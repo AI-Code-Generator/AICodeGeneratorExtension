@@ -1,6 +1,8 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { IndexFlatL2, Index, IndexFlatIP, MetricType } from 'faiss-node';
+import { pipeline } from '@huggingface/transformers';
 
 export async function readFilesRecursive(directory: string, excludeList: string[] = []): Promise<string[]> {
     let results: string[] = [];
@@ -21,6 +23,12 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                 results = results.concat(subFiles);
             } else {
                 results.push(fullPath);
+                const content: string = await fs.readFile(fullPath, 'utf8');
+                const chunks: string[] = chunkByLines(content);
+                for (const chunk of chunks) {
+                    // store in the chunks in faiss vector db
+                    
+                }
             }
         }
     } catch (error) {
@@ -40,4 +48,16 @@ export async function indexWorkspaceFiles(excludeDirs = ['node_modules', '.git',
     const files = await readFilesRecursive(rootDirectory, excludeDirs);
     console.log(`Found ${files.length} files.`);
     return files;
+}
+
+// Naively chunk text by lines
+function chunkByLines(text: string, linesPerChunk = 3) {
+    const lines = text.split("\n").map(line => line.trim()).filter(line => line.length > 0);
+    let chunks = [];
+
+    for (let i = 0; i < lines.length; i += linesPerChunk) {
+        chunks.push(lines.slice(i, i + linesPerChunk).join("\n"));
+    }
+
+    return chunks;
 }
