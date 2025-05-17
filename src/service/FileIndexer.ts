@@ -2,7 +2,17 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { IndexFlatL2, Index, IndexFlatIP, MetricType } from 'faiss-node';
-import { pipeline } from '@huggingface/transformers';
+
+let embedder: any = null;
+const EMBEDDING_DIM = 768;
+let vectorIndex: IndexFlatL2 | null = null;
+
+async function initializeEmbedder() {
+    if (!embedder) {
+        const { pipeline } = await import('@huggingface/transformers');
+        embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5');
+    }
+}
 
 export async function readFilesRecursive(directory: string, excludeList: string[] = []): Promise<string[]> {
     let results: string[] = [];
@@ -25,9 +35,14 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                 results.push(fullPath);
                 const content: string = await fs.readFile(fullPath, 'utf8');
                 const chunks: string[] = chunkByLines(content);
+                
+                await initializeEmbedder();
+
                 for (const chunk of chunks) {
-                    // store in the chunks in faiss vector db
-                    
+                    // Generate embedding for the chunk
+                    const embedding = await embedText(chunk);
+                    // store in the chunks in faiss vector db       
+                    await saveFaiss(embedding);
                 }
             }
         }
@@ -36,6 +51,20 @@ export async function readFilesRecursive(directory: string, excludeList: string[
     }
     
     return results;
+}
+
+async function embedText(text: string) {
+    if (!embedder) {
+        throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
+    }
+
+    const output = await embedder(text, { 
+        pooling: "mean",
+        normalize: true
+    });
+    // Convert from ONNX type tensor to a normal js one
+    const embeddings = Array.from(output[0].data);
+    return embeddings;
 }
 
 export async function indexWorkspaceFiles(excludeDirs = ['node_modules', '.git', 'dist', 'build']): Promise<string[]> {
@@ -60,4 +89,16 @@ function chunkByLines(text: string, linesPerChunk = 3) {
     }
 
     return chunks;
+}
+
+async function saveFaiss(embedding: any[]) {
+    if (!vectorIndex) {
+        vectorIndex = new IndexFlatL2(EMBEDDING_DIM);
+    }
+
+    if (embedding.length !== EMBEDDING_DIM) {
+        throw new Error(`Invalid embedding dimension. Expected ${EMBEDDING_DIM}, got ${embedding.length}`);
+    }
+
+    vectorIndex.add(embedding);
 }
