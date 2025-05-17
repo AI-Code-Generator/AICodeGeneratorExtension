@@ -2,6 +2,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { IndexFlatL2, Index, IndexFlatIP, MetricType } from 'faiss-node';
+import { CodeParser } from './Parser';
 
 let embedder: any = null;
 const EMBEDDING_DIM = 768;
@@ -34,13 +35,14 @@ export async function readFilesRecursive(directory: string, excludeList: string[
             } else {
                 results.push(fullPath);
                 const content: string = await fs.readFile(fullPath, 'utf8');
-                const chunks: string[] = chunkByLines(content);
-                
+                //const chunks: string[] = chunkByLines(content);
+                const chunks = CodeParser.parseCode(content, fullPath);
+
                 await initializeEmbedder();
 
                 for (const chunk of chunks) {
                     // Generate embedding for the chunk
-                    const embedding = await embedText(chunk);
+                    const embedding = await embedText(chunk.content);
                     // store in the chunks in faiss vector db       
                     await saveFaiss(embedding);
                 }
