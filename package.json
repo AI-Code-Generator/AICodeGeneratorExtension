@@ -58,6 +58,7 @@
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "@huggingface/transformers": "^3.4.2",
     "@langchain/core": "^0.3.40",
     "dotenv": "^16.4.7",
     "faiss-node": "^0.5.1",
