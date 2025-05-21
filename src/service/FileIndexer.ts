@@ -6,7 +6,11 @@ import { CodeParser } from './Parser';
 
 let embedder: any = null;
 const EMBEDDING_DIM = 768;
-let vectorIndex: IndexFlatL2 | null = null;
+// let vectorIndex: IndexFlatL2 | null = null;
+
+export const state = {
+    vectorIndex: null as IndexFlatL2 | null
+};
 
 async function initializeEmbedder() {
     if (!embedder) {
@@ -94,13 +98,27 @@ function chunkByLines(text: string, linesPerChunk = 3) {
 }
 
 async function saveFaiss(embedding: any[]) {
-    if (!vectorIndex) {
-        vectorIndex = new IndexFlatL2(EMBEDDING_DIM);
+    if (!state.vectorIndex) {
+        state.vectorIndex = new IndexFlatL2(EMBEDDING_DIM);
     }
 
     if (embedding.length !== EMBEDDING_DIM) {
         throw new Error(`Invalid embedding dimension. Expected ${EMBEDDING_DIM}, got ${embedding.length}`);
     }
 
-    vectorIndex.add(embedding);
+    state.vectorIndex.add(embedding);
+    const all = state.vectorIndex.ntotal();
+}
+
+export async function similaritySearch(text: string) {
+    if (!text) {
+        return null;
+    }
+    const embeddedText: any[] = await embedText(text);
+    if (!embeddedText) {
+        return null;
+    }
+
+    const result = state.vectorIndex?.search(embeddedText, 8);
+    return result;
 }
