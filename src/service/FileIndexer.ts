@@ -3,9 +3,12 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { IndexFlatL2, Index, IndexFlatIP, MetricType } from 'faiss-node';
 import { CodeParser } from './Parser';
+import * as fsSync from 'fs';
+import { initializeSQLite, sqliteDb } from './Sqlite';
 
 let embedder: any = null;
 const EMBEDDING_DIM = 768;
+const FAISS_INDEX_FILENAME = 'workspace_index.faiss';
 // let vectorIndex: IndexFlatL2 | null = null;
 
 export const state = {
@@ -73,11 +76,14 @@ async function embedText(text: string) {
     return embeddings;
 }
 
-export async function indexWorkspaceFiles(excludeDirs = ['node_modules', '.git', 'dist', 'build']): Promise<string[]> {
+export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = ['node_modules', '.git', 'dist', 'build']): Promise<string[]> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         return [];
     }
+
+    initializeSQLite(storageUri);
+    initializeFaiss(storageUri);
     
     const rootDirectory = workspaceFolders[0].uri.fsPath;
     const files = await readFilesRecursive(rootDirectory, excludeDirs);
@@ -95,6 +101,26 @@ function chunkByLines(text: string, linesPerChunk = 3) {
     }
 
     return chunks;
+}
+
+function initializeFaiss(storageUri: vscode.Uri) {
+    try {
+        const faissIndexStoragePath = path.join(storageUri.fsPath, FAISS_INDEX_FILENAME);
+        fsSync.accessSync(faissIndexStoragePath);
+        state.vectorIndex = IndexFlatL2.read(faissIndexStoragePath);
+    } catch (error) {
+        console.log('Faiss index file not found or error loading, creating a new one.');
+        state.vectorIndex = new IndexFlatL2(EMBEDDING_DIM); // <===== check this error handling part
+        // If creating a new Faiss index, ensure metadata is also cleared (if it could be out of sync)
+        if (sqliteDb) {
+            try {
+                console.log("New Faiss index, clearing metadata table.");
+                sqliteDb.db?.prepare('DELETE FROM metadata').run(); // <======= check this
+            } catch (dbError) {
+                console.error("Failed to clear metadata table:", dbError);
+            }
+        }
+    }
 }
 
 async function saveFaiss(embedding: any[]) {

@@ -46,6 +46,7 @@
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
     "@types/vscode": "^1.97.0",
@@ -60,6 +61,7 @@
     "@google/generative-ai": "^0.21.0",
     "@huggingface/transformers": "^3.4.2",
     "@langchain/core": "^0.3.40",
+    "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.7",
     "faiss-node": "^0.5.1",
     "langchain": "^0.3.15",
