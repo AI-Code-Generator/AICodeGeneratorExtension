@@ -6,13 +6,30 @@ import { CodeParser } from './Parser';
 import * as fsSync from 'fs';
 import { initializeSQLite, sqliteDb } from './Sqlite';
 
+interface CodeChunkMetadata {
+    id?: number;
+    content: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    chunkType: string;
+    embedding_index: number;
+}
+
 let embedder: any = null;
 const EMBEDDING_DIM = 768;
 const FAISS_INDEX_FILENAME = 'workspace_index.faiss';
+let STORAGEPATH: any = null;
 // let vectorIndex: IndexFlatL2 | null = null;
 
 export const state = {
     vectorIndex: null as IndexFlatL2 | null
+};
+
+export const bulkState = {
+    metadataBuffer: [] as CodeChunkMetadata[],
+    batchSize: 100,
+    currentEmbeddingIndex: 0
 };
 
 async function initializeEmbedder() {
@@ -51,10 +68,18 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                     // Generate embedding for the chunk
                     const embedding = await embedText(chunk.content);
                     // store in the chunks in faiss vector db       
-                    await saveFaiss(embedding);
+                    await saveFaiss(embedding, {
+                        content: chunk.content,
+                        filePath: fullPath,
+                        startLine: chunk.startLine || 0,
+                        endLine: chunk.endLine || 0,
+                        chunkType: chunk.type || 'unknown'
+                    });
                 }
             }
         }
+        await flushRemainingMetadata();
+        writeToFaiss();
     } catch (error) {
         console.error('Error reading directory:', error);
     }
@@ -82,7 +107,8 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
         return [];
     }
 
-    initializeSQLite(storageUri);
+    STORAGEPATH = storageUri;
+    await initializeSQLite(storageUri);
     initializeFaiss(storageUri);
     
     const rootDirectory = workspaceFolders[0].uri.fsPath;
@@ -112,18 +138,19 @@ function initializeFaiss(storageUri: vscode.Uri) {
         console.log('Faiss index file not found or error loading, creating a new one.');
         state.vectorIndex = new IndexFlatL2(EMBEDDING_DIM); // <===== check this error handling part
         // If creating a new Faiss index, ensure metadata is also cleared (if it could be out of sync)
-        if (sqliteDb) {
-            try {
-                console.log("New Faiss index, clearing metadata table.");
-                sqliteDb.db?.prepare('DELETE FROM metadata').run(); // <======= check this
-            } catch (dbError) {
-                console.error("Failed to clear metadata table:", dbError);
-            }
+        if (sqliteDb.db) {
+            sqliteDb.db.run('DELETE FROM metadata', (err) => {
+                if (err) {
+                    console.error("Failed to clear metadata table:", err);
+                } else {
+                    console.log("New Faiss index, cleared metadata table.");
+                }
+            });
         }
     }
 }
 
-async function saveFaiss(embedding: any[]) {
+async function saveFaiss(embedding: any[], metadata: Omit<CodeChunkMetadata, 'id' | 'embedding_index'>) {
     if (!state.vectorIndex) {
         state.vectorIndex = new IndexFlatL2(EMBEDDING_DIM);
     }
@@ -134,6 +161,106 @@ async function saveFaiss(embedding: any[]) {
 
     state.vectorIndex.add(embedding);
     const all = state.vectorIndex.ntotal();
+
+    bulkState.metadataBuffer.push({
+        ...metadata,
+        embedding_index: bulkState.currentEmbeddingIndex
+    });
+    
+    bulkState.currentEmbeddingIndex++;
+
+    // Save in batches
+    if (bulkState.metadataBuffer.length >= bulkState.batchSize) {
+        await saveBulkMetadata();
+    }
+}
+
+// Bulk save metadata to SQLite
+async function saveBulkMetadata(): Promise<void> {
+    if (!sqliteDb?.db || bulkState.metadataBuffer.length === 0) {
+        return;
+    }
+
+    return new Promise((resolve, reject) => {
+        const stmt = sqliteDb.db!.prepare(`
+            INSERT INTO metadata (content, file_path, start_line, end_line, chunk_type, embedding_index)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `);
+
+        sqliteDb.db!.serialize(() => {
+            sqliteDb.db!.run('BEGIN TRANSACTION');
+            
+            let completed = 0;
+            const total = bulkState.metadataBuffer.length;
+            
+            for (const chunk of bulkState.metadataBuffer) {
+                stmt.run([
+                    chunk.content,
+                    chunk.filePath,
+                    chunk.startLine,
+                    chunk.endLine,
+                    chunk.chunkType,
+                    chunk.embedding_index
+                ], (err) => {
+                    if (err) {
+                        console.error('Failed to insert metadata:', err);
+                        reject(err);
+                        return;
+                    }
+                    
+                    completed++;
+                    if (completed === total) {
+                        sqliteDb.db!.run('COMMIT', (err) => {
+                            if (err) {
+                                reject(err);
+                            } else {
+                                console.log(`Saved ${bulkState.metadataBuffer.length} metadata entries to database`);
+                                bulkState.metadataBuffer = [];
+                                resolve();
+                            }
+                        });
+                    }
+                });
+            }
+            
+            stmt.finalize();
+        });
+    });
+}
+
+// Function to flush remaining metadata
+export async function flushRemainingMetadata() {
+    if (bulkState.metadataBuffer.length > 0) {
+        await saveBulkMetadata();
+    }
+}
+
+function writeToFaiss() {
+    const faissIndexStoragePath = path.join(STORAGEPATH, FAISS_INDEX_FILENAME);
+    state.vectorIndex?.write(faissIndexStoragePath);
+}
+
+// Function to get metadata by embedding index
+export function getMetadataByEmbeddingIndex(embeddingIndex: number): Promise<CodeChunkMetadata | null> {
+    return new Promise((resolve, reject) => {
+        if (!sqliteDb?.db) {
+            resolve(null);
+            return;
+        }
+
+        sqliteDb.db.get(
+            'SELECT * FROM metadata WHERE embedding_index = ?',
+            [embeddingIndex],
+            (err, row) => {
+                if (err) {
+                    console.error('Failed to get metadata:', err);
+                    reject(err);
+                } else {
+                    resolve(row as CodeChunkMetadata || null);
+                }
+            }
+        );
+    });
 }
 
 export async function similaritySearch(text: string) {
@@ -146,5 +273,21 @@ export async function similaritySearch(text: string) {
     }
 
     const result = state.vectorIndex?.search(embeddedText, 8);
-    return result;
+    if (!result) {
+        return null;
+    }
+
+    // Get metadata for each result (now async)
+    const resultsWithMetadata = await Promise.all(
+        result.labels.map(async (embeddingIndex: number, i: number) => {
+            const metadata = await getMetadataByEmbeddingIndex(embeddingIndex);
+            return {
+                score: result.distances[i],
+                embeddingIndex,
+                metadata
+            };
+        })
+    );
+
+    return resultsWithMetadata;
 }
