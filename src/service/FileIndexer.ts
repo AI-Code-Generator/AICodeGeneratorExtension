@@ -183,47 +183,49 @@ async function saveBulkMetadata(): Promise<void> {
 
     return new Promise((resolve, reject) => {
         const stmt = sqliteDb.db!.prepare(`
-            INSERT INTO metadata (content, file_path, start_line, end_line, chunk_type, embedding_index)
+            INSERT INTO metadata (content, file_path, start_line, end_line, type, embedding_index)
             VALUES (?, ?, ?, ?, ?, ?)
         `);
 
         sqliteDb.db!.serialize(() => {
-            sqliteDb.db!.run('BEGIN TRANSACTION');
-            
-            let completed = 0;
-            const total = bulkState.metadataBuffer.length;
-            
-            for (const chunk of bulkState.metadataBuffer) {
-                stmt.run([
-                    chunk.content,
-                    chunk.filePath,
-                    chunk.startLine,
-                    chunk.endLine,
-                    chunk.chunkType,
-                    chunk.embedding_index
-                ], (err) => {
-                    if (err) {
-                        console.error('Failed to insert metadata:', err);
-                        reject(err);
-                        return;
+            sqliteDb.db!.run('BEGIN TRANSACTION', (err) => {
+                if (err) {
+                    stmt.finalize();
+                    reject(err);
+                    return;
+                }
+
+                try {
+                    // Use synchronous run instead of async
+                    for (const chunk of bulkState.metadataBuffer) {
+                        stmt.run([
+                            chunk.content,
+                            chunk.filePath,
+                            chunk.startLine,
+                            chunk.endLine,
+                            chunk.chunkType,
+                            chunk.embedding_index
+                        ]);
                     }
-                    
-                    completed++;
-                    if (completed === total) {
-                        sqliteDb.db!.run('COMMIT', (err) => {
-                            if (err) {
-                                reject(err);
-                            } else {
-                                console.log(`Saved ${bulkState.metadataBuffer.length} metadata entries to database`);
-                                bulkState.metadataBuffer = [];
-                                resolve();
-                            }
-                        });
-                    }
-                });
-            }
-            
-            stmt.finalize();
+
+                    sqliteDb.db!.run('COMMIT', (err) => {
+                        stmt.finalize();
+                        if (err) {
+                            reject(err);
+                        } else {
+                            console.log(`Saved ${bulkState.metadataBuffer.length} metadata entries to database`);
+                            bulkState.metadataBuffer = [];
+                            resolve();
+                        }
+                    });
+                } catch (error) {
+                    console.error('Failed to insert metadata:', error);
+                    sqliteDb.db!.run('ROLLBACK', () => {
+                        stmt.finalize();
+                        reject(error);
+                    });
+                }
+            });
         });
     });
 }
@@ -236,7 +238,7 @@ export async function flushRemainingMetadata() {
 }
 
 function writeToFaiss() {
-    const faissIndexStoragePath = path.join(STORAGEPATH, FAISS_INDEX_FILENAME);
+    const faissIndexStoragePath = path.join(STORAGEPATH.fsPath, FAISS_INDEX_FILENAME);
     state.vectorIndex?.write(faissIndexStoragePath);
 }
 
