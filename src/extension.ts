@@ -9,7 +9,7 @@ export function activate(context: vscode.ExtensionContext) {
     
     let output = vscode.window.createOutputChannel("AI code assist");
     // Index workspace files when extension activates
-    indexWorkspaceFiles().then(files => {
+    indexWorkspaceFiles(context.globalStorageUri).then(files => {
         output.appendLine(`Indexed ${files.length} files in workspace`);
     }).catch(err => {
         output.appendLine('Error indexing workspace:');

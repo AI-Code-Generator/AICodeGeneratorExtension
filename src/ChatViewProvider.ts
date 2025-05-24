@@ -1,5 +1,6 @@
 // src/ChatViewProvider.ts
 import * as vscode from 'vscode';
+import { similaritySearch } from './service/FileIndexer';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     // private _view?: vscode.WebviewView;
@@ -164,6 +165,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                         // Prepare the query with context
                         const query = `${data.message}\n\nContext:\nLanguage: ${fileLanguage}\nSelected code:\n${selectedCode}`;
+
+                        const similarity =  await similaritySearch(data.message);
 
                         // Send progress message
                         this._view?.webview.postMessage({
