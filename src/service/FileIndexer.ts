@@ -1,35 +1,33 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { IndexFlatL2, Index, IndexFlatIP, MetricType } from 'faiss-node';
+import * as lancedb from '@lancedb/lancedb';
 import { CodeParser } from './Parser';
-import * as fsSync from 'fs';
-import { initializeSQLite, sqliteDb } from './Sqlite';
 
 interface CodeChunkMetadata {
-    id?: number;
+    id?: string;
     content: string;
     filePath: string;
     startLine: number;
     endLine: number;
     chunkType: string;
-    embedding_index: number;
+    vector: number[];
+    [key: string]: any; // Add index signature for LanceDB compatibility
 }
 
 let embedder: any = null;
 const EMBEDDING_DIM = 768;
-const FAISS_INDEX_FILENAME = 'workspace_index.faiss';
+const LANCEDB_TABLE_NAME = 'code_chunks';
 let STORAGEPATH: any = null;
-// let vectorIndex: IndexFlatL2 | null = null;
 
 export const state = {
-    vectorIndex: null as IndexFlatL2 | null
+    db: null as lancedb.Connection | null,
+    table: null as lancedb.Table | null
 };
 
 export const bulkState = {
-    metadataBuffer: [] as CodeChunkMetadata[],
-    batchSize: 100,
-    currentEmbeddingIndex: 0
+    metadataBuffer: [] as Record<string, any>[], // Change to Record<string, any>[]
+    batchSize: 100
 };
 
 async function initializeEmbedder() {
@@ -59,7 +57,6 @@ export async function readFilesRecursive(directory: string, excludeList: string[
             } else {
                 results.push(fullPath);
                 const content: string = await fs.readFile(fullPath, 'utf8');
-                //const chunks: string[] = chunkByLines(content);
                 const chunks = CodeParser.parseCode(content, fullPath);
 
                 await initializeEmbedder();
@@ -67,19 +64,19 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                 for (const chunk of chunks) {
                     // Generate embedding for the chunk
                     const embedding = await embedText(chunk.content);
-                    // store in the chunks in faiss vector db       
-                    await saveFaiss(embedding, {
+                    // Store in LanceDB
+                    await saveLanceDB({
                         content: chunk.content,
                         filePath: fullPath,
                         startLine: chunk.startLine || 0,
                         endLine: chunk.endLine || 0,
-                        chunkType: chunk.type || 'unknown'
+                        chunkType: chunk.type || 'unknown',
+                        vector: embedding
                     });
                 }
             }
         }
         await flushRemainingMetadata();
-        writeToFaiss();
     } catch (error) {
         console.error('Error reading directory:', error);
     }
@@ -97,7 +94,7 @@ async function embedText(text: string) {
         normalize: true
     });
     // Convert from ONNX type tensor to a normal js one
-    const embeddings = Array.from(output[0].data);
+    const embeddings = Array.from(output[0].data) as number[];
     return embeddings;
 }
 
@@ -108,8 +105,7 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
     }
 
     STORAGEPATH = storageUri;
-    await initializeSQLite(storageUri);
-    initializeFaiss(storageUri);
+    await initializeLanceDB(storageUri);
     
     const rootDirectory = workspaceFolders[0].uri.fsPath;
     const files = await readFilesRecursive(rootDirectory, excludeDirs);
@@ -117,57 +113,58 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
     return files;
 }
 
-// Naively chunk text by lines
-function chunkByLines(text: string, linesPerChunk = 3) {
-    const lines = text.split("\n").map(line => line.trim()).filter(line => line.length > 0);
-    let chunks = [];
-
-    for (let i = 0; i < lines.length; i += linesPerChunk) {
-        chunks.push(lines.slice(i, i + linesPerChunk).join("\n"));
-    }
-
-    return chunks;
-}
-
-function initializeFaiss(storageUri: vscode.Uri) {
+async function initializeLanceDB(storageUri: vscode.Uri) {
     try {
-        const faissIndexStoragePath = path.join(storageUri.fsPath, FAISS_INDEX_FILENAME);
-        fsSync.accessSync(faissIndexStoragePath);
-        state.vectorIndex = IndexFlatL2.read(faissIndexStoragePath);
-    } catch (error) {
-        console.log('Faiss index file not found or error loading, creating a new one.');
-        state.vectorIndex = new IndexFlatL2(EMBEDDING_DIM); // <===== check this error handling part
-        // If creating a new Faiss index, ensure metadata is also cleared (if it could be out of sync)
-        if (sqliteDb.db) {
-            sqliteDb.db.run('DELETE FROM metadata', (err) => {
-                if (err) {
-                    console.error("Failed to clear metadata table:", err);
-                } else {
-                    console.log("New Faiss index, cleared metadata table.");
-                }
-            });
+        const lanceDbPath = path.join(storageUri.fsPath, 'lancedb');
+        state.db = await lancedb.connect(lanceDbPath);
+        
+        // Check if table exists
+        const tableNames = await state.db.tableNames();
+        
+        if (tableNames.includes(LANCEDB_TABLE_NAME)) {
+            state.table = await state.db.openTable(LANCEDB_TABLE_NAME);
+            console.log('Loaded existing LanceDB table');
+        } else {
+            // Create new table with sample data to define schema
+            const sampleData = [{
+                id: 'sample',
+                content: 'sample content',
+                filePath: 'sample/path',
+                startLine: 0,
+                endLine: 0,
+                chunkType: 'sample',
+                vector: new Array(EMBEDDING_DIM).fill(0)
+            }];
+            
+            state.table = await state.db.createTable(LANCEDB_TABLE_NAME, sampleData);
+            // Delete the sample data
+            await state.table.delete('id = "sample"');
+            console.log('Created new LanceDB table');
         }
+    } catch (error) {
+        console.error('Failed to initialize LanceDB:', error);
+        throw error;
     }
 }
 
-async function saveFaiss(embedding: any[], metadata: Omit<CodeChunkMetadata, 'id' | 'embedding_index'>) {
-    if (!state.vectorIndex) {
-        state.vectorIndex = new IndexFlatL2(EMBEDDING_DIM);
+async function saveLanceDB(metadata: Omit<CodeChunkMetadata, 'id'>) {
+    if (!state.table) {
+        throw new Error('LanceDB table not initialized');
     }
 
-    if (embedding.length !== EMBEDDING_DIM) {
-        throw new Error(`Invalid embedding dimension. Expected ${EMBEDDING_DIM}, got ${embedding.length}`);
+    if (metadata.vector.length !== EMBEDDING_DIM) {
+        throw new Error(`Invalid embedding dimension. Expected ${EMBEDDING_DIM}, got ${metadata.vector.length}`);
     }
 
-    state.vectorIndex.add(embedding);
-    const all = state.vectorIndex.ntotal();
+    // Generate a unique ID
+    const id = `${metadata.filePath}:${metadata.startLine}-${metadata.endLine}:${Date.now()}`;
 
-    bulkState.metadataBuffer.push({
-        ...metadata,
-        embedding_index: bulkState.currentEmbeddingIndex
-    });
-    
-    bulkState.currentEmbeddingIndex++;
+    const record: Record<string, any> = {
+        id,
+        ...metadata
+    };
+
+    bulkState.metadataBuffer.push(record);
 
     // Save in batches
     if (bulkState.metadataBuffer.length >= bulkState.batchSize) {
@@ -175,59 +172,20 @@ async function saveFaiss(embedding: any[], metadata: Omit<CodeChunkMetadata, 'id
     }
 }
 
-// Bulk save metadata to SQLite
+// Bulk save metadata to LanceDB
 async function saveBulkMetadata(): Promise<void> {
-    if (!sqliteDb?.db || bulkState.metadataBuffer.length === 0) {
+    if (!state.table || bulkState.metadataBuffer.length === 0) {
         return;
     }
 
-    return new Promise((resolve, reject) => {
-        const stmt = sqliteDb.db!.prepare(`
-            INSERT INTO metadata (content, file_path, start_line, end_line, type, embedding_index)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `);
-
-        sqliteDb.db!.serialize(() => {
-            sqliteDb.db!.run('BEGIN TRANSACTION', (err) => {
-                if (err) {
-                    stmt.finalize();
-                    reject(err);
-                    return;
-                }
-
-                try {
-                    // Use synchronous run instead of async
-                    for (const chunk of bulkState.metadataBuffer) {
-                        stmt.run([
-                            chunk.content,
-                            chunk.filePath,
-                            chunk.startLine,
-                            chunk.endLine,
-                            chunk.chunkType,
-                            chunk.embedding_index
-                        ]);
-                    }
-
-                    sqliteDb.db!.run('COMMIT', (err) => {
-                        stmt.finalize();
-                        if (err) {
-                            reject(err);
-                        } else {
-                            console.log(`Saved ${bulkState.metadataBuffer.length} metadata entries to database`);
-                            bulkState.metadataBuffer = [];
-                            resolve();
-                        }
-                    });
-                } catch (error) {
-                    console.error('Failed to insert metadata:', error);
-                    sqliteDb.db!.run('ROLLBACK', () => {
-                        stmt.finalize();
-                        reject(error);
-                    });
-                }
-            });
-        });
-    });
+    try {
+        await state.table.add(bulkState.metadataBuffer);
+        console.log(`Saved ${bulkState.metadataBuffer.length} entries to LanceDB`);
+        bulkState.metadataBuffer = [];
+    } catch (error) {
+        console.error('Failed to save bulk metadata to LanceDB:', error);
+        throw error;
+    }
 }
 
 // Function to flush remaining metadata
@@ -237,59 +195,65 @@ export async function flushRemainingMetadata() {
     }
 }
 
-function writeToFaiss() {
-    const faissIndexStoragePath = path.join(STORAGEPATH.fsPath, FAISS_INDEX_FILENAME);
-    state.vectorIndex?.write(faissIndexStoragePath);
-}
+export async function similaritySearch(text: string, limit: number = 8) {
+    if (!text || !state.table) {
+        return null;
+    }
 
-// Function to get metadata by embedding index
-export function getMetadataByEmbeddingIndex(embeddingIndex: number): Promise<CodeChunkMetadata | null> {
-    return new Promise((resolve, reject) => {
-        if (!sqliteDb?.db) {
-            resolve(null);
-            return;
-        }
+    try {
+        await initializeEmbedder();
+        const embeddedText = await embedText(text);
+        
+        const results = await state.table
+            .vectorSearch(embeddedText)
+            .limit(limit)
+            .toArray();
 
-        sqliteDb.db.get(
-            'SELECT * FROM metadata WHERE embedding_index = ?',
-            [embeddingIndex],
-            (err, row) => {
-                if (err) {
-                    console.error('Failed to get metadata:', err);
-                    reject(err);
-                } else {
-                    resolve(row as CodeChunkMetadata || null);
-                }
+        return results.map(result => ({
+            score: result._distance, // LanceDB returns distance in _distance field
+            metadata: {
+                id: result.id,
+                content: result.content,
+                filePath: result.filePath,
+                startLine: result.startLine,
+                endLine: result.endLine,
+                chunkType: result.chunkType
             }
-        );
-    });
+        }));
+    } catch (error) {
+        console.error('Error in similarity search:', error);
+        return null;
+    }
 }
 
-export async function similaritySearch(text: string) {
-    if (!text) {
-        return null;
-    }
-    const embeddedText: any[] = await embedText(text);
-    if (!embeddedText) {
-        return null;
+// Helper function to get all entries (for debugging)
+export async function getAllEntries(): Promise<CodeChunkMetadata[]> {
+    if (!state.table) {
+        return [];
     }
 
-    const result = state.vectorIndex?.search(embeddedText, 8);
-    if (!result) {
-        return null;
+    try {
+        // Use query() to get all entries
+        const results = await state.table.query().toArray();
+        return results;
+    } catch (error) {
+        console.error('Error getting all entries:', error);
+        return [];
+    }
+}
+
+// Helper function to clear all data
+export async function clearAllData(): Promise<void> {
+    if (!state.table) {
+        return;
     }
 
-    // Get metadata for each result (now async)
-    const resultsWithMetadata = await Promise.all(
-        result.labels.map(async (embeddingIndex: number, i: number) => {
-            const metadata = await getMetadataByEmbeddingIndex(embeddingIndex);
-            return {
-                score: result.distances[i],
-                embeddingIndex,
-                metadata
-            };
-        })
-    );
-
-    return resultsWithMetadata;
+    try {
+        // Use delete with proper SQL WHERE clause
+        await state.table.delete('id IS NOT NULL'); // Delete all rows
+        console.log('Cleared all data from LanceDB');
+    } catch (error) {
+        console.error('Error clearing data:', error);
+        throw error;
+    }
 }
