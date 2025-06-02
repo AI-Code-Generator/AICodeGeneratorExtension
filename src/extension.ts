@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ChatViewProvider } from './ChatViewProvider';
 //import { AICompletionProvider } from './CompletionProvider';
 import { config } from './config';
-import { indexWorkspaceFiles } from './service/FileIndexer';
+import { indexWorkspaceFiles, indexSingleFile } from './service/FileIndexer';
 
 export function activate(context: vscode.ExtensionContext) {
     const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl);
@@ -15,6 +15,35 @@ export function activate(context: vscode.ExtensionContext) {
         output.appendLine('Error indexing workspace:');
     });
 
+    // Set up file system watcher
+    const fileWatcher = vscode.workspace.createFileSystemWatcher("**/*", false, false, false);
+    
+    // Handle file changes
+    fileWatcher.onDidChange(async (uri) => {
+        try {
+            await indexSingleFile(uri, context.globalStorageUri);
+            output.appendLine(`Reindexed changed file: ${uri.fsPath}`);
+        } catch (err) {
+            output.appendLine(`Error reindexing file ${uri.fsPath}: ${err}`);
+        }
+    });
+    
+    // Handle file creation
+    fileWatcher.onDidCreate(async (uri) => {
+        try {
+            await indexSingleFile(uri, context.globalStorageUri);
+            output.appendLine(`Indexed new file: ${uri.fsPath}`);
+        } catch (err) {
+            output.appendLine(`Error indexing new file ${uri.fsPath}: ${err}`);
+        }
+    });
+    
+    // Handle file deletion
+    fileWatcher.onDidDelete((uri) => {
+        output.appendLine(`File deleted: ${uri.fsPath} (will be cleaned up on next full indexing)`);
+    });
+
+    context.subscriptions.push(fileWatcher);
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(

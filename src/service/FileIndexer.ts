@@ -239,6 +239,68 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
     return files;
 }
 
+export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Uri): Promise<boolean> {
+    const filePath = fileUri.fsPath;
+    
+    try {
+        // Skip excluded directories
+        const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
+        if (isInExcludedDir(filePath, excludeDirs)) {
+            return false;
+        }
+
+        // Make sure DB is initialized
+        if (!state.db) {
+            STORAGEPATH = storageUri;
+            await initializeLanceDB(storageUri);
+        }
+        
+        // Read file content
+        const content = await fs.readFile(filePath, 'utf8');
+        
+        // Check if we need to process this file
+        const shouldProcess = await shouldProcessFile(filePath, content);
+        
+        if (shouldProcess) {
+            const chunks = CodeParser.parseCode(content, filePath);
+            console.log(`Processing changed file: ${filePath}`);
+            
+            await initializeEmbedder();
+            
+            if (state.table) {
+                await state.table.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+            }
+            
+            for (const chunk of chunks) {
+                const embedding = await embedText(chunk.content);
+                
+                await saveLanceDB({
+                    content: chunk.content,
+                    filePath: filePath,
+                    startLine: chunk.startLine || 0,
+                    endLine: chunk.endLine || 0,
+                    chunkType: chunk.type || 'unknown',
+                    vector: embedding,
+                    contentHash: calculateContentHash(chunk.content),
+                    lastIndexed: Date.now()
+                });
+            }
+            
+            await updateFileTracking(filePath, content);
+            await flushRemainingMetadata();
+            await flushRemainingFileTracking();
+            
+            return true;
+        } else {
+            console.log(`Skipping unchanged file: ${filePath}`);
+            return false;
+        }
+    } catch (error) {
+        console.error(`Error indexing file ${filePath}:`, error);
+        return false;
+    }
+}
+
 async function initializeLanceDB(storageUri: vscode.Uri) {
     try {
         const lanceDbPath = path.join(storageUri.fsPath, 'lancedb');
