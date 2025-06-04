@@ -87,7 +87,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         private readonly _extensionUri: vscode.Uri,
         baseUrl: string
     ) {
-        this._queryUrl = `${baseUrl}/query`;
+        this._queryUrl = `${baseUrl}/ask-ai`;
         this._embedUrl = `${baseUrl}/embed`;
     }
 
@@ -164,7 +164,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         await this.embedCodeContext(codeContext, fileLanguage);
 
                         // Prepare the query with context
-                        const query = `${data.message}\n\nContext:\nLanguage: ${fileLanguage}\nSelected code:\n${selectedCode}`;
+                        let query = `${data.message}\n\nLanguage: ${fileLanguage}`;
+                        if (selectedCode.trim()) {
+                            query += `\nSelected code:\n${selectedCode}`;
+                        }
 
                         const similarity =  await similaritySearch(data.message);
 
@@ -181,16 +184,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             headers: {
                                 'Content-Type': 'application/json',
                             },
-                            body: JSON.stringify({ query: query })
+                            body: JSON.stringify({ 
+                                query: query,
+                                context: similarity,
+                                user_ID: "0001"
+                            })
                         });
 
                         const jsonResponse: any = await response.json();
 
-                        if (jsonResponse.success) {
+                        if (!jsonResponse.error) {
                             // Send response back to webview
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
-                                message: jsonResponse.result,
+                                message: jsonResponse.response,
                                 sender: 'assistant'
                             });
                         } else {

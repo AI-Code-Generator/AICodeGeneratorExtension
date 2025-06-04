@@ -413,17 +413,18 @@ export async function similaritySearch(text: string, limit: number = 8) {
             .limit(limit)
             .toArray();
 
-        return results.map(result => ({
-            score: result._distance,
-            metadata: {
-                id: result.id,
-                content: result.content,
-                filePath: result.filePath,
-                startLine: result.startLine,
-                endLine: result.endLine,
-                chunkType: result.chunkType
-            }
-        }));
+        // return results.map(result => ({
+        //     score: result._distance,
+        //     metadata: {
+        //         id: result.id,
+        //         content: result.content,
+        //         filePath: result.filePath,
+        //         startLine: result.startLine,
+        //         endLine: result.endLine,
+        //         chunkType: result.chunkType
+        //     }
+        // }));
+        return results.map(result => result.content);
     } catch (error) {
         console.error('Error in similarity search:', error);
         return null;
