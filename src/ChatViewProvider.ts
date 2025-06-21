@@ -1,6 +1,7 @@
 // src/ChatViewProvider.ts
 import * as vscode from 'vscode';
 import { similaritySearch } from './service/FileIndexer';
+import { ContextGatherer } from './service/ContextGatherer';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     // private _view?: vscode.WebviewView;
@@ -82,6 +83,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private readonly _queryUrl: string;
     private readonly _embedUrl: string;
+    private readonly _enhanceUrl: string;
+    private contextGatherer: ContextGatherer;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -89,6 +92,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ) {
         this._queryUrl = `${baseUrl}/ask-ai`;
         this._embedUrl = `${baseUrl}/embed`;
+        this._enhanceUrl = `${baseUrl}/enhance-query`;
+        this.contextGatherer = new ContextGatherer();
     }
 
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
@@ -134,6 +139,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async enhanceQuery(originalQuery: string, enhancedContext: any): Promise<string> {
+        try {
+            const response = await fetch(this._enhanceUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    question: originalQuery,
+                    context: enhancedContext
+                })
+            });
+
+            const result = await response.json();
+            
+            if (!result.error && result.enhancedQuery) {
+                return result.enhancedQuery;
+            } else {
+                console.warn('Query enhancement failed, using original query');
+                return originalQuery;
+            }
+        } catch (error) {
+            console.error('Failed to enhance query:', error);
+            return originalQuery;
+        }
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         context: vscode.WebviewViewResolveContext,
@@ -169,7 +201,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             query += `\nSelected code:\n${selectedCode}`;
                         }
 
-                        const similarity =  await similaritySearch(data.message);
+                        // const similarity =  await similaritySearch(data.message);
+
+                        // Gather workspace and file context using AST Manager
+                        const workspaceContext = this.contextGatherer.gatherWorkspaceContext();
+                        const currentFileContext = this.contextGatherer.gatherCurrentFileContext(editor);
+                        const relevantSymbols = this.contextGatherer.findRelevantSymbols(data.message);
+                        const enhancedContext = {
+                            ...workspaceContext,
+                            currentFileContext,
+                            relevantSymbols,
+                            language: fileLanguage,
+                            selectedCode: selectedCode.trim() ? selectedCode : undefined
+                        };
+
+                        const enhancedQuery = await this.enhanceQuery(
+                            data.message,
+                            enhancedContext
+                        );
+
+                        // Now perform similarity search with enhanced query
+                        const similarity = await similaritySearch(enhancedQuery);
 
                         // Send progress message
                         this._view?.webview.postMessage({
