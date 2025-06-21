@@ -3,11 +3,21 @@ import { ChatViewProvider } from './ChatViewProvider';
 //import { AICompletionProvider } from './CompletionProvider';
 import { config } from './config';
 import { indexWorkspaceFiles, indexSingleFile } from './service/FileIndexer';
+import { ASTManager } from './service/ASTManager';
 
 export function activate(context: vscode.ExtensionContext) {
     const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl);
     
     let output = vscode.window.createOutputChannel("AI code assist");
+
+    // Initialize AST Manager
+    const astManager = ASTManager.getInstance();
+    astManager.initializeWorkspace(context).then(() => {
+        output.appendLine('AST Manager initialized successfully');
+    }).catch(err => {
+        output.appendLine(`Error initializing AST Manager: ${err}`);
+    });
+
     // Index workspace files when extension activates
     indexWorkspaceFiles(context.globalStorageUri).then(files => {
         output.appendLine(`Indexed ${files.length} files in workspace`);
