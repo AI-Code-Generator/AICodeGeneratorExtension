@@ -2,6 +2,7 @@
 import * as vscode from 'vscode';
 import { similaritySearch } from './service/FileIndexer';
 import { ContextGatherer } from './service/ContextGatherer';
+import { AgentService } from './service/AgentService';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     // private _view?: vscode.WebviewView;
@@ -85,6 +86,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _embedUrl: string;
     private readonly _enhanceUrl: string;
     private contextGatherer: ContextGatherer;
+    private agentService: AgentService;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -94,6 +96,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._embedUrl = `${baseUrl}/embed`;
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this.contextGatherer = new ContextGatherer();
+        this.agentService = new AgentService();
     }
 
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
@@ -181,7 +184,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
         // Handle messages from the webview
+        const agentUrl = this._queryUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
+            if (data.mode === 'agent') {
+                this.agentService.processRequest(data.message, agentUrl, (update) => {
+                    this._view?.webview.postMessage({
+                        type: 'addMessage',
+                        message: update,
+                        sender: 'assistant'
+                    });
+                });
+                return;
+            }
+
             switch (data.type) {
                 case 'sendMessage':
                     try {
@@ -193,7 +208,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const codeContext = this.getCodeContext(editor);
                         
                         // Embed the code context
-                        await this.embedCodeContext(codeContext, fileLanguage);
+                        // await this.embedCodeContext(codeContext, fileLanguage);
 
                         // Prepare the query with context
                         let query = `${data.message}\n\nLanguage: ${fileLanguage}`;
@@ -280,6 +295,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-family: var(--vscode-font-family); 
             padding: 10px; 
             margin: 0;
+        }
+        .mode-selector {
+            display: flex;
+            gap: 10px;
+            padding: 10px;
+            background: var(--vscode-editor-background);
+            border-bottom: 1px solid var(--vscode-input-border);
+        }
+        .mode-button {
+            padding: 8px 12px;
+            border: 1px solid var(--vscode-input-border);
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .mode-button.active {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
         }
         .message { 
             margin: 10px 0; 
@@ -394,6 +428,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
+    <div class="mode-selector">
+        <button id="askButton" class="mode-button active">Ask</button>
+        <button id="agentButton" class="mode-button">Agent</button>
+    </div>
     <div id="chatMessages"></div>
     <div id="loading" class="loading">Thinking...</div>
     <div class="input-container">
@@ -411,6 +449,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const sendButton = document.getElementById('sendButton');
         const chatMessages = document.getElementById('chatMessages');
         const loading = document.getElementById('loading');
+        const askButton = document.getElementById('askButton');
+        const agentButton = document.getElementById('agentButton');
+        let currentMode = 'ask';
+
+        askButton.addEventListener('click', () => {
+            currentMode = 'ask';
+            askButton.classList.add('active');
+            agentButton.classList.remove('active');
+        });
+
+        agentButton.addEventListener('click', () => {
+            currentMode = 'agent';
+            agentButton.classList.add('active');
+            askButton.classList.remove('active');
+        });
 
         // Create a code block with header and copy button
         function createCodeBlock(code, language) {
@@ -461,7 +514,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 loading.style.display = 'block';
                 vscode.postMessage({
                     type: 'sendMessage',
-                    message: message
+                    message: message,
+                    mode: currentMode
                 });
                 messageInput.value = '';
             }
