@@ -84,18 +84,31 @@ class ToolBox {
 
 export class AgentService {
     private toolbox = new ToolBox();
+    private shouldStop = false;
+    private currentAbortController?: AbortController;
 
     constructor() {
     }
 
     public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void) {
+        this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
         const maxSteps = 10;
 
         for (let i = 0; i < maxSteps; i++) {
+            if (this.shouldStop) {
+                sendUpdate("Agent stopped by user.");
+                return;
+            }
+
             sendUpdate(`--- Step ${i + 1} ---`);
 
             const { tool, args, thought } = await this.getNextActionFromModel(prompt, history, sendUpdate, serverUrl);
+
+            if (this.shouldStop) {
+                sendUpdate("Agent stopped by user.");
+                return;
+            }
 
             if (thought) {
                 sendUpdate(`Thought: ${thought}`);
@@ -128,6 +141,13 @@ export class AgentService {
             }
         }
         sendUpdate("Agent stopped after reaching max steps.");
+    }
+
+    public stop() {
+        this.shouldStop = true;
+        if (this.currentAbortController) {
+            this.currentAbortController.abort();
+        }
     }
 
     private getToolDefinitions() {
@@ -174,6 +194,8 @@ export class AgentService {
         `;
 
         try {
+            this.currentAbortController = new AbortController();
+            
             const response = await fetch(serverUrl, {
                 method: 'POST',
                 headers: {
@@ -182,7 +204,8 @@ export class AgentService {
                 body: JSON.stringify({ 
                     query: fullPrompt,
                     user_ID: "0001"
-                })
+                }),
+                signal: this.currentAbortController.signal
             });
 
             if (!response.ok) {
@@ -227,11 +250,21 @@ export class AgentService {
             };
 
         } catch (error: any) {
+            this.currentAbortController = undefined;
+            if (error.name === 'AbortError') {
+                return {
+                    thought: "Request was stopped by user.",
+                    tool: 'finish',
+                    args: ["Request was stopped by user."]
+                };
+            }
             return {
                 thought: "There was an error calling the model.",
                 tool: 'finish',
                 args: [`Error calling model: ${error.message}`]
             };
+        } finally {
+            this.currentAbortController = undefined;
         }
     }
 }
