@@ -2,89 +2,17 @@
 import * as vscode from 'vscode';
 import { similaritySearch } from './service/FileIndexer';
 import { ContextGatherer } from './service/ContextGatherer';
+import { AgentService } from './service/AgentService';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
-    // private _view?: vscode.WebviewView;
-
-    // constructor(
-    //     private readonly _extensionUri: vscode.Uri,
-    //     private readonly _serverUrl: string
-    // ) {}
-
-    // public resolveWebviewView(
-    //     webviewView: vscode.WebviewView,
-    //     context: vscode.WebviewViewResolveContext,
-    //     _token: vscode.CancellationToken,
-    // ) {
-    //     this._view = webviewView;
-
-    //     webviewView.webview.options = {
-    //         enableScripts: true,
-    //         localResourceRoots: [this._extensionUri]
-    //     };
-
-    //     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
-
-    //     // Handle messages from the webview
-    //     webviewView.webview.onDidReceiveMessage(async (data) => {
-    //         switch (data.type) {
-    //             case 'sendMessage':
-    //                 try {
-    //                     // Get selected code if any
-    //                     const editor = vscode.window.activeTextEditor;
-    //                     const selectedCode = editor?.document.getText(editor.selection) || '';
-    //                     const fileLanguage = editor?.document.languageId || '';
-
-    //                     // Prepare the query with context
-    //                     const query = `${data.message}\n\nContext:\nLanguage: ${fileLanguage}\nSelected code:\n${selectedCode}`;
-
-    //                     // Send progress message
-    //                     this._view?.webview.postMessage({
-    //                         type: 'addMessage',
-    //                         message: data.message,
-    //                         sender: 'user'
-    //                     });
-
-    //                     // Send request to server using native fetch
-    //                     const response = await fetch(this._serverUrl, {
-    //                         method: 'POST',
-    //                         headers: {
-    //                             'Content-Type': 'application/json',
-    //                         },
-    //                         body: JSON.stringify({ query: query })
-    //                     });
-
-    //                     const jsonResponse: any = await response.json();
-
-    //                     if (jsonResponse.success) {
-    //                         // Send response back to webview
-    //                         this._view?.webview.postMessage({
-    //                             type: 'addMessage',
-    //                             message: jsonResponse.result,
-    //                             sender: 'assistant'
-    //                         });
-    //                     } else {
-    //                         throw new Error('Server request failed');
-    //                     }
-    //                 } catch (error) {
-    //                     vscode.window.showErrorMessage(`Error: ${error}`);
-    //                     // Show error in chat
-    //                     this._view?.webview.postMessage({
-    //                         type: 'addMessage',
-    //                         message: 'Sorry, there was an error processing your request.',
-    //                         sender: 'assistant'
-    //                     });
-    //                 }
-    //                 break;
-    //         }
-    //     });
-    // }
-
     private _view?: vscode.WebviewView;
     private readonly _queryUrl: string;
     private readonly _embedUrl: string;
     private readonly _enhanceUrl: string;
     private contextGatherer: ContextGatherer;
+    private agentService: AgentService;
+    private currentAbortController?: AbortController;
+    private isProcessing: boolean = false;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -94,6 +22,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._embedUrl = `${baseUrl}/embed`;
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this.contextGatherer = new ContextGatherer();
+        this.agentService = new AgentService();
     }
 
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
@@ -181,10 +110,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
         // Handle messages from the webview
+        const agentUrl = this._queryUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
+            if (data.type === 'stopProcess') {
+                this.stopCurrentProcess();
+                return;
+            }
+
+            if (data.mode === 'agent') {
+                this.isProcessing = true;
+                this.updateProcessingState();
+                
+                this.agentService.processRequest(data.message, agentUrl, (update) => {
+                    this._view?.webview.postMessage({
+                        type: 'addMessage',
+                        message: update,
+                        sender: 'assistant'
+                    });
+                }).finally(() => {
+                    this.isProcessing = false;
+                    this.updateProcessingState();
+                });
+                return;
+            }
+
             switch (data.type) {
                 case 'sendMessage':
                     try {
+                        this.isProcessing = true;
+                        this.updateProcessingState();
+                        
+                        // Create abort controller for this request
+                        this.currentAbortController = new AbortController();
+                        
                         const editor = vscode.window.activeTextEditor;
                         const selectedCode = editor?.document.getText(editor.selection) || '';
                         const fileLanguage = editor?.document.languageId || '';
@@ -193,7 +151,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const codeContext = this.getCodeContext(editor);
                         
                         // Embed the code context
-                        await this.embedCodeContext(codeContext, fileLanguage);
+                        // await this.embedCodeContext(codeContext, fileLanguage);
 
                         // Prepare the query with context
                         let query = `${data.message}\n\nLanguage: ${fileLanguage}`;
@@ -240,7 +198,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 query: query,
                                 context: similarity,
                                 user_ID: "0001"
-                            })
+                            }),
+                            signal: this.currentAbortController.signal
                         });
 
                         const jsonResponse: any = await response.json();
@@ -255,16 +214,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         } else {
                             throw new Error('Server request failed');
                         }
-                    } catch (error) {
-                        vscode.window.showErrorMessage(`Error: ${error}`);
-                        this._view?.webview.postMessage({
-                            type: 'addMessage',
-                            message: 'Sorry, there was an error processing your request.',
-                            sender: 'assistant'
-                        });
+                    } catch (error: any) {
+                        if (error.name === 'AbortError') {
+                            this._view?.webview.postMessage({
+                                type: 'addMessage',
+                                message: 'Request was stopped by user.',
+                                sender: 'assistant'
+                            });
+                        } else {
+                            vscode.window.showErrorMessage(`Error: ${error}`);
+                            this._view?.webview.postMessage({
+                                type: 'addMessage',
+                                message: 'Sorry, there was an error processing your request.',
+                                sender: 'assistant'
+                            });
+                        }
+                    } finally {
+                        this.isProcessing = false;
+                        this.currentAbortController = undefined;
+                        this.updateProcessingState();
                     }
                     break;
             }
+        });
+    }
+
+    private stopCurrentProcess() {
+        if (this.currentAbortController) {
+            this.currentAbortController.abort();
+        }
+        if (this.agentService) {
+            this.agentService.stop();
+        }
+        this.isProcessing = false;
+        this.updateProcessingState();
+    }
+
+    private updateProcessingState() {
+        this._view?.webview.postMessage({
+            type: 'updateProcessingState',
+            isProcessing: this.isProcessing
         });
     }
 
@@ -280,6 +269,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-family: var(--vscode-font-family); 
             padding: 10px; 
             margin: 0;
+        }
+        .mode-selector {
+            display: flex;
+            gap: 10px;
+            padding: 10px;
+            background: var(--vscode-editor-background);
+            border-bottom: 1px solid var(--vscode-input-border);
+        }
+        .mode-button {
+            padding: 8px 12px;
+            border: 1px solid var(--vscode-input-border);
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .mode-button.active {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
         }
         .message { 
             margin: 10px 0; 
@@ -315,7 +323,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             border-radius: 4px;
             min-height: 40px;
         }
-        #sendButton {
+        #sendButton, #stopButton {
             padding: 8px 16px;
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
@@ -324,8 +332,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             white-space: nowrap;
         }
-        #sendButton:hover {
+        #sendButton:hover, #stopButton:hover {
             background: var(--vscode-button-hoverBackground);
+        }
+        #stopButton {
+            background: var(--vscode-errorForeground);
+            color: white;
+            display: none;
+        }
+        #stopButton:hover {
+            background: var(--vscode-errorForeground);
+            opacity: 0.8;
         }
         #chatMessages {
             height: calc(100vh - 100px);
@@ -394,6 +411,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
+    <div class="mode-selector">
+        <button id="askButton" class="mode-button active">Ask</button>
+        <button id="agentButton" class="mode-button">Agent</button>
+    </div>
     <div id="chatMessages"></div>
     <div id="loading" class="loading">Thinking...</div>
     <div class="input-container">
@@ -403,14 +424,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             rows="1"
         ></textarea>
         <button id="sendButton">Send</button>
+        <button id="stopButton">Stop</button>
     </div>
 
     <script>
         const vscode = acquireVsCodeApi();
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
+        const stopButton = document.getElementById('stopButton');
         const chatMessages = document.getElementById('chatMessages');
         const loading = document.getElementById('loading');
+        const askButton = document.getElementById('askButton');
+        const agentButton = document.getElementById('agentButton');
+        let currentMode = 'ask';
+        let isProcessing = false;
+
+        askButton.addEventListener('click', () => {
+            currentMode = 'ask';
+            askButton.classList.add('active');
+            agentButton.classList.remove('active');
+        });
+
+        agentButton.addEventListener('click', () => {
+            currentMode = 'agent';
+            agentButton.classList.add('active');
+            askButton.classList.remove('active');
+        });
 
         // Create a code block with header and copy button
         function createCodeBlock(code, language) {
@@ -457,13 +496,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         function sendMessage() {
             const message = messageInput.value.trim();
-            if (message) {
+            if (message && !isProcessing) {
+                isProcessing = true;
+                updateButtonStates();
                 loading.style.display = 'block';
                 vscode.postMessage({
                     type: 'sendMessage',
-                    message: message
+                    message: message,
+                    mode: currentMode
                 });
                 messageInput.value = '';
+            }
+        }
+
+        function stopProcess() {
+            if (isProcessing) {
+                vscode.postMessage({
+                    type: 'stopProcess'
+                });
+            }
+        }
+
+        function updateButtonStates() {
+            if (isProcessing) {
+                sendButton.style.display = 'none';
+                stopButton.style.display = 'block';
+            } else {
+                sendButton.style.display = 'block';
+                stopButton.style.display = 'none';
             }
         }
 
@@ -481,13 +541,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
-        // Handle button click
+        // Handle button clicks
         sendButton.addEventListener('click', sendMessage);
+        stopButton.addEventListener('click', stopProcess);
 
         // Process incoming messages
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.type) {
+                case 'updateProcessingState':
+                    isProcessing = message.isProcessing;
+                    updateButtonStates();
+                    if (!isProcessing) {
+                        loading.style.display = 'none';
+                    }
+                    break;
                 case 'addMessage':
                     loading.style.display = 'none';
                     const messageDiv = document.createElement('div');
@@ -538,8 +606,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
-        // Initial focus
+        // Initial setup
         messageInput.focus();
+        updateButtonStates();
     </script>
 </body>
 </html>
