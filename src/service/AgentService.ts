@@ -195,13 +195,35 @@ export class AgentService {
             }
 
             const jsonResponse = await response.json();
-            // Assuming the endpoint returns the JSON in a specific field, e.g., "response"
-            const modelOutput = JSON.parse(jsonResponse.response);
+
+            let modelResponseText = jsonResponse.response;
+
+            const jsonMatch = modelResponseText.match(/```(json)?\s*([\s\S]*?)\s*```/);
+            if (jsonMatch && jsonMatch[2]) {
+                modelResponseText = jsonMatch[2];
+            }
+            
+            const modelOutput = JSON.parse(modelResponseText);
+            const toolName = modelOutput.tool_call.name;
+            let args = modelOutput.tool_call.args;
+
+            // Convert args from object to array based on tool definition
+            if (!Array.isArray(args) && typeof args === 'object' && args !== null) {
+                const toolDef = this.getToolDefinitions().find(t => t.name === toolName);
+                if (toolDef && toolDef.args) {
+                    args = toolDef.args.map((argDef: any) => args[argDef.name]);
+                } else {
+                    // If no tool definition found or no args defined, convert object values to array
+                    args = Object.values(args);
+                }
+            } else if (!Array.isArray(args)) {
+                args = [];
+            }
 
             return {
                 thought: modelOutput.thought,
-                tool: modelOutput.tool_call.name,
-                args: modelOutput.tool_call.args
+                tool: toolName,
+                args: args
             };
 
         } catch (error: any) {
