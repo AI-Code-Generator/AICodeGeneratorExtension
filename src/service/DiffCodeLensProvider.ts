@@ -26,28 +26,36 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
                 continue; // Skip rejected changes
             }
 
-            // Position the CodeLens at the start of the changed block
-            const range = new vscode.Range(
-                change.startLine,
-                0,
-                change.startLine,
-                0
-            );
+            // Position the CodeLens based on change type
+            let range: vscode.Range;
+            
+            if (change.changeType === 'delete') {
+                // For deletions, position CodeLens at the deletion point
+                const line = Math.min(change.startLine, document.lineCount - 1);
+                range = new vscode.Range(line, 0, line, 0);
+            } else {
+                // For insertions and replacements, position at the start of the changed block
+                range = new vscode.Range(change.startLine, 0, change.startLine, 0);
+            }
+
+            // Create different button text based on change type
+            const changeTypeText = change.changeType === 'delete' ? ' (Deletion)' : 
+                                 change.changeType === 'insert' ? ' (Addition)' : ' (Modification)';
 
             // Accept button
             const acceptCodeLens = new vscode.CodeLens(range, {
-                title: "✓ Accept",
+                title: `✓ Accept${changeTypeText}`,
                 command: 'aiCodeAssist.acceptChange',
                 arguments: [change.id],
-                tooltip: 'Accept this change'
+                tooltip: `Accept this ${change.changeType}`
             });
 
             // Reject button
             const rejectCodeLens = new vscode.CodeLens(range, {
-                title: "✗ Reject",
+                title: `✗ Reject${changeTypeText}`,
                 command: 'aiCodeAssist.rejectChange',
                 arguments: [change.id],
-                tooltip: 'Reject this change and revert to original'
+                tooltip: `Reject this ${change.changeType} and revert to original`
             });
 
             codeLenses.push(acceptCodeLens, rejectCodeLens);

@@ -12,23 +12,54 @@ export interface DiffChange {
     endLine: number;
     applied: boolean;
     timestamp: Date;
+    changeType: 'insert' | 'delete' | 'replace'; // Add change type
 }
 
 export class DiffManager {
     private static instance: DiffManager;
     private pendingChanges: Map<string, DiffChange[]> = new Map();
-    private decorationType: vscode.TextEditorDecorationType;
+    private insertDecorationType: vscode.TextEditorDecorationType;
+    private deleteDecorationType: vscode.TextEditorDecorationType;
+    private replaceDecorationType: vscode.TextEditorDecorationType;
     private updateTimeouts: Map<string, NodeJS.Timeout> = new Map();
 
     private constructor() {
-        this.decorationType = vscode.window.createTextEditorDecorationType({
+        // Insert decoration (green background)
+        this.insertDecorationType = vscode.window.createTextEditorDecorationType({
             backgroundColor: new vscode.ThemeColor('merge.incomingContentBackground'),
             isWholeLine: true,
             overviewRulerColor: new vscode.ThemeColor('merge.incomingHeaderBackground'),
             overviewRulerLane: vscode.OverviewRulerLane.Right,
             after: {
-                contentText: ' ← AI Generated',
+                contentText: ' ← AI Generated (Added)',
                 color: new vscode.ThemeColor('merge.incomingHeaderBackground'),
+                fontStyle: 'italic',
+                margin: '0 0 0 1em'
+            }
+        });
+
+        // Replace decoration (blue background)
+        this.replaceDecorationType = vscode.window.createTextEditorDecorationType({
+            backgroundColor: new vscode.ThemeColor('merge.currentContentBackground'),
+            isWholeLine: true,
+            overviewRulerColor: new vscode.ThemeColor('merge.currentHeaderBackground'),
+            overviewRulerLane: vscode.OverviewRulerLane.Right,
+            after: {
+                contentText: ' ← AI Generated (Modified)',
+                color: new vscode.ThemeColor('merge.currentHeaderBackground'),
+                fontStyle: 'italic',
+                margin: '0 0 0 1em'
+            }
+        });
+
+        // Delete decoration (shows deleted content)
+        this.deleteDecorationType = vscode.window.createTextEditorDecorationType({
+            backgroundColor: new vscode.ThemeColor('editorError.background'),
+            overviewRulerColor: new vscode.ThemeColor('editorError.foreground'),
+            overviewRulerLane: vscode.OverviewRulerLane.Right,
+            after: {
+                contentText: ' ← AI Generated (Deleted)',
+                color: new vscode.ThemeColor('editorError.foreground'),
                 fontStyle: 'italic',
                 margin: '0 0 0 1em'
             }
@@ -98,15 +129,28 @@ export class DiffManager {
 
         for (const change of diff) {
             if (change.type !== 'equal') {
+                let startLine, endLine;
+                
+                if (change.type === 'delete') {
+                    // For deletions, position at where the deletion occurred in the new file
+                    startLine = change.newStart;
+                    endLine = change.newStart;
+                } else {
+                    // For insertions and replacements, use the actual new lines
+                    startLine = change.newStart;
+                    endLine = change.newStart + Math.max(change.newLines.length, 1) - 1;
+                }
+                
                 changes.push({
                     id: `${filePath}-${changeId++}`,
                     filePath,
                     originalContent: change.originalLines.join('\n'),
                     newContent: change.newLines.join('\n'),
-                    startLine: change.newStart,
-                    endLine: change.newStart + change.newLines.length - 1,
+                    startLine,
+                    endLine,
                     applied: true,
-                    timestamp: new Date()
+                    timestamp: new Date(),
+                    changeType: change.type as 'insert' | 'delete' | 'replace'
                 });
             }
         }
@@ -268,43 +312,78 @@ export class DiffManager {
         const changes = this.pendingChanges.get(filePath);
 
         if (!changes || changes.length === 0) {
-            editor.setDecorations(this.decorationType, []);
+            editor.setDecorations(this.insertDecorationType, []);
+            editor.setDecorations(this.replaceDecorationType, []);
+            editor.setDecorations(this.deleteDecorationType, []);
             return;
         }
 
-        const decorations: vscode.DecorationOptions[] = [];
+        const insertDecorations: vscode.DecorationOptions[] = [];
+        const replaceDecorations: vscode.DecorationOptions[] = [];
+        const deleteDecorations: vscode.DecorationOptions[] = [];
         
         for (const change of changes) {
             if (!change.applied) {
                 continue; // Skip rejected changes
             }
 
-            // Ensure the line numbers are valid for the current document
-            const maxLine = Math.min(change.endLine, editor.document.lineCount - 1);
-            const startLine = Math.min(change.startLine, editor.document.lineCount - 1);
+            // Handle different change types
+            if (change.changeType === 'delete') {
+                // For deletions, show at the position where deletion occurred
+                let line = Math.min(change.startLine, editor.document.lineCount - 1);
+                // If deletion is at the end of file, show on the last line
+                if (line < 0) {
+                    line = Math.max(0, editor.document.lineCount - 1);
+                }
+                
+                const range = new vscode.Range(line, 0, line, editor.document.lineAt(line).text.length);
 
-            if (startLine >= 0 && maxLine >= startLine) {
-                const range = new vscode.Range(
-                    startLine,
-                    0,
-                    maxLine,
-                    editor.document.lineAt(maxLine).text.length
-                );
-
-                decorations.push({
+                deleteDecorations.push({
                     range,
                     hoverMessage: new vscode.MarkdownString(
-                        `**AI Generated Change**\n\n` +
+                        `**AI Generated Deletion**\n\n` +
                         `Change ID: \`${change.id}\`\n\n` +
                         `Applied at: ${change.timestamp.toLocaleString()}\n\n` +
-                        `**Original:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` +
-                        `**New:**\n\`\`\`\n${change.newContent}\n\`\`\``
+                        `**Deleted Content:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` +
+                        `*Content was removed from this location*`
                     )
                 });
+            } else {
+                // For insertions and replacements, highlight the actual lines
+                const maxLine = Math.min(change.endLine, editor.document.lineCount - 1);
+                const startLine = Math.min(change.startLine, editor.document.lineCount - 1);
+
+                if (startLine >= 0 && maxLine >= startLine) {
+                    const range = new vscode.Range(
+                        startLine,
+                        0,
+                        maxLine,
+                        editor.document.lineAt(maxLine).text.length
+                    );
+
+                    const decoration = {
+                        range,
+                        hoverMessage: new vscode.MarkdownString(
+                            `**AI Generated ${change.changeType === 'insert' ? 'Addition' : 'Modification'}**\n\n` +
+                            `Change ID: \`${change.id}\`\n\n` +
+                            `Applied at: ${change.timestamp.toLocaleString()}\n\n` +
+                            (change.originalContent ? `**Original:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` : '') +
+                            `**New:**\n\`\`\`\n${change.newContent}\n\`\`\``
+                        )
+                    };
+
+                    if (change.changeType === 'insert') {
+                        insertDecorations.push(decoration);
+                    } else {
+                        replaceDecorations.push(decoration);
+                    }
+                }
             }
         }
 
-        editor.setDecorations(this.decorationType, decorations);
+        editor.setDecorations(this.insertDecorationType, insertDecorations);
+        editor.setDecorations(this.replaceDecorationType, replaceDecorations);
+        editor.setDecorations(this.deleteDecorationType, deleteDecorations);
     }
 
     private handleTextDocumentChange(event: vscode.TextDocumentChangeEvent): void {
@@ -414,7 +493,9 @@ export class DiffManager {
     }
 
     public dispose(): void {
-        this.decorationType.dispose();
+        this.insertDecorationType.dispose();
+        this.replaceDecorationType.dispose();
+        this.deleteDecorationType.dispose();
         this.pendingChanges.clear();
         
         // Clear all pending timeouts
