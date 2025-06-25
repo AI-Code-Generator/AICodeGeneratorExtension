@@ -1,0 +1,431 @@
+// src/service/DiffManager.ts
+import * as vscode from 'vscode';
+import { promises as fs } from 'fs';
+import * as path from 'path';
+
+export interface DiffChange {
+    id: string;
+    filePath: string;
+    originalContent: string;
+    newContent: string;
+    startLine: number;
+    endLine: number;
+    applied: boolean;
+    timestamp: Date;
+}
+
+export class DiffManager {
+    private static instance: DiffManager;
+    private pendingChanges: Map<string, DiffChange[]> = new Map();
+    private decorationType: vscode.TextEditorDecorationType;
+    private updateTimeouts: Map<string, NodeJS.Timeout> = new Map();
+
+    private constructor() {
+        this.decorationType = vscode.window.createTextEditorDecorationType({
+            backgroundColor: new vscode.ThemeColor('merge.incomingContentBackground'),
+            isWholeLine: true,
+            overviewRulerColor: new vscode.ThemeColor('merge.incomingHeaderBackground'),
+            overviewRulerLane: vscode.OverviewRulerLane.Right,
+            after: {
+                contentText: ' ← AI Generated',
+                color: new vscode.ThemeColor('merge.incomingHeaderBackground'),
+                fontStyle: 'italic',
+                margin: '0 0 0 1em'
+            }
+        });
+
+        // Listen for active editor changes to update decorations
+        vscode.window.onDidChangeActiveTextEditor(this.updateDecorations.bind(this));
+        vscode.workspace.onDidChangeTextDocument(this.handleTextDocumentChange.bind(this));
+        vscode.window.onDidChangeVisibleTextEditors(this.updateAllVisibleDecorations.bind(this));
+    }
+
+    public static getInstance(): DiffManager {
+        if (!DiffManager.instance) {
+            DiffManager.instance = new DiffManager();
+        }
+        return DiffManager.instance;
+    }
+
+    public async applyChangeWithDiff(filePath: string, newContent: string): Promise<string> {
+        const absolutePath = this.getAbsolutePath(filePath);
+        
+        // Read current content
+        let originalContent: string;
+        try {
+            originalContent = await fs.readFile(absolutePath, 'utf-8');
+        } catch (error) {
+            // File doesn't exist, create it
+            originalContent = '';
+        }
+
+        // Generate diff
+        const changes = this.generateDiffChanges(originalContent, newContent, filePath);
+        
+        if (changes.length === 0) {
+            return 'No changes detected';
+        }
+
+        // Store pending changes
+        this.pendingChanges.set(filePath, changes);
+
+        // Apply changes to file immediately
+        await fs.writeFile(absolutePath, newContent, 'utf-8');
+
+        // Open the file if not already open
+        await this.ensureFileIsOpen(absolutePath);
+
+        // Force decoration update with a slight delay to ensure file is loaded
+        setTimeout(() => {
+            this.updateAllVisibleDecorations();
+            // Force a second update to handle any timing issues
+            setTimeout(() => {
+                this.updateAllVisibleDecorations();
+            }, 200);
+        }, 100);
+
+        return `Applied ${changes.length} changes to ${path.basename(filePath)}. Review and accept/reject individual changes.`;
+    }
+
+    private generateDiffChanges(originalContent: string, newContent: string, filePath: string): DiffChange[] {
+        const originalLines = originalContent.split('\n');
+        const newLines = newContent.split('\n');
+        const changes: DiffChange[] = [];
+
+        // Use a simple LCS-based diff algorithm
+        const diff = this.computeDiff(originalLines, newLines);
+        let changeId = 0;
+
+        for (const change of diff) {
+            if (change.type !== 'equal') {
+                changes.push({
+                    id: `${filePath}-${changeId++}`,
+                    filePath,
+                    originalContent: change.originalLines.join('\n'),
+                    newContent: change.newLines.join('\n'),
+                    startLine: change.newStart,
+                    endLine: change.newStart + change.newLines.length - 1,
+                    applied: true,
+                    timestamp: new Date()
+                });
+            }
+        }
+
+        return changes;
+    }
+
+    private computeDiff(originalLines: string[], newLines: string[]): Array<{
+        type: 'equal' | 'delete' | 'insert' | 'replace';
+        originalStart: number;
+        originalLines: string[];
+        newStart: number;
+        newLines: string[];
+    }> {
+        const diff: Array<{
+            type: 'equal' | 'delete' | 'insert' | 'replace';
+            originalStart: number;
+            originalLines: string[];
+            newStart: number;
+            newLines: string[];
+        }> = [];
+
+        let i = 0, j = 0;
+
+        while (i < originalLines.length || j < newLines.length) {
+            // Find equal lines
+            const equalStart = { original: i, new: j };
+            while (i < originalLines.length && j < newLines.length && originalLines[i] === newLines[j]) {
+                i++;
+                j++;
+            }
+
+            if (i > equalStart.original) {
+                diff.push({
+                    type: 'equal',
+                    originalStart: equalStart.original,
+                    originalLines: originalLines.slice(equalStart.original, i),
+                    newStart: equalStart.new,
+                    newLines: newLines.slice(equalStart.new, j)
+                });
+            }
+
+            if (i >= originalLines.length && j >= newLines.length) {
+                break;
+            }
+
+            // Find the next matching block
+            const changeStart = { original: i, new: j };
+            let foundMatch = false;
+
+            // Look ahead to find next common line
+            for (let lookAhead = 1; lookAhead <= 10; lookAhead++) {
+                for (let oi = i; oi < Math.min(i + lookAhead, originalLines.length); oi++) {
+                    for (let ni = j; ni < Math.min(j + lookAhead, newLines.length); ni++) {
+                        if (originalLines[oi] === newLines[ni] &&
+                            oi + 1 < originalLines.length && ni + 1 < newLines.length &&
+                            originalLines[oi + 1] === newLines[ni + 1]) {
+                            
+                            // Create change block
+                            const originalBlock = originalLines.slice(changeStart.original, oi);
+                            const newBlock = newLines.slice(changeStart.new, ni);
+                            
+                            if (originalBlock.length > 0 || newBlock.length > 0) {
+                                let changeType: 'delete' | 'insert' | 'replace';
+                                if (originalBlock.length === 0) {
+                                    changeType = 'insert';
+                                } else if (newBlock.length === 0) {
+                                    changeType = 'delete';
+                                } else {
+                                    changeType = 'replace';
+                                }
+
+                                diff.push({
+                                    type: changeType,
+                                    originalStart: changeStart.original,
+                                    originalLines: originalBlock,
+                                    newStart: changeStart.new,
+                                    newLines: newBlock
+                                });
+                            }
+
+                            i = oi;
+                            j = ni;
+                            foundMatch = true;
+                            break;
+                        }
+                    }
+                    if (foundMatch) {
+                        break;
+                    }
+                }
+                if (foundMatch) {
+                    break;
+                }
+            }
+
+            if (!foundMatch) {
+                // No more matches found, treat rest as change
+                const originalBlock = originalLines.slice(changeStart.original);
+                const newBlock = newLines.slice(changeStart.new);
+                
+                if (originalBlock.length > 0 || newBlock.length > 0) {
+                    let changeType: 'delete' | 'insert' | 'replace';
+                    if (originalBlock.length === 0) {
+                        changeType = 'insert';
+                    } else if (newBlock.length === 0) {
+                        changeType = 'delete';
+                    } else {
+                        changeType = 'replace';
+                    }
+
+                    diff.push({
+                        type: changeType,
+                        originalStart: changeStart.original,
+                        originalLines: originalBlock,
+                        newStart: changeStart.new,
+                        newLines: newBlock
+                    });
+                }
+                break;
+            }
+        }
+
+        return diff;
+    }
+
+    private async ensureFileIsOpen(absolutePath: string): Promise<void> {
+        const uri = vscode.Uri.file(absolutePath);
+        
+        // Check if file is already open in any visible editor
+        const visibleEditors = vscode.window.visibleTextEditors;
+        const isAlreadyVisible = visibleEditors.some(editor => 
+            editor.document.uri.fsPath === uri.fsPath
+        );
+
+        if (!isAlreadyVisible) {
+            // Open the file
+            const document = await vscode.workspace.openTextDocument(uri);
+            await vscode.window.showTextDocument(document, vscode.ViewColumn.Active);
+        }
+    }
+
+    private updateDecorations(): void {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor) {
+            this.updateDecorationsForEditor(activeEditor);
+        }
+    }
+
+    private updateAllVisibleDecorations(): void {
+        // Update decorations for all visible editors
+        vscode.window.visibleTextEditors.forEach(editor => {
+            this.updateDecorationsForEditor(editor);
+        });
+    }
+
+    private updateDecorationsForEditor(editor: vscode.TextEditor): void {
+        const filePath = vscode.workspace.asRelativePath(editor.document.uri);
+        const changes = this.pendingChanges.get(filePath);
+
+        if (!changes || changes.length === 0) {
+            editor.setDecorations(this.decorationType, []);
+            return;
+        }
+
+        const decorations: vscode.DecorationOptions[] = [];
+        
+        for (const change of changes) {
+            if (!change.applied) {
+                continue; // Skip rejected changes
+            }
+
+            // Ensure the line numbers are valid for the current document
+            const maxLine = Math.min(change.endLine, editor.document.lineCount - 1);
+            const startLine = Math.min(change.startLine, editor.document.lineCount - 1);
+
+            if (startLine >= 0 && maxLine >= startLine) {
+                const range = new vscode.Range(
+                    startLine,
+                    0,
+                    maxLine,
+                    editor.document.lineAt(maxLine).text.length
+                );
+
+                decorations.push({
+                    range,
+                    hoverMessage: new vscode.MarkdownString(
+                        `**AI Generated Change**\n\n` +
+                        `Change ID: \`${change.id}\`\n\n` +
+                        `Applied at: ${change.timestamp.toLocaleString()}\n\n` +
+                        `**Original:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` +
+                        `**New:**\n\`\`\`\n${change.newContent}\n\`\`\``
+                    )
+                });
+            }
+        }
+
+        editor.setDecorations(this.decorationType, decorations);
+    }
+
+    private handleTextDocumentChange(event: vscode.TextDocumentChangeEvent): void {
+        // Update decorations when document changes, but with a delay to avoid too frequent updates
+        const filePath = vscode.workspace.asRelativePath(event.document.uri);
+        
+        if (this.pendingChanges.has(filePath)) {
+            // Clear any existing timeout for this file
+            clearTimeout(this.updateTimeouts.get(filePath));
+            
+            // Set a new timeout to update decorations
+            const timeout = setTimeout(() => {
+                // Find the editor for this document and update its decorations
+                const editor = vscode.window.visibleTextEditors.find(
+                    e => e.document.uri.fsPath === event.document.uri.fsPath
+                );
+                if (editor) {
+                    this.updateDecorationsForEditor(editor);
+                }
+                this.updateTimeouts.delete(filePath);
+            }, 150);
+            
+            this.updateTimeouts.set(filePath, timeout);
+        }
+    }
+
+    public acceptChange(changeId: string): void {
+        for (const [filePath, changes] of this.pendingChanges) {
+            const change = changes.find(c => c.id === changeId);
+            if (change) {
+                // Change is already applied, just remove it from pending
+                const index = changes.indexOf(change);
+                changes.splice(index, 1);
+                
+                if (changes.length === 0) {
+                    this.pendingChanges.delete(filePath);
+                }
+                
+                // Force immediate decoration update
+                this.updateAllVisibleDecorations();
+                vscode.window.showInformationMessage(`Accepted change ${changeId}`);
+                return;
+            }
+        }
+    }
+
+    public async rejectChange(changeId: string): Promise<void> {
+        for (const [filePath, changes] of this.pendingChanges) {
+            const change = changes.find(c => c.id === changeId);
+            if (change) {
+                // Revert the change in the file
+                const absolutePath = this.getAbsolutePath(filePath);
+                const currentContent = await fs.readFile(absolutePath, 'utf-8');
+                const lines = currentContent.split('\n');
+                
+                // Find the exact lines to replace
+                const startLine = change.startLine;
+                const endLine = change.endLine;
+                const linesToReplace = endLine - startLine + 1;
+                
+                // Replace the changed lines with original content
+                const originalLines = change.originalContent.split('\n');
+                
+                // Handle empty original content (pure insertion)
+                if (change.originalContent.trim() === '') {
+                    // Remove the inserted lines
+                    lines.splice(startLine, linesToReplace);
+                } else {
+                    // Replace with original lines
+                    lines.splice(startLine, linesToReplace, ...originalLines);
+                }
+                
+                await fs.writeFile(absolutePath, lines.join('\n'), 'utf-8');
+                
+                // Remove from pending changes
+                const index = changes.indexOf(change);
+                changes.splice(index, 1);
+                
+                if (changes.length === 0) {
+                    this.pendingChanges.delete(filePath);
+                }
+                
+                // Force immediate decoration update
+                this.updateAllVisibleDecorations();
+                vscode.window.showInformationMessage(`Rejected change ${changeId}`);
+                return;
+            }
+        }
+    }
+
+    public getPendingChanges(filePath: string): DiffChange[] {
+        return this.pendingChanges.get(filePath) || [];
+    }
+
+    public getAllPendingChanges(): Map<string, DiffChange[]> {
+        return new Map(this.pendingChanges);
+    }
+
+    private getAbsolutePath(filePath: string): string {
+        if (path.isAbsolute(filePath)) {
+            return filePath;
+        }
+        if (vscode.workspace.workspaceFolders) {
+            return path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, filePath);
+        }
+        return filePath;
+    }
+
+    public dispose(): void {
+        this.decorationType.dispose();
+        this.pendingChanges.clear();
+        
+        // Clear all pending timeouts
+        for (const timeout of this.updateTimeouts.values()) {
+            clearTimeout(timeout);
+        }
+        this.updateTimeouts.clear();
+    }
+
+    public forceRefreshDecorations(): void {
+        // Force refresh decorations for all visible editors
+        this.updateAllVisibleDecorations();
+    }
+}
