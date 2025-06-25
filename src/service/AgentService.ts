@@ -3,9 +3,15 @@ import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
+import { DiffManager } from './DiffManager';
 
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
+    private diffManager: DiffManager;
+
+    constructor() {
+        this.diffManager = DiffManager.getInstance();
+    }
     public async list_files(): Promise<string[]> {
         // Find all files, ignoring .git, node_modules, and other common exclusions
         const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
@@ -21,34 +27,8 @@ class ToolBox {
         }
     }
 
-    public async propose_file_change(filePath: string, newContent: string): Promise<boolean> {
-        const absolutePath = this.getAbsolutePath(filePath);
-        const originalContent = await this.read_file(filePath);
-
-        const originalUri = vscode.Uri.file(absolutePath).with({ scheme: 'file' });
-        const newUri = vscode.Uri.file(`${absolutePath}.agent.tmp`).with({ scheme: 'file' });
-
-        await fs.writeFile(newUri.fsPath, newContent);
-
-        await vscode.commands.executeCommand('vscode.diff', originalUri, newUri, `Proposed changes for ${path.basename(filePath)}`);
-
-        const choice = await vscode.window.showInformationMessage(
-            `Apply changes to ${path.basename(filePath)}?`,
-            { modal: true },
-            'Yes',
-            'No'
-        );
-
-        await fs.unlink(newUri.fsPath);
-
-        if (choice === 'Yes') {
-            await fs.writeFile(absolutePath, newContent);
-            vscode.window.showInformationMessage(`Applied changes to ${path.basename(filePath)}`);
-            return true;
-        } else {
-            vscode.window.showInformationMessage(`Discarded changes for ${path.basename(filePath)}`);
-            return false;
-        }
+    public async apply_file_change(filePath: string, newContent: string): Promise<string> {
+        return await this.diffManager.applyChangeWithDiff(filePath, newContent);
     }
 
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
@@ -154,7 +134,7 @@ export class AgentService {
         return [
             { name: 'list_files', description: 'List all files in the workspace. Returns an array of relative file paths.' },
             { name: 'read_file', description: 'Read the content of a file at a given relative path.', args: [{ name: 'filePath', type: 'string' }] },
-            { name: 'propose_file_change', description: 'Propose a change to a file. Shows a diff to the user who can accept or reject it. Returns true if accepted, false otherwise.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
+            { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
             { name: 'finish', description: 'Finishes the task with a message.', args: [{ name: 'message', type: 'string' }] }
         ];
@@ -166,9 +146,17 @@ export class AgentService {
         const systemPrompt = `
             You are an expert AI programmer agent.
             Your goal is to complete the user's request: "${prompt}"
-            You operate in a loop. In each step, you will be given the user's request and a history of your previous actions and their results.
-            You must choose one of the following tools to use in this step. Call the tool with the correct arguments.
-            Do not ask for clarification.
+            
+            CRITICAL INSTRUCTIONS:
+            1. You operate autonomously - make file changes immediately without asking permission
+            2. apply_file_change tool applies changes instantly to files
+            3. Users see diffs with accept/reject buttons after you make changes
+            4. NEVER ask "Should I..." or "Would you like me to..." - just do it
+            5. Complete the entire task by making all necessary changes
+            6. Only use 'finish' when the task is completely done
+            
+            You operate in a loop. In each step, choose the appropriate tool and execute it.
+            Do not ask for clarification or permission.
 
             Tools:
             ${JSON.stringify(this.getToolDefinitions(), null, 2)}

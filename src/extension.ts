@@ -4,11 +4,19 @@ import { ChatViewProvider } from './ChatViewProvider';
 import { config } from './config';
 import { indexWorkspaceFiles, indexSingleFile } from './service/FileIndexer';
 import { ASTManager } from './service/ASTManager';
+import { DiffManager } from './service/DiffManager';
+import { DiffCodeLensProvider } from './service/DiffCodeLensProvider';
 
 export function activate(context: vscode.ExtensionContext) {
     const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl);
     
     let output = vscode.window.createOutputChannel("AI code assist");
+
+    // Initialize Diff Manager
+    const diffManager = DiffManager.getInstance();
+    
+    // Initialize CodeLens Provider for diffs
+    const diffCodeLensProvider = new DiffCodeLensProvider();
 
     // Initialize AST Manager
     const astManager = ASTManager.getInstance();
@@ -62,6 +70,31 @@ export function activate(context: vscode.ExtensionContext) {
         )
     );
 
+    // Register CodeLens provider for all languages
+    context.subscriptions.push(
+        vscode.languages.registerCodeLensProvider(
+            { scheme: 'file' },
+            diffCodeLensProvider
+        )
+    );
+
+    // Register commands for accepting/rejecting changes
+    context.subscriptions.push(
+        vscode.commands.registerCommand('aiCodeAssist.acceptChange', (changeId: string) => {
+            diffManager.acceptChange(changeId);
+            diffCodeLensProvider.refresh();
+            diffManager.forceRefreshDecorations();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('aiCodeAssist.rejectChange', (changeId: string) => {
+            diffManager.rejectChange(changeId);
+            diffCodeLensProvider.refresh();
+            diffManager.forceRefreshDecorations();
+        })
+    );
+
 	// const completionProvider = new AICompletionProvider(config.serverUrl);
     // context.subscriptions.push(
     //     vscode.languages.registerInlineCompletionItemProvider(
@@ -85,4 +118,8 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
-export function deactivate() {}
+export function deactivate() {
+    // Clean up diff manager
+    const diffManager = DiffManager.getInstance();
+    diffManager.dispose();
+}
