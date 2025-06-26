@@ -15,6 +15,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private currentAbortController?: AbortController;
     private isProcessing: boolean = false;
     private currentMode: 'ask' | 'agent' = 'ask'; // Track current mode
+    private askHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
+    private agentHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -119,12 +121,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const agentUrl = this._queryUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'requestState') {
-                // Send current processing state and mode to webview
+                // Send current processing state, mode, and history to webview
                 this.updateProcessingState();
                 this._view?.webview.postMessage({
                     type: 'updateMode',
                     mode: this.currentMode
                 });
+                this.sendHistoryToWebview();
                 return;
             }
 
@@ -143,10 +146,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
+            if (data.type === 'changeMode') {
+                this.currentMode = data.mode;
+                this._view?.webview.postMessage({
+                    type: 'updateMode',
+                    mode: this.currentMode
+                });
+                this.sendHistoryToWebview();
+                return;
+            }
+
             if (data.mode === 'agent') {
                 this.currentMode = 'agent'; // Update current mode
                 this.isProcessing = true;
                 this.updateProcessingState();
+                
+                // Add user message to agent history
+                this.addToHistory('agent', 'user', data.message);
+                
+                // Display the user message first
+                this._view?.webview.postMessage({
+                    type: 'addMessage',
+                    message: data.message,
+                    sender: 'user'
+                });
                 
                 // Hide bulk actions when starting new agent task
                 this._view?.webview.postMessage({
@@ -154,13 +177,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     show: false
                 });
                 
+                let agentResponse = '';
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
+                    agentResponse += update + '\n';
                     this._view?.webview.postMessage({
                         type: 'addMessage',
                         message: update,
                         sender: 'assistant'
                     });
                 }).finally(() => {
+                    // Add complete agent response to history
+                    this.addToHistory('agent', 'assistant', agentResponse.trim());
+                    
                     this.isProcessing = false;
                     this.updateProcessingState();
                     
@@ -227,6 +255,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Now perform similarity search with enhanced query
                         const similarity = await similaritySearch(enhancedQuery);
 
+                        // Add user message to ask history
+                        this.addToHistory('ask', 'user', data.message);
+
                         // Send progress message
                         this._view?.webview.postMessage({
                             type: 'addMessage',
@@ -251,6 +282,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const jsonResponse: any = await response.json();
 
                         if (!jsonResponse.error) {
+                            // Add AI response to ask history
+                            this.addToHistory('ask', 'assistant', jsonResponse.response);
+                            
                             // Send response back to webview
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
@@ -261,20 +295,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             throw new Error('Server request failed');
                         }
                     } catch (error: any) {
+                        let errorMessage = '';
                         if (error.name === 'AbortError') {
+                            errorMessage = 'Request was stopped by user.';
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
-                                message: 'Request was stopped by user.',
+                                message: errorMessage,
                                 sender: 'assistant'
                             });
                         } else {
                             vscode.window.showErrorMessage(`Error: ${error}`);
+                            errorMessage = 'Sorry, there was an error processing your request.';
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
-                                message: 'Sorry, there was an error processing your request.',
+                                message: errorMessage,
                                 sender: 'assistant'
                             });
                         }
+                        // Add error message to history
+                        this.addToHistory('ask', 'assistant', errorMessage);
                     } finally {
                         this.isProcessing = false;
                         this.currentAbortController = undefined;
@@ -300,6 +339,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._view?.webview.postMessage({
             type: 'updateProcessingState',
             isProcessing: this.isProcessing
+        });
+    }
+
+    private addToHistory(mode: 'ask' | 'agent', type: 'user' | 'assistant', message: string) {
+        const historyArray = mode === 'ask' ? this.askHistory : this.agentHistory;
+        historyArray.push({ type, message });
+    }
+
+    private getCurrentHistory(): Array<{type: 'user' | 'assistant', message: string}> {
+        return this.currentMode === 'ask' ? this.askHistory : this.agentHistory;
+    }
+
+    private sendHistoryToWebview() {
+        const history = this.getCurrentHistory();
+        this._view?.webview.postMessage({
+            type: 'loadHistory',
+            history: history
         });
     }
 
@@ -552,21 +608,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         let isProcessing = false;
 
         askButton.addEventListener('click', () => {
-            currentMode = 'ask';
-            askButton.classList.add('active');
-            agentButton.classList.remove('active');
-            // Hide bulk actions in ask mode with animation
-            bulkActions.classList.remove('show');
-            setTimeout(() => {
-                bulkActions.style.display = 'none';
-            }, 300);
+            if (currentMode !== 'ask') {
+                vscode.postMessage({
+                    type: 'changeMode',
+                    mode: 'ask'
+                });
+            }
         });
 
         agentButton.addEventListener('click', () => {
-            currentMode = 'agent';
-            agentButton.classList.add('active');
-            askButton.classList.remove('active');
-            // Don't automatically show bulk actions - they will appear when agent finishes
+            if (currentMode !== 'agent') {
+                vscode.postMessage({
+                    type: 'changeMode',
+                    mode: 'agent'
+                });
+            }
         });
 
         // Bulk action button event listeners
@@ -774,8 +830,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Reset textarea height
                     messageInput.style.height = 'auto';
                     break;
+                case 'loadHistory':
+                    loadHistory(message.history);
+                    break;
             }
         });
+
+        function loadHistory(history) {
+            // Clear current chat messages
+            chatMessages.innerHTML = '';
+            
+            // Load history messages
+            for (const historyItem of history) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message ' + historyItem.type;
+                
+                if (historyItem.type === 'assistant') {
+                    // Process assistant messages for code blocks
+                    const codeBlockRegex = /(\\\`\\\`\\\`(?:([a-zA-Z]+)\\n)?)([\\s\\S]*?)\\\`\\\`\\\`/g;
+                    let lastIndex = 0;
+                    let match;
+                    
+                    while ((match = codeBlockRegex.exec(historyItem.message)) !== null) {
+                        // Add text before code block
+                        if (match.index > lastIndex) {
+                            const textNode = document.createElement('div');
+                            textNode.className = 'text-content';
+                            textNode.textContent = historyItem.message.substring(lastIndex, match.index);
+                            messageDiv.appendChild(textNode);
+                        }
+                        
+                        // Add code block
+                        const language = match[2] || 'plaintext';
+                        const code = match[3].trim();
+                        messageDiv.appendChild(createCodeBlock(code, language));
+                        
+                        lastIndex = match.index + match[0].length;
+                    }
+                    
+                    // Add remaining text after last code block
+                    if (lastIndex < historyItem.message.length) {
+                        const textNode = document.createElement('div');
+                        textNode.className = 'text-content';
+                        textNode.textContent = historyItem.message.substring(lastIndex);
+                        messageDiv.appendChild(textNode);
+                    }
+                } else {
+                    // User messages are displayed as-is
+                    messageDiv.textContent = historyItem.message;
+                }
+                
+                chatMessages.appendChild(messageDiv);
+            }
+            
+            // Scroll to bottom
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
 
         // Initial setup
         messageInput.focus();
