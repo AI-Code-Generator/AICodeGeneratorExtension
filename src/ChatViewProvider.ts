@@ -211,19 +211,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Create the initial assistant message bubble
                         this._view?.webview.postMessage({
                             type: 'addMessage',
-                            message: update,
+                            message: agentResponse.trim(),
                             sender: 'assistant'
                         });
                         
                         // Add initial assistant message to history immediately
-                        this.addToHistory('agent', 'assistant', update);
+                        this.addToHistory('agent', 'assistant', agentResponse.trim());
                         this.currentAgentResponseIndex = this.agentHistory.length - 1;
                         isFirstUpdate = false;
                     } else {
-                        // Append to the existing assistant message bubble
+                        // Update the existing assistant message bubble with full content
                         this._view?.webview.postMessage({
-                            type: 'appendToMessage',
-                            message: update,
+                            type: 'updateMessage',
+                            message: agentResponse.trim(),
                             sender: 'assistant'
                         });
                         
@@ -1286,15 +1286,96 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Reset textarea height
                     messageInput.style.height = 'auto';
                     break;
+                case 'updateMessage':
+                    // Find the last assistant message and update it with new content
+                    const lastAssistantMessageToUpdate = chatMessages.querySelector('.message.assistant:last-of-type');
+                    if (lastAssistantMessageToUpdate) {
+                        // Clear existing content
+                        lastAssistantMessageToUpdate.innerHTML = '';
+                        
+                        // Split content by code blocks and process markdown
+                        const codeBlockRegex = new RegExp('(' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96) + '(?:([a-zA-Z]+)\\\\n)?)([\\\\s\\\\S]*?)' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96), 'g');
+                        let lastIndex = 0;
+                        let match;
+                        
+                        while ((match = codeBlockRegex.exec(message.message)) !== null) {
+                            // Add text before code block (process as markdown)
+                            if (match.index > lastIndex) {
+                                const textContent = message.message.substring(lastIndex, match.index);
+                                const textNode = document.createElement('div');
+                                textNode.className = 'text-content';
+                                textNode.innerHTML = processMarkdown(textContent);
+                                lastAssistantMessageToUpdate.appendChild(textNode);
+                            }
+                            
+                            // Add code block
+                            const language = match[2] || 'plaintext';
+                            const code = match[3].trim();
+                            lastAssistantMessageToUpdate.appendChild(createCodeBlock(code, language));
+                            
+                            lastIndex = match.index + match[0].length;
+                        }
+                        
+                        // Add remaining text after last code block (process as markdown)
+                        if (lastIndex < message.message.length) {
+                            const textContent = message.message.substring(lastIndex);
+                            const textNode = document.createElement('div');
+                            textNode.className = 'text-content';
+                            textNode.innerHTML = processMarkdown(textContent);
+                            lastAssistantMessageToUpdate.appendChild(textNode);
+                        }
+                        
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    }
+                    break;
                 case 'appendToMessage':
                     // Find the last assistant message and append to it
                     const lastAssistantMessage = chatMessages.querySelector('.message.assistant:last-of-type');
                     if (lastAssistantMessage) {
-                        // Create a new text node for the update
-                        const appendNode = document.createElement('div');
-                        appendNode.className = 'text-content';
-                        appendNode.textContent = message.message;
-                        lastAssistantMessage.appendChild(appendNode);
+                        // Get the accumulated content from the last assistant message
+                        let existingContent = '';
+                        const textNodes = lastAssistantMessage.querySelectorAll('.text-content');
+                        textNodes.forEach(node => {
+                            existingContent += node.textContent || '';
+                        });
+                        
+                        // Append the new message
+                        const newContent = existingContent + message.message;
+                        
+                        // Clear existing content and rebuild with proper markdown processing
+                        lastAssistantMessage.innerHTML = '';
+                        
+                        // Split content by code blocks and process markdown
+                        const codeBlockRegex = new RegExp('(' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96) + '(?:([a-zA-Z]+)\\\\n)?)([\\\\s\\\\S]*?)' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96), 'g');
+                        let lastIndex = 0;
+                        let match;
+                        
+                        while ((match = codeBlockRegex.exec(newContent)) !== null) {
+                            // Add text before code block (process as markdown)
+                            if (match.index > lastIndex) {
+                                const textContent = newContent.substring(lastIndex, match.index);
+                                const textNode = document.createElement('div');
+                                textNode.className = 'text-content';
+                                textNode.innerHTML = processMarkdown(textContent);
+                                lastAssistantMessage.appendChild(textNode);
+                            }
+                            
+                            // Add code block
+                            const language = match[2] || 'plaintext';
+                            const code = match[3].trim();
+                            lastAssistantMessage.appendChild(createCodeBlock(code, language));
+                            
+                            lastIndex = match.index + match[0].length;
+                        }
+                        
+                        // Add remaining text after last code block (process as markdown)
+                        if (lastIndex < newContent.length) {
+                            const textContent = newContent.substring(lastIndex);
+                            const textNode = document.createElement('div');
+                            textNode.className = 'text-content';
+                            textNode.innerHTML = processMarkdown(textContent);
+                            lastAssistantMessage.appendChild(textNode);
+                        }
                         
                         chatMessages.scrollTop = chatMessages.scrollHeight;
                     }

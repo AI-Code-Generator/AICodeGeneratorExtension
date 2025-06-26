@@ -100,7 +100,7 @@ export class AgentService {
                 return;
             }
 
-            sendUpdate(`--- Step ${i + 1} ---`);
+            sendUpdate(`## Step ${i + 1}`);
 
             const { tool, args, thought } = await this.getNextActionFromModel(prompt, history, sendUpdate, serverUrl);
 
@@ -114,7 +114,7 @@ export class AgentService {
             }
 
             if (tool === 'finish') {
-                sendUpdate(`Agent finished: ${args[0]}`);
+                sendUpdate(`**Agent finished: ${args[0]}**`);
                 return;
             }
 
