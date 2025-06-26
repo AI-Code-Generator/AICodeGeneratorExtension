@@ -15,16 +15,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private currentAbortController?: AbortController;
     private isProcessing: boolean = false;
     private currentMode: 'ask' | 'agent' = 'ask'; // Track current mode
+    private askHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
+    private agentHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
+    private currentAgentResponseIndex: number = -1; // Track current streaming response
+    private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        baseUrl: string
+        baseUrl: string,
+        private readonly _context: vscode.ExtensionContext
     ) {
         this._queryUrl = `${baseUrl}/ask-ai`;
         this._embedUrl = `${baseUrl}/embed`;
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService();
+        
+        // Load persisted history
+        this.loadHistory();
     }
 
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
@@ -119,12 +127,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const agentUrl = this._queryUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'requestState') {
-                // Send current processing state and mode to webview
+                // Send current processing state, mode, and history to webview
                 this.updateProcessingState();
                 this._view?.webview.postMessage({
                     type: 'updateMode',
                     mode: this.currentMode
                 });
+                this.sendHistoryToWebview();
                 return;
             }
 
@@ -143,10 +152,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
+            if (data.type === 'changeMode') {
+                this.currentMode = data.mode;
+                this._view?.webview.postMessage({
+                    type: 'updateMode',
+                    mode: this.currentMode
+                });
+                this.sendHistoryToWebview();
+                // Save mode change
+                this.saveHistory();
+                return;
+            }
+
+            if (data.type === 'clearMessages') {
+                this.clearMessages();
+                return;
+            }
+
             if (data.mode === 'agent') {
                 this.currentMode = 'agent'; // Update current mode
                 this.isProcessing = true;
                 this.updateProcessingState();
+                
+                // Add user message to agent history
+                this.addToHistory('agent', 'user', data.message);
+                
+                // Display the user message first
+                this._view?.webview.postMessage({
+                    type: 'addMessage',
+                    message: data.message,
+                    sender: 'user'
+                });
                 
                 // Hide bulk actions when starting new agent task
                 this._view?.webview.postMessage({
@@ -154,13 +190,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     show: false
                 });
                 
+                let agentResponse = '';
+                let isFirstUpdate = true;
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
-                    this._view?.webview.postMessage({
-                        type: 'addMessage',
-                        message: update,
-                        sender: 'assistant'
-                    });
+                    agentResponse += update + '\n';
+                    
+                    if (isFirstUpdate) {
+                        // Create the initial assistant message bubble
+                        this._view?.webview.postMessage({
+                            type: 'addMessage',
+                            message: update,
+                            sender: 'assistant'
+                        });
+                        
+                        // Add initial assistant message to history immediately
+                        this.addToHistory('agent', 'assistant', update);
+                        this.currentAgentResponseIndex = this.agentHistory.length - 1;
+                        isFirstUpdate = false;
+                    } else {
+                        // Append to the existing assistant message bubble
+                        this._view?.webview.postMessage({
+                            type: 'appendToMessage',
+                            message: update,
+                            sender: 'assistant'
+                        });
+                        
+                        // Update the agent response in history
+                        if (this.currentAgentResponseIndex >= 0) {
+                            this.agentHistory[this.currentAgentResponseIndex].message = agentResponse.trim();
+                            this.debouncedSaveHistory();
+                        }
+                    }
                 }).finally(() => {
+                    // Ensure final agent response is saved to history
+                    if (this.currentAgentResponseIndex >= 0) {
+                        this.agentHistory[this.currentAgentResponseIndex].message = agentResponse.trim();
+                        this.saveHistory();
+                    }
+                    this.currentAgentResponseIndex = -1;
+                    
                     this.isProcessing = false;
                     this.updateProcessingState();
                     
@@ -227,6 +295,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Now perform similarity search with enhanced query
                         const similarity = await similaritySearch(enhancedQuery);
 
+                        // Add user message to ask history
+                        this.addToHistory('ask', 'user', data.message);
+
                         // Send progress message
                         this._view?.webview.postMessage({
                             type: 'addMessage',
@@ -251,6 +322,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const jsonResponse: any = await response.json();
 
                         if (!jsonResponse.error) {
+                            // Add AI response to ask history
+                            this.addToHistory('ask', 'assistant', jsonResponse.response);
+                            
                             // Send response back to webview
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
@@ -261,20 +335,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             throw new Error('Server request failed');
                         }
                     } catch (error: any) {
+                        let errorMessage = '';
                         if (error.name === 'AbortError') {
+                            errorMessage = 'Request was stopped by user.';
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
-                                message: 'Request was stopped by user.',
+                                message: errorMessage,
                                 sender: 'assistant'
                             });
                         } else {
                             vscode.window.showErrorMessage(`Error: ${error}`);
+                            errorMessage = 'Sorry, there was an error processing your request.';
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
-                                message: 'Sorry, there was an error processing your request.',
+                                message: errorMessage,
                                 sender: 'assistant'
                             });
                         }
+                        // Add error message to history
+                        this.addToHistory('ask', 'assistant', errorMessage);
                     } finally {
                         this.isProcessing = false;
                         this.currentAbortController = undefined;
@@ -303,6 +382,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    private addToHistory(mode: 'ask' | 'agent', type: 'user' | 'assistant', message: string) {
+        const historyArray = mode === 'ask' ? this.askHistory : this.agentHistory;
+        historyArray.push({ type, message });
+        // Save history to extension storage
+        this.saveHistory();
+    }
+
+    private getCurrentHistory(): Array<{type: 'user' | 'assistant', message: string}> {
+        return this.currentMode === 'ask' ? this.askHistory : this.agentHistory;
+    }
+
+    private sendHistoryToWebview() {
+        const history = this.getCurrentHistory();
+        this._view?.webview.postMessage({
+            type: 'loadHistory',
+            history: history
+        });
+    }
+
+    private async loadHistory() {
+        try {
+            const askHistoryData = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('askHistory');
+            const agentHistoryData = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('agentHistory');
+            const savedMode = this._context.globalState.get<'ask' | 'agent'>('currentMode');
+            
+            if (askHistoryData) {
+                this.askHistory = askHistoryData;
+            }
+            if (agentHistoryData) {
+                this.agentHistory = agentHistoryData;
+            }
+            if (savedMode) {
+                this.currentMode = savedMode;
+            }
+        } catch (error) {
+            console.error('Failed to load chat history:', error);
+        }
+    }
+
+    private async saveHistory() {
+        try {
+            await this._context.globalState.update('askHistory', this.askHistory);
+            await this._context.globalState.update('agentHistory', this.agentHistory);
+            await this._context.globalState.update('currentMode', this.currentMode);
+        } catch (error) {
+            console.error('Failed to save chat history:', error);
+        }
+    }
+
+    private debouncedSaveHistory() {
+        // Clear existing timeout
+        if (this.saveHistoryTimeout) {
+            clearTimeout(this.saveHistoryTimeout);
+        }
+        
+        // Set new timeout to save after 500ms of inactivity
+        this.saveHistoryTimeout = setTimeout(() => {
+            this.saveHistory();
+        }, 500);
+    }
+
+    private clearMessages() {        
+        if (this.currentMode === 'ask') {
+            this.askHistory = [];
+        } else {
+            this.agentHistory = [];
+        }
+
+        this.saveHistory();
+
+        this._view?.webview.postMessage({
+            type: 'clearMessages'
+        });
+    }
+
     private _getHtmlForWebview(webview: vscode.Webview) {
         return `
         <!DOCTYPE html>
@@ -322,6 +476,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             padding: 10px;
             background: var(--vscode-editor-background);
             border-bottom: 1px solid var(--vscode-input-border);
+            align-items: center;
+            justify-content: space-between;
+        }
+        .mode-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        .clear-button {
+            padding: 6px 10px;
+            border: 1px solid var(--vscode-errorForeground);
+            background: transparent;
+            color: var(--vscode-errorForeground);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .clear-button:hover {
+            background: var(--vscode-errorForeground);
+            color: white;
         }
         .mode-button {
             padding: 8px 12px;
@@ -454,6 +628,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         .text-content {
             margin: 8px 0;
+            line-height: 1.6;
+        }
+        .text-content h1, .text-content h2, .text-content h3 {
+            margin: 16px 0 8px 0;
+            color: var(--vscode-foreground);
+            line-height: 1.3;
+        }
+        .text-content h1 {
+            font-size: 1.5em;
+            border-bottom: 1px solid var(--vscode-input-border);
+            padding-bottom: 4px;
+        }
+        .text-content h2 {
+            font-size: 1.3em;
+        }
+        .text-content h3 {
+            font-size: 1.1em;
+        }
+        .text-content strong {
+            font-weight: bold;
+            color: var(--vscode-foreground);
+        }
+        .text-content em {
+            font-style: italic;
+        }
+        .text-content code {
+            background: var(--vscode-textCodeBlock-background);
+            color: var(--vscode-textPreformat-foreground);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: var(--vscode-editor-font-family);
+            font-size: 0.9em;
+        }
+        .text-content ul, .text-content ol {
+            margin: 12px 0;
+            padding-left: 24px;
+        }
+        .text-content li {
+            margin: 6px 0;
+            line-height: 1.5;
+        }
+        .text-content ul li {
+            list-style-type: disc;
+        }
+        .text-content ol li {
+            list-style-type: decimal;
+        }
+        .text-content p {
+            margin: 12px 0;
+            line-height: 1.6;
+        }
+        .text-content p:first-child {
+            margin-top: 0;
+        }
+        .text-content p:last-child {
+            margin-bottom: 0;
         }
         .bulk-actions {
             display: none;
@@ -514,8 +744,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
     <div class="mode-selector">
-        <button id="askButton" class="mode-button active">Ask</button>
-        <button id="agentButton" class="mode-button">Agent</button>
+        <div class="mode-buttons">
+            <button id="askButton" class="mode-button active">Ask</button>
+            <button id="agentButton" class="mode-button">Agent</button>
+        </div>
+        <button id="clearButton" class="clear-button" title="Clear all messages">🗑️ Clear</button>
     </div>
     <div id="chatMessages"></div>
     <div id="bulkActions" class="bulk-actions">
@@ -545,6 +778,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const loading = document.getElementById('loading');
         const askButton = document.getElementById('askButton');
         const agentButton = document.getElementById('agentButton');
+        const clearButton = document.getElementById('clearButton');
         const bulkActions = document.getElementById('bulkActions');
         const acceptAllButton = document.getElementById('acceptAllButton');
         const rejectAllButton = document.getElementById('rejectAllButton');
@@ -552,21 +786,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         let isProcessing = false;
 
         askButton.addEventListener('click', () => {
-            currentMode = 'ask';
-            askButton.classList.add('active');
-            agentButton.classList.remove('active');
-            // Hide bulk actions in ask mode with animation
-            bulkActions.classList.remove('show');
-            setTimeout(() => {
-                bulkActions.style.display = 'none';
-            }, 300);
+            if (currentMode !== 'ask') {
+                vscode.postMessage({
+                    type: 'changeMode',
+                    mode: 'ask'
+                });
+            }
         });
 
         agentButton.addEventListener('click', () => {
-            currentMode = 'agent';
-            agentButton.classList.add('active');
-            askButton.classList.remove('active');
-            // Don't automatically show bulk actions - they will appear when agent finishes
+            if (currentMode !== 'agent') {
+                vscode.postMessage({
+                    type: 'changeMode',
+                    mode: 'agent'
+                });
+            }
+        });
+
+        clearButton.addEventListener('click', () => {
+            vscode.postMessage({
+                type: 'clearMessages'
+            });
         });
 
         // Bulk action button event listeners
@@ -633,6 +873,157 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             container.appendChild(header);
             container.appendChild(codeContent);
             return container;
+        }
+
+        // Process markdown text (excluding code blocks)
+        function processMarkdown(text) {
+            if (!text || text.trim() === '') {
+                return '';
+            }
+            
+            // Normalize line endings and trim
+            let processedText = text.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n').trim();
+            
+            // Split into lines for better processing
+            let lines = processedText.split('\\n');
+            let htmlLines = [];
+            let inList = false;
+            let listItems = [];
+            let globalNumberCounter = 1; // Track global numbering across all numbered lists
+            let currentListStartNumber = 1; // Track the start number for current list
+            
+            for (let i = 0; i < lines.length; i++) {
+                let line = lines[i];
+                let trimmedLine = line.trim();
+                
+                // Check if this is a list item
+                let isBulletItem = /^[\\*\\-\\+]\\s+/.test(trimmedLine);
+                let isNumberedItem = /^\\d+\\.\\s+/.test(trimmedLine);
+                let isListItem = isBulletItem || isNumberedItem;
+                
+                if (isListItem) {
+                    // If we were in a different type of list, close it first
+                    if (inList && ((isBulletItem && inList !== 'ul') || (isNumberedItem && inList !== 'ol'))) {
+                        if (inList === 'ul') {
+                            htmlLines.push('<ul>' + listItems.join('') + '</ul>');
+                        } else {
+                            // For numbered lists, include start attribute if not starting from 1
+                            let olTag = currentListStartNumber === 1 ? '<ol>' : '<ol start="' + currentListStartNumber + '">';
+                            htmlLines.push(olTag + listItems.join('') + '</ol>');
+                        }
+                        listItems = [];
+                    }
+                    
+                    // Extract list item content
+                    let itemContent = '';
+                    if (isBulletItem) {
+                        itemContent = trimmedLine.replace(/^[\\*\\-\\+]\\s+/, '');
+                        inList = 'ul';
+                    } else {
+                        itemContent = trimmedLine.replace(/^\\d+\\.\\s+/, '');
+                        if (inList !== 'ol') {
+                            // Starting a new numbered list
+                            currentListStartNumber = globalNumberCounter;
+                        }
+                        inList = 'ol';
+                        globalNumberCounter++;
+                    }
+                    
+                    itemContent = processInlineMarkdown(itemContent);
+                    listItems.push('<li>' + itemContent + '</li>');
+                } else {
+                    // If we were in a list and now we're not, close the list
+                    if (inList) {
+                        if (inList === 'ul') {
+                            htmlLines.push('<ul>' + listItems.join('') + '</ul>');
+                        } else {
+                            // For numbered lists, include start attribute if not starting from 1
+                            let olTag = currentListStartNumber === 1 ? '<ol>' : '<ol start="' + currentListStartNumber + '">';
+                            htmlLines.push(olTag + listItems.join('') + '</ol>');
+                        }
+                        listItems = [];
+                        inList = false;
+                    }
+                    
+                    // Process non-list line
+                    if (trimmedLine === '') {
+                        // Empty line - will be used for paragraph breaks
+                        htmlLines.push('');
+                    } else {
+                        // Process headers
+                        if (/^###\\s+/.test(trimmedLine)) {
+                            let headerContent = trimmedLine.replace(/^###\\s+/, '');
+                            htmlLines.push('<h3>' + processInlineMarkdown(headerContent) + '</h3>');
+                        } else if (/^##\\s+/.test(trimmedLine)) {
+                            let headerContent = trimmedLine.replace(/^##\\s+/, '');
+                            htmlLines.push('<h2>' + processInlineMarkdown(headerContent) + '</h2>');
+                        } else if (/^#\\s+/.test(trimmedLine)) {
+                            let headerContent = trimmedLine.replace(/^#\\s+/, '');
+                            htmlLines.push('<h1>' + processInlineMarkdown(headerContent) + '</h1>');
+                        } else {
+                            // Regular text line
+                            htmlLines.push(processInlineMarkdown(trimmedLine));
+                        }
+                    }
+                }
+            }
+            
+            // Close any remaining list
+            if (inList) {
+                if (inList === 'ul') {
+                    htmlLines.push('<ul>' + listItems.join('') + '</ul>');
+                } else {
+                    // For numbered lists, include start attribute if not starting from 1
+                    let olTag = currentListStartNumber === 1 ? '<ol>' : '<ol start="' + currentListStartNumber + '">';
+                    htmlLines.push(olTag + listItems.join('') + '</ol>');
+                }
+            }
+            
+            // Group consecutive non-empty, non-header, non-list text lines into paragraphs
+            let finalHtml = [];
+            let paragraphLines = [];
+            
+            for (let i = 0; i < htmlLines.length; i++) {
+                let line = htmlLines[i];
+                
+                if (line === '') {
+                    // Empty line - end current paragraph if any
+                    if (paragraphLines.length > 0) {
+                        finalHtml.push('<p>' + paragraphLines.join('<br>') + '</p>');
+                        paragraphLines = [];
+                    }
+                } else if (line.startsWith('<h') || line.startsWith('<ul>') || line.startsWith('<ol>')) {
+                    // Header or list - end current paragraph and add element
+                    if (paragraphLines.length > 0) {
+                        finalHtml.push('<p>' + paragraphLines.join('<br>') + '</p>');
+                        paragraphLines = [];
+                    }
+                    finalHtml.push(line);
+                } else {
+                    // Regular text line - add to current paragraph
+                    paragraphLines.push(line);
+                }
+            }
+            
+            // Add any remaining paragraph
+            if (paragraphLines.length > 0) {
+                finalHtml.push('<p>' + paragraphLines.join('<br>') + '</p>');
+            }
+            
+            return finalHtml.join('');
+        }
+        
+        // Process inline markdown (bold, italic, code)
+        function processInlineMarkdown(text) {
+            return text
+                // Bold (** or __)
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/__(.*?)__/g, '<strong>$1</strong>')
+                // Italic (* or _) - but not if it's part of bold
+                .replace(/(?<!\\*)\\*([^\\*]+?)\\*(?!\\*)/g, '<em>$1</em>')
+                .replace(/(?<!_)_([^_]+?)_(?!_)/g, '<em>$1</em>')
+                // Inline code
+                .replace(/\`([^\`]+)\`/g, '<code>$1</code>');
         }
 
         function sendMessage() {
@@ -734,16 +1125,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     
                     if (message.sender === 'assistant') {
                         // Split content by code blocks
-                        const codeBlockRegex = /(\\\`\\\`\\\`(?:([a-zA-Z]+)\\n)?)([\\s\\S]*?)\\\`\\\`\\\`/g;
+                        const codeBlockRegex = new RegExp('(' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96) + '(?:([a-zA-Z]+)\\\\n)?)([\\\\s\\\\S]*?)' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96), 'g');
                         let lastIndex = 0;
                         let match;
                         
                         while ((match = codeBlockRegex.exec(message.message)) !== null) {
-                            // Add text before code block
+                            // Add text before code block (process as markdown)
                             if (match.index > lastIndex) {
+                                const textContent = message.message.substring(lastIndex, match.index);
                                 const textNode = document.createElement('div');
                                 textNode.className = 'text-content';
-                                textNode.textContent = message.message.substring(lastIndex, match.index);
+                                textNode.innerHTML = processMarkdown(textContent);
                                 messageDiv.appendChild(textNode);
                             }
                             
@@ -755,11 +1147,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             lastIndex = match.index + match[0].length;
                         }
                         
-                        // Add remaining text after last code block
+                        // Add remaining text after last code block (process as markdown)
                         if (lastIndex < message.message.length) {
+                            const textContent = message.message.substring(lastIndex);
                             const textNode = document.createElement('div');
                             textNode.className = 'text-content';
-                            textNode.textContent = message.message.substring(lastIndex);
+                            textNode.innerHTML = processMarkdown(textContent);
                             messageDiv.appendChild(textNode);
                         }
                     } else {
@@ -774,8 +1167,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Reset textarea height
                     messageInput.style.height = 'auto';
                     break;
+                case 'appendToMessage':
+                    // Find the last assistant message and append to it
+                    const lastAssistantMessage = chatMessages.querySelector('.message.assistant:last-of-type');
+                    if (lastAssistantMessage) {
+                        // Create a new text node for the update
+                        const appendNode = document.createElement('div');
+                        appendNode.className = 'text-content';
+                        appendNode.textContent = message.message;
+                        lastAssistantMessage.appendChild(appendNode);
+                        
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    }
+                    break;
+                case 'loadHistory':
+                    loadHistory(message.history);
+                    break;
+                case 'clearMessages':
+                    // Clear all messages from the chat
+                    chatMessages.innerHTML = '';
+                    break;
             }
         });
+
+        function loadHistory(history) {
+            // Clear current chat messages
+            chatMessages.innerHTML = '';
+            
+            // Load history messages
+            for (const historyItem of history) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message ' + historyItem.type;
+                
+                if (historyItem.type === 'assistant') {
+                    // Process assistant messages for code blocks
+                    const codeBlockRegex = new RegExp('(' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96) + '(?:([a-zA-Z]+)\\\\n)?)([\\\\s\\\\S]*?)' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96), 'g');
+                    let lastIndex = 0;
+                    let match;
+                    
+                    while ((match = codeBlockRegex.exec(historyItem.message)) !== null) {
+                        // Add text before code block (process as markdown)
+                        if (match.index > lastIndex) {
+                            const textContent = historyItem.message.substring(lastIndex, match.index);
+                            const textNode = document.createElement('div');
+                            textNode.className = 'text-content';
+                            textNode.innerHTML = processMarkdown(textContent);
+                            messageDiv.appendChild(textNode);
+                        }
+                        
+                        // Add code block
+                        const language = match[2] || 'plaintext';
+                        const code = match[3].trim();
+                        messageDiv.appendChild(createCodeBlock(code, language));
+                        
+                        lastIndex = match.index + match[0].length;
+                    }
+                    
+                    // Add remaining text after last code block (process as markdown)
+                    if (lastIndex < historyItem.message.length) {
+                        const textContent = historyItem.message.substring(lastIndex);
+                        const textNode = document.createElement('div');
+                        textNode.className = 'text-content';
+                        textNode.innerHTML = processMarkdown(textContent);
+                        messageDiv.appendChild(textNode);
+                    }
+                } else {
+                    // User messages are displayed as-is
+                    messageDiv.textContent = historyItem.message;
+                }
+                
+                chatMessages.appendChild(messageDiv);
+            }
+            
+            // Scroll to bottom
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
 
         // Initial setup
         messageInput.focus();
