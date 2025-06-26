@@ -164,6 +164,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
+            if (data.type === 'clearMessages') {
+                this.clearMessages();
+                return;
+            }
+
             if (data.mode === 'agent') {
                 this.currentMode = 'agent'; // Update current mode
                 this.isProcessing = true;
@@ -438,6 +443,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }, 500);
     }
 
+    private clearMessages() {        
+        if (this.currentMode === 'ask') {
+            this.askHistory = [];
+        } else {
+            this.agentHistory = [];
+        }
+
+        this.saveHistory();
+
+        this._view?.webview.postMessage({
+            type: 'clearMessages'
+        });
+    }
+
     private _getHtmlForWebview(webview: vscode.Webview) {
         return `
         <!DOCTYPE html>
@@ -457,6 +476,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             padding: 10px;
             background: var(--vscode-editor-background);
             border-bottom: 1px solid var(--vscode-input-border);
+            align-items: center;
+            justify-content: space-between;
+        }
+        .mode-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        .clear-button {
+            padding: 6px 10px;
+            border: 1px solid var(--vscode-errorForeground);
+            background: transparent;
+            color: var(--vscode-errorForeground);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .clear-button:hover {
+            background: var(--vscode-errorForeground);
+            color: white;
         }
         .mode-button {
             padding: 8px 12px;
@@ -649,8 +688,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
     <div class="mode-selector">
-        <button id="askButton" class="mode-button active">Ask</button>
-        <button id="agentButton" class="mode-button">Agent</button>
+        <div class="mode-buttons">
+            <button id="askButton" class="mode-button active">Ask</button>
+            <button id="agentButton" class="mode-button">Agent</button>
+        </div>
+        <button id="clearButton" class="clear-button" title="Clear all messages">🗑️ Clear</button>
     </div>
     <div id="chatMessages"></div>
     <div id="bulkActions" class="bulk-actions">
@@ -680,6 +722,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const loading = document.getElementById('loading');
         const askButton = document.getElementById('askButton');
         const agentButton = document.getElementById('agentButton');
+        const clearButton = document.getElementById('clearButton');
         const bulkActions = document.getElementById('bulkActions');
         const acceptAllButton = document.getElementById('acceptAllButton');
         const rejectAllButton = document.getElementById('rejectAllButton');
@@ -702,6 +745,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     mode: 'agent'
                 });
             }
+        });
+
+        clearButton.addEventListener('click', () => {
+            vscode.postMessage({
+                type: 'clearMessages'
+            });
         });
 
         // Bulk action button event listeners
@@ -924,6 +973,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'loadHistory':
                     loadHistory(message.history);
+                    break;
+                case 'clearMessages':
+                    // Clear all messages from the chat
+                    chatMessages.innerHTML = '';
                     break;
             }
         });
