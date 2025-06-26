@@ -629,6 +629,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .text-content {
             margin: 8px 0;
         }
+        .text-content h1, .text-content h2, .text-content h3 {
+            margin: 16px 0 8px 0;
+            color: var(--vscode-foreground);
+        }
+        .text-content h1 {
+            font-size: 1.5em;
+            border-bottom: 1px solid var(--vscode-input-border);
+            padding-bottom: 4px;
+        }
+        .text-content h2 {
+            font-size: 1.3em;
+        }
+        .text-content h3 {
+            font-size: 1.1em;
+        }
+        .text-content strong {
+            font-weight: bold;
+            color: var(--vscode-foreground);
+        }
+        .text-content em {
+            font-style: italic;
+        }
+        .text-content code {
+            background: var(--vscode-textCodeBlock-background);
+            color: var(--vscode-textPreformat-foreground);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: var(--vscode-editor-font-family);
+            font-size: 0.9em;
+        }
+        .text-content ul {
+            margin: 8px 0;
+            padding-left: 20px;
+        }
+        .text-content li {
+            margin: 4px 0;
+            list-style-type: disc;
+        }
+        .text-content p {
+            margin: 8px 0;
+            line-height: 1.5;
+        }
         .bulk-actions {
             display: none;
             position: fixed;
@@ -819,6 +861,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return container;
         }
 
+        // Process markdown text (excluding code blocks)
+        function processMarkdown(text) {
+            // Convert markdown to HTML
+            let html = text
+                // Headers
+                .replace(/^### (.*$)/gm, '<h3>$1</h3>')
+                .replace(/^## (.*$)/gm, '<h2>$1</h2>')
+                .replace(/^# (.*$)/gm, '<h1>$1</h1>')
+                // Bold
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/__(.*?)__/g, '<strong>$1</strong>')
+                // Italic
+                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
+                .replace(/_(.*?)_/g, '<em>$1</em>')
+                // Inline code
+                .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
+                // Lists
+                .replace(/^\\* (.*$)/gm, '<li>$1</li>')
+                .replace(/^- (.*$)/gm, '<li>$1</li>')
+                .replace(/^\\+ (.*$)/gm, '<li>$1</li>')
+                // Numbered lists
+                .replace(/^\\d+\\. (.*$)/gm, '<li>$1</li>')
+                // Line breaks
+                .replace(/\\n\\n/g, '</p><p>')
+                .replace(/\\n/g, '<br>');
+
+            // Wrap consecutive list items in ul tags
+            html = html.replace(/(<li>.*?<\\/li>)(\\s*<li>.*?<\\/li>)*/g, function(match) {
+                return '<ul>' + match + '</ul>';
+            });
+
+            // Wrap in paragraphs if not already wrapped
+            if (!html.includes('<h1>') && !html.includes('<h2>') && !html.includes('<h3>') && !html.includes('<ul>')) {
+                html = '<p>' + html + '</p>';
+            }
+
+            return html;
+        }
+
         function sendMessage() {
             const message = messageInput.value.trim();
             if (message && !isProcessing) {
@@ -918,16 +999,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     
                     if (message.sender === 'assistant') {
                         // Split content by code blocks
-                        const codeBlockRegex = /(\\\`\\\`\\\`(?:([a-zA-Z]+)\\n)?)([\\s\\S]*?)\\\`\\\`\\\`/g;
+                        const codeBlockRegex = new RegExp('(' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96) + '(?:([a-zA-Z]+)\\\\n)?)([\\\\s\\\\S]*?)' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96), 'g');
                         let lastIndex = 0;
                         let match;
                         
                         while ((match = codeBlockRegex.exec(message.message)) !== null) {
-                            // Add text before code block
+                            // Add text before code block (process as markdown)
                             if (match.index > lastIndex) {
+                                const textContent = message.message.substring(lastIndex, match.index);
                                 const textNode = document.createElement('div');
                                 textNode.className = 'text-content';
-                                textNode.textContent = message.message.substring(lastIndex, match.index);
+                                textNode.innerHTML = processMarkdown(textContent);
                                 messageDiv.appendChild(textNode);
                             }
                             
@@ -939,11 +1021,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             lastIndex = match.index + match[0].length;
                         }
                         
-                        // Add remaining text after last code block
+                        // Add remaining text after last code block (process as markdown)
                         if (lastIndex < message.message.length) {
+                            const textContent = message.message.substring(lastIndex);
                             const textNode = document.createElement('div');
                             textNode.className = 'text-content';
-                            textNode.textContent = message.message.substring(lastIndex);
+                            textNode.innerHTML = processMarkdown(textContent);
                             messageDiv.appendChild(textNode);
                         }
                     } else {
@@ -992,16 +1075,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 
                 if (historyItem.type === 'assistant') {
                     // Process assistant messages for code blocks
-                    const codeBlockRegex = /(\\\`\\\`\\\`(?:([a-zA-Z]+)\\n)?)([\\s\\S]*?)\\\`\\\`\\\`/g;
+                    const codeBlockRegex = new RegExp('(' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96) + '(?:([a-zA-Z]+)\\\\n)?)([\\\\s\\\\S]*?)' + String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96), 'g');
                     let lastIndex = 0;
                     let match;
                     
                     while ((match = codeBlockRegex.exec(historyItem.message)) !== null) {
-                        // Add text before code block
+                        // Add text before code block (process as markdown)
                         if (match.index > lastIndex) {
+                            const textContent = historyItem.message.substring(lastIndex, match.index);
                             const textNode = document.createElement('div');
                             textNode.className = 'text-content';
-                            textNode.textContent = historyItem.message.substring(lastIndex, match.index);
+                            textNode.innerHTML = processMarkdown(textContent);
                             messageDiv.appendChild(textNode);
                         }
                         
@@ -1013,11 +1097,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         lastIndex = match.index + match[0].length;
                     }
                     
-                    // Add remaining text after last code block
+                    // Add remaining text after last code block (process as markdown)
                     if (lastIndex < historyItem.message.length) {
+                        const textContent = historyItem.message.substring(lastIndex);
                         const textNode = document.createElement('div');
                         textNode.className = 'text-content';
-                        textNode.textContent = historyItem.message.substring(lastIndex);
+                        textNode.innerHTML = processMarkdown(textContent);
                         messageDiv.appendChild(textNode);
                     }
                 } else {
