@@ -8,9 +8,14 @@ import { DiffManager } from './DiffManager';
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
     private diffManager: DiffManager;
+    private terminalCommandCallback?: (command: string) => Promise<boolean>;
 
     constructor() {
         this.diffManager = DiffManager.getInstance();
+    }
+
+    public setTerminalCommandCallback(callback: (command: string) => Promise<boolean>) {
+        this.terminalCommandCallback = callback;
     }
     public async list_files(): Promise<string[]> {
         // Find all files, ignoring .git, node_modules, and other common exclusions
@@ -32,14 +37,22 @@ class ToolBox {
     }
 
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
-        const allow = await vscode.window.showInformationMessage(
-            `The agent wants to run the following command:\n\n${command}\n\nDo you want to allow it?`,
-            { modal: true },
-            'Yes',
-            'No'
-        );
+        let allow = false;
+        
+        if (this.terminalCommandCallback) {
+            allow = await this.terminalCommandCallback(command);
+        } else {
+            // Fallback to popup if no callback is set
+            const result = await vscode.window.showInformationMessage(
+                `The agent wants to run the following command:\n\n${command}\n\nDo you want to allow it?`,
+                { modal: true },
+                'Yes',
+                'No'
+            );
+            allow = result === 'Yes';
+        }
 
-        if (allow !== 'Yes') {
+        if (!allow) {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
@@ -66,8 +79,14 @@ export class AgentService {
     private toolbox = new ToolBox();
     private shouldStop = false;
     private currentAbortController?: AbortController;
+    private terminalCommandCallback?: (command: string) => Promise<boolean>;
 
     constructor() {
+    }
+
+    public setTerminalCommandCallback(callback: (command: string) => Promise<boolean>) {
+        this.terminalCommandCallback = callback;
+        this.toolbox.setTerminalCommandCallback(callback);
     }
 
     public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void) {
@@ -81,7 +100,7 @@ export class AgentService {
                 return;
             }
 
-            sendUpdate(`--- Step ${i + 1} ---`);
+            sendUpdate(`## Step ${i + 1}`);
 
             const { tool, args, thought } = await this.getNextActionFromModel(prompt, history, sendUpdate, serverUrl);
 
@@ -95,7 +114,7 @@ export class AgentService {
             }
 
             if (tool === 'finish') {
-                sendUpdate(`Agent finished: ${args[0]}`);
+                sendUpdate(`**Agent finished: ${args[0]}**`);
                 return;
             }
 
