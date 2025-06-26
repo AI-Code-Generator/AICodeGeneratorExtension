@@ -628,10 +628,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         .text-content {
             margin: 8px 0;
+            line-height: 1.6;
         }
         .text-content h1, .text-content h2, .text-content h3 {
             margin: 16px 0 8px 0;
             color: var(--vscode-foreground);
+            line-height: 1.3;
         }
         .text-content h1 {
             font-size: 1.5em;
@@ -659,17 +661,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-family: var(--vscode-editor-font-family);
             font-size: 0.9em;
         }
-        .text-content ul {
-            margin: 8px 0;
-            padding-left: 20px;
+        .text-content ul, .text-content ol {
+            margin: 12px 0;
+            padding-left: 24px;
         }
         .text-content li {
-            margin: 4px 0;
+            margin: 6px 0;
+            line-height: 1.5;
+        }
+        .text-content ul li {
             list-style-type: disc;
         }
+        .text-content ol li {
+            list-style-type: decimal;
+        }
         .text-content p {
-            margin: 8px 0;
-            line-height: 1.5;
+            margin: 12px 0;
+            line-height: 1.6;
+        }
+        .text-content p:first-child {
+            margin-top: 0;
+        }
+        .text-content p:last-child {
+            margin-bottom: 0;
         }
         .bulk-actions {
             display: none;
@@ -863,41 +877,153 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // Process markdown text (excluding code blocks)
         function processMarkdown(text) {
-            // Convert markdown to HTML
-            let html = text
-                // Headers
-                .replace(/^### (.*$)/gm, '<h3>$1</h3>')
-                .replace(/^## (.*$)/gm, '<h2>$1</h2>')
-                .replace(/^# (.*$)/gm, '<h1>$1</h1>')
-                // Bold
+            if (!text || text.trim() === '') {
+                return '';
+            }
+            
+            // Normalize line endings and trim
+            let processedText = text.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n').trim();
+            
+            // Split into lines for better processing
+            let lines = processedText.split('\\n');
+            let htmlLines = [];
+            let inList = false;
+            let listItems = [];
+            let globalNumberCounter = 1; // Track global numbering across all numbered lists
+            let currentListStartNumber = 1; // Track the start number for current list
+            
+            for (let i = 0; i < lines.length; i++) {
+                let line = lines[i];
+                let trimmedLine = line.trim();
+                
+                // Check if this is a list item
+                let isBulletItem = /^[\\*\\-\\+]\\s+/.test(trimmedLine);
+                let isNumberedItem = /^\\d+\\.\\s+/.test(trimmedLine);
+                let isListItem = isBulletItem || isNumberedItem;
+                
+                if (isListItem) {
+                    // If we were in a different type of list, close it first
+                    if (inList && ((isBulletItem && inList !== 'ul') || (isNumberedItem && inList !== 'ol'))) {
+                        if (inList === 'ul') {
+                            htmlLines.push('<ul>' + listItems.join('') + '</ul>');
+                        } else {
+                            // For numbered lists, include start attribute if not starting from 1
+                            let olTag = currentListStartNumber === 1 ? '<ol>' : '<ol start="' + currentListStartNumber + '">';
+                            htmlLines.push(olTag + listItems.join('') + '</ol>');
+                        }
+                        listItems = [];
+                    }
+                    
+                    // Extract list item content
+                    let itemContent = '';
+                    if (isBulletItem) {
+                        itemContent = trimmedLine.replace(/^[\\*\\-\\+]\\s+/, '');
+                        inList = 'ul';
+                    } else {
+                        itemContent = trimmedLine.replace(/^\\d+\\.\\s+/, '');
+                        if (inList !== 'ol') {
+                            // Starting a new numbered list
+                            currentListStartNumber = globalNumberCounter;
+                        }
+                        inList = 'ol';
+                        globalNumberCounter++;
+                    }
+                    
+                    itemContent = processInlineMarkdown(itemContent);
+                    listItems.push('<li>' + itemContent + '</li>');
+                } else {
+                    // If we were in a list and now we're not, close the list
+                    if (inList) {
+                        if (inList === 'ul') {
+                            htmlLines.push('<ul>' + listItems.join('') + '</ul>');
+                        } else {
+                            // For numbered lists, include start attribute if not starting from 1
+                            let olTag = currentListStartNumber === 1 ? '<ol>' : '<ol start="' + currentListStartNumber + '">';
+                            htmlLines.push(olTag + listItems.join('') + '</ol>');
+                        }
+                        listItems = [];
+                        inList = false;
+                    }
+                    
+                    // Process non-list line
+                    if (trimmedLine === '') {
+                        // Empty line - will be used for paragraph breaks
+                        htmlLines.push('');
+                    } else {
+                        // Process headers
+                        if (/^###\\s+/.test(trimmedLine)) {
+                            let headerContent = trimmedLine.replace(/^###\\s+/, '');
+                            htmlLines.push('<h3>' + processInlineMarkdown(headerContent) + '</h3>');
+                        } else if (/^##\\s+/.test(trimmedLine)) {
+                            let headerContent = trimmedLine.replace(/^##\\s+/, '');
+                            htmlLines.push('<h2>' + processInlineMarkdown(headerContent) + '</h2>');
+                        } else if (/^#\\s+/.test(trimmedLine)) {
+                            let headerContent = trimmedLine.replace(/^#\\s+/, '');
+                            htmlLines.push('<h1>' + processInlineMarkdown(headerContent) + '</h1>');
+                        } else {
+                            // Regular text line
+                            htmlLines.push(processInlineMarkdown(trimmedLine));
+                        }
+                    }
+                }
+            }
+            
+            // Close any remaining list
+            if (inList) {
+                if (inList === 'ul') {
+                    htmlLines.push('<ul>' + listItems.join('') + '</ul>');
+                } else {
+                    // For numbered lists, include start attribute if not starting from 1
+                    let olTag = currentListStartNumber === 1 ? '<ol>' : '<ol start="' + currentListStartNumber + '">';
+                    htmlLines.push(olTag + listItems.join('') + '</ol>');
+                }
+            }
+            
+            // Group consecutive non-empty, non-header, non-list text lines into paragraphs
+            let finalHtml = [];
+            let paragraphLines = [];
+            
+            for (let i = 0; i < htmlLines.length; i++) {
+                let line = htmlLines[i];
+                
+                if (line === '') {
+                    // Empty line - end current paragraph if any
+                    if (paragraphLines.length > 0) {
+                        finalHtml.push('<p>' + paragraphLines.join('<br>') + '</p>');
+                        paragraphLines = [];
+                    }
+                } else if (line.startsWith('<h') || line.startsWith('<ul>') || line.startsWith('<ol>')) {
+                    // Header or list - end current paragraph and add element
+                    if (paragraphLines.length > 0) {
+                        finalHtml.push('<p>' + paragraphLines.join('<br>') + '</p>');
+                        paragraphLines = [];
+                    }
+                    finalHtml.push(line);
+                } else {
+                    // Regular text line - add to current paragraph
+                    paragraphLines.push(line);
+                }
+            }
+            
+            // Add any remaining paragraph
+            if (paragraphLines.length > 0) {
+                finalHtml.push('<p>' + paragraphLines.join('<br>') + '</p>');
+            }
+            
+            return finalHtml.join('');
+        }
+        
+        // Process inline markdown (bold, italic, code)
+        function processInlineMarkdown(text) {
+            return text
+                // Bold (** or __)
                 .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/__(.*?)__/g, '<strong>$1</strong>')
-                // Italic
-                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
-                .replace(/_(.*?)_/g, '<em>$1</em>')
+                // Italic (* or _) - but not if it's part of bold
+                .replace(/(?<!\\*)\\*([^\\*]+?)\\*(?!\\*)/g, '<em>$1</em>')
+                .replace(/(?<!_)_([^_]+?)_(?!_)/g, '<em>$1</em>')
                 // Inline code
-                .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
-                // Lists
-                .replace(/^\\* (.*$)/gm, '<li>$1</li>')
-                .replace(/^- (.*$)/gm, '<li>$1</li>')
-                .replace(/^\\+ (.*$)/gm, '<li>$1</li>')
-                // Numbered lists
-                .replace(/^\\d+\\. (.*$)/gm, '<li>$1</li>')
-                // Line breaks
-                .replace(/\\n\\n/g, '</p><p>')
-                .replace(/\\n/g, '<br>');
-
-            // Wrap consecutive list items in ul tags
-            html = html.replace(/(<li>.*?<\\/li>)(\\s*<li>.*?<\\/li>)*/g, function(match) {
-                return '<ul>' + match + '</ul>';
-            });
-
-            // Wrap in paragraphs if not already wrapped
-            if (!html.includes('<h1>') && !html.includes('<h2>') && !html.includes('<h3>') && !html.includes('<ul>')) {
-                html = '<p>' + html + '</p>';
-            }
-
-            return html;
+                .replace(/\`([^\`]+)\`/g, '<code>$1</code>');
         }
 
         function sendMessage() {
