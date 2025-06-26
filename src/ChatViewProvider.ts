@@ -178,13 +178,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 });
                 
                 let agentResponse = '';
+                let isFirstUpdate = true;
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
                     agentResponse += update + '\n';
-                    this._view?.webview.postMessage({
-                        type: 'addMessage',
-                        message: update,
-                        sender: 'assistant'
-                    });
+                    
+                    if (isFirstUpdate) {
+                        // Create the initial assistant message bubble
+                        this._view?.webview.postMessage({
+                            type: 'addMessage',
+                            message: update,
+                            sender: 'assistant'
+                        });
+                        isFirstUpdate = false;
+                    } else {
+                        // Append to the existing assistant message bubble
+                        this._view?.webview.postMessage({
+                            type: 'appendToMessage',
+                            message: update,
+                            sender: 'assistant'
+                        });
+                    }
                 }).finally(() => {
                     // Add complete agent response to history
                     this.addToHistory('agent', 'assistant', agentResponse.trim());
@@ -829,6 +842,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     
                     // Reset textarea height
                     messageInput.style.height = 'auto';
+                    break;
+                case 'appendToMessage':
+                    // Find the last assistant message and append to it
+                    const lastAssistantMessage = chatMessages.querySelector('.message.assistant:last-of-type');
+                    if (lastAssistantMessage) {
+                        // Create a new text node for the update
+                        const appendNode = document.createElement('div');
+                        appendNode.className = 'text-content';
+                        appendNode.textContent = message.message;
+                        lastAssistantMessage.appendChild(appendNode);
+                        
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    }
                     break;
                 case 'loadHistory':
                     loadHistory(message.history);
