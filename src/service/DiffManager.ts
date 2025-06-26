@@ -22,6 +22,7 @@ export class DiffManager {
     private deleteDecorationType: vscode.TextEditorDecorationType;
     private replaceDecorationType: vscode.TextEditorDecorationType;
     private updateTimeouts: Map<string, NodeJS.Timeout> = new Map();
+    private dynamicDecorations: Map<string, vscode.TextEditorDecorationType[]> = new Map(); // Track dynamic decorations
 
     private constructor() {
         // Insert decoration (green background)
@@ -30,8 +31,9 @@ export class DiffManager {
             isWholeLine: true,
             overviewRulerColor: new vscode.ThemeColor('merge.incomingHeaderBackground'),
             overviewRulerLane: vscode.OverviewRulerLane.Right,
+            border: '2px dashed rgba(0,200,0,0.5)',
             after: {
-                contentText: ' ← AI Generated (Added)',
+                contentText: ' ➕ ADDED by AI',
                 color: new vscode.ThemeColor('merge.incomingHeaderBackground'),
                 fontStyle: 'italic',
                 margin: '0 0 0 1em'
@@ -311,45 +313,93 @@ export class DiffManager {
         const filePath = vscode.workspace.asRelativePath(editor.document.uri);
         const changes = this.pendingChanges.get(filePath);
 
+        // Clear existing dynamic decorations for this file
+        const existingDecorations = this.dynamicDecorations.get(filePath) || [];
+        existingDecorations.forEach(decoration => decoration.dispose());
+        this.dynamicDecorations.set(filePath, []);
+
+        // Clear static decorations
+        editor.setDecorations(this.insertDecorationType, []);
+        editor.setDecorations(this.replaceDecorationType, []);
+        editor.setDecorations(this.deleteDecorationType, []);
+
         if (!changes || changes.length === 0) {
-            editor.setDecorations(this.insertDecorationType, []);
-            editor.setDecorations(this.replaceDecorationType, []);
-            editor.setDecorations(this.deleteDecorationType, []);
             return;
         }
 
         const insertDecorations: vscode.DecorationOptions[] = [];
-        const replaceDecorations: vscode.DecorationOptions[] = [];
-        const deleteDecorations: vscode.DecorationOptions[] = [];
-        
+        const newDynamicDecorations: vscode.TextEditorDecorationType[] = [];
+
         for (const change of changes) {
             if (!change.applied) {
                 continue; // Skip rejected changes
             }
 
-            // Handle different change types
             if (change.changeType === 'delete') {
-                // For deletions, show at the position where deletion occurred
+                // For deletions, create a clear visual indicator with hover content
+                const deleteLinesCount = change.originalContent.split('\n').length;
+                
+                const deleteDecoration = vscode.window.createTextEditorDecorationType({
+                    backgroundColor: new vscode.ThemeColor('editorError.background'),
+                    overviewRulerColor: new vscode.ThemeColor('editorError.foreground'),
+                    overviewRulerLane: vscode.OverviewRulerLane.Right,
+                    isWholeLine: true,
+                    border: '2px dashed rgba(255,0,0,0.5)',
+                    // Show clear deletion indicator
+                    after: {
+                        contentText: ` 🗑️ DELETED ${deleteLinesCount} line${deleteLinesCount > 1 ? 's' : ''} (hover to see content)`,
+                        color: new vscode.ThemeColor('editorError.foreground'),
+                        fontStyle: 'italic',
+                        fontWeight: 'bold',
+                        margin: '0 0 0 1em',
+                        backgroundColor: new vscode.ThemeColor('editorError.background'),
+                        border: '1px solid rgba(255,0,0,0.3)',
+                        textDecoration: 'none'
+                    }
+                });
+
+                newDynamicDecorations.push(deleteDecoration);
+                
+                // Position for showing deleted content indicator
                 let line = Math.min(change.startLine, editor.document.lineCount - 1);
-                // If deletion is at the end of file, show on the last line
                 if (line < 0) {
                     line = Math.max(0, editor.document.lineCount - 1);
                 }
                 
                 const range = new vscode.Range(line, 0, line, editor.document.lineAt(line).text.length);
 
-                deleteDecorations.push({
+                editor.setDecorations(deleteDecoration, [{
                     range,
                     hoverMessage: new vscode.MarkdownString(
-                        `**AI Generated Deletion**\n\n` +
+                        `**🗑️ AI Generated Deletion**\n\n` +
                         `Change ID: \`${change.id}\`\n\n` +
                         `Applied at: ${change.timestamp.toLocaleString()}\n\n` +
-                        `**Deleted Content:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` +
-                        `*Content was removed from this location*`
+                        `**❌ DELETED CONTENT:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` +
+                        `*${deleteLinesCount} line${deleteLinesCount > 1 ? 's were' : ' was'} removed from this location*`
                     )
+                }]);
+
+            } else if (change.changeType === 'replace') {
+                // For replacements, show modified indicator with rich hover showing both versions
+                const replaceDecoration = vscode.window.createTextEditorDecorationType({
+                    backgroundColor: new vscode.ThemeColor('merge.currentContentBackground'),
+                    isWholeLine: true,
+                    overviewRulerColor: new vscode.ThemeColor('merge.currentHeaderBackground'),
+                    overviewRulerLane: vscode.OverviewRulerLane.Right,
+                    border: '2px dashed rgba(0,100,200,0.5)',
+                    after: {
+                        contentText: ' 🔄 MODIFIED (hover to see original vs new)',
+                        color: new vscode.ThemeColor('merge.currentHeaderBackground'),
+                        fontStyle: 'italic',
+                        fontWeight: 'bold',
+                        margin: '0 0 0 1em',
+                        backgroundColor: new vscode.ThemeColor('merge.currentContentBackground'),
+                        border: '1px solid rgba(0,100,200,0.3)'
+                    }
                 });
-            } else {
-                // For insertions and replacements, highlight the actual lines
+
+                newDynamicDecorations.push(replaceDecoration);
+                
                 const maxLine = Math.min(change.endLine, editor.document.lineCount - 1);
                 const startLine = Math.min(change.startLine, editor.document.lineCount - 1);
 
@@ -361,29 +411,50 @@ export class DiffManager {
                         editor.document.lineAt(maxLine).text.length
                     );
 
-                    const decoration = {
+                    editor.setDecorations(replaceDecoration, [{
                         range,
                         hoverMessage: new vscode.MarkdownString(
-                            `**AI Generated ${change.changeType === 'insert' ? 'Addition' : 'Modification'}**\n\n` +
+                            `**🔄 AI Generated Modification**\n\n` +
                             `Change ID: \`${change.id}\`\n\n` +
                             `Applied at: ${change.timestamp.toLocaleString()}\n\n` +
-                            (change.originalContent ? `**Original:**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` : '') +
-                            `**New:**\n\`\`\`\n${change.newContent}\n\`\`\``
+                            `**❌ ORIGINAL (removed):**\n\`\`\`\n${change.originalContent}\n\`\`\`\n\n` +
+                            `**✅ NEW (current):**\n\`\`\`\n${change.newContent}\n\`\`\`\n\n` +
+                            `*The original content was replaced with the new content above*`
                         )
-                    };
+                    }]);
+                }
 
-                    if (change.changeType === 'insert') {
-                        insertDecorations.push(decoration);
-                    } else {
-                        replaceDecorations.push(decoration);
-                    }
+            } else { // insert
+                const maxLine = Math.min(change.endLine, editor.document.lineCount - 1);
+                const startLine = Math.min(change.startLine, editor.document.lineCount - 1);
+
+                if (startLine >= 0 && maxLine >= startLine) {
+                    const range = new vscode.Range(
+                        startLine,
+                        0,
+                        maxLine,
+                        editor.document.lineAt(maxLine).text.length
+                    );
+
+                    insertDecorations.push({
+                        range,
+                        hoverMessage: new vscode.MarkdownString(
+                            `**➕ AI Generated Addition**\n\n` +
+                            `Change ID: \`${change.id}\`\n\n` +
+                            `Applied at: ${change.timestamp.toLocaleString()}\n\n` +
+                            `**✅ ADDED CONTENT:**\n\`\`\`\n${change.newContent}\n\`\`\`\n\n` +
+                            `*This content was added by the AI*`
+                        )
+                    });
                 }
             }
         }
 
+        // Apply static decorations
         editor.setDecorations(this.insertDecorationType, insertDecorations);
-        editor.setDecorations(this.replaceDecorationType, replaceDecorations);
-        editor.setDecorations(this.deleteDecorationType, deleteDecorations);
+
+        // Store dynamic decorations for cleanup
+        this.dynamicDecorations.set(filePath, newDynamicDecorations);
     }
 
     private handleTextDocumentChange(event: vscode.TextDocumentChangeEvent): void {
@@ -496,6 +567,13 @@ export class DiffManager {
         this.insertDecorationType.dispose();
         this.replaceDecorationType.dispose();
         this.deleteDecorationType.dispose();
+        
+        // Dispose all dynamic decorations
+        for (const decorations of this.dynamicDecorations.values()) {
+            decorations.forEach(decoration => decoration.dispose());
+        }
+        this.dynamicDecorations.clear();
+        
         this.pendingChanges.clear();
         
         // Clear all pending timeouts
