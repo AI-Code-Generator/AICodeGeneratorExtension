@@ -95,6 +95,25 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Register commands for bulk accept/reject all changes
+    context.subscriptions.push(
+        vscode.commands.registerCommand('aiCodeAssist.acceptAllChanges', () => {
+            diffManager.acceptAllChanges();
+            diffCodeLensProvider.refresh();
+            diffManager.forceRefreshDecorations();
+            vscode.window.showInformationMessage('Accepted all AI-generated changes');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('aiCodeAssist.rejectAllChanges', async () => {
+            await diffManager.rejectAllChanges();
+            diffCodeLensProvider.refresh();
+            diffManager.forceRefreshDecorations();
+            vscode.window.showInformationMessage('Rejected all AI-generated changes');
+        })
+    );
+
 	// const completionProvider = new AICompletionProvider(config.serverUrl);
     // context.subscriptions.push(
     //     vscode.languages.registerInlineCompletionItemProvider(
