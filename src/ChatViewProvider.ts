@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { similaritySearch } from './service/FileIndexer';
 import { ContextGatherer } from './service/ContextGatherer';
 import { AgentService } from './service/AgentService';
+import { DiffManager } from './service/DiffManager';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -117,9 +118,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
+            if (data.type === 'acceptAllChanges') {
+                vscode.commands.executeCommand('aiCodeAssist.acceptAllChanges');
+                return;
+            }
+
+            if (data.type === 'rejectAllChanges') {
+                vscode.commands.executeCommand('aiCodeAssist.rejectAllChanges');
+                return;
+            }
+
             if (data.mode === 'agent') {
                 this.isProcessing = true;
                 this.updateProcessingState();
+                
+                // Hide bulk actions when starting new agent task
+                this._view?.webview.postMessage({
+                    type: 'showBulkActions',
+                    show: false
+                });
                 
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
                     this._view?.webview.postMessage({
@@ -130,6 +147,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 }).finally(() => {
                     this.isProcessing = false;
                     this.updateProcessingState();
+                    
+                    // Show bulk actions only if there are pending changes
+                    const diffManager = DiffManager.getInstance();
+                    const allChanges = diffManager.getAllPendingChanges();
+                    const hasPendingChanges = Array.from(allChanges.values()).some(changes => changes.length > 0);
+                    
+                    if (hasPendingChanges) {
+                        this._view?.webview.postMessage({
+                            type: 'showBulkActions',
+                            show: true
+                        });
+                    }
                 });
                 return;
             }
@@ -312,6 +341,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             gap: 8px;
             background: var(--vscode-editor-background);
             padding: 10px;
+            z-index: 1000; /* Below bulk actions */
         }
         #messageInput { 
             flex-grow: 1;
@@ -348,7 +378,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             height: calc(100vh - 100px);
             overflow-y: auto;
             padding: 10px;
-            margin-bottom: 80px;
+            margin-bottom: 140px; /* Increased margin for bulk actions + input */
         }
         .loading {
             display: none;
@@ -356,7 +386,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-style: italic;
             color: var(--vscode-descriptionForeground);
             position: fixed;
-            bottom: 70px;
+            bottom: 130px; /* Adjusted for bulk actions */
             left: 20px;
             background: var(--vscode-editor-background);
             padding: 5px 10px;
@@ -408,6 +438,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .text-content {
             margin: 8px 0;
         }
+        .bulk-actions {
+            display: none;
+            position: fixed;
+            bottom: 70px; /* Position above input container */
+            left: 10px;
+            right: 10px;
+            margin: 0;
+            padding: 15px;
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 6px;
+            text-align: center;
+            z-index: 1001; /* Above loading indicator */
+            box-shadow: 0 -2px 8px rgba(0,0,0,0.2);
+            transform: translateY(100%);
+            transition: transform 0.3s ease-in-out, opacity 0.3s ease-in-out;
+            opacity: 0;
+        }
+        .bulk-actions.show {
+            display: block;
+            transform: translateY(0);
+            opacity: 1;
+        }
+        .bulk-actions h4 {
+            margin: 0 0 10px 0;
+            color: var(--vscode-foreground);
+            font-size: 14px;
+        }
+        .bulk-actions-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+        }
+        .bulk-action-button {
+            padding: 8px 16px;
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .accept-all-button {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        .accept-all-button:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .reject-all-button {
+            background: var(--vscode-errorForeground);
+            color: white;
+        }
+        .reject-all-button:hover {
+            opacity: 0.8;
+        }
     </style>
 </head>
 <body>
@@ -416,6 +501,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <button id="agentButton" class="mode-button">Agent</button>
     </div>
     <div id="chatMessages"></div>
+    <div id="bulkActions" class="bulk-actions">
+        <h4>Agent Task Completed - Review Changes</h4>
+        <div class="bulk-actions-buttons">
+            <button id="acceptAllButton" class="bulk-action-button accept-all-button">✓ Accept All Changes</button>
+            <button id="rejectAllButton" class="bulk-action-button reject-all-button">✗ Reject All Changes</button>
+        </div>
+    </div>
     <div id="loading" class="loading">Thinking...</div>
     <div class="input-container">
         <textarea 
@@ -436,6 +528,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const loading = document.getElementById('loading');
         const askButton = document.getElementById('askButton');
         const agentButton = document.getElementById('agentButton');
+        const bulkActions = document.getElementById('bulkActions');
+        const acceptAllButton = document.getElementById('acceptAllButton');
+        const rejectAllButton = document.getElementById('rejectAllButton');
         let currentMode = 'ask';
         let isProcessing = false;
 
@@ -443,12 +538,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             currentMode = 'ask';
             askButton.classList.add('active');
             agentButton.classList.remove('active');
+            // Hide bulk actions in ask mode with animation
+            bulkActions.classList.remove('show');
+            setTimeout(() => {
+                bulkActions.style.display = 'none';
+            }, 300);
         });
 
         agentButton.addEventListener('click', () => {
             currentMode = 'agent';
             agentButton.classList.add('active');
             askButton.classList.remove('active');
+            // Don't automatically show bulk actions - they will appear when agent finishes
+        });
+
+        // Bulk action button event listeners
+        acceptAllButton.addEventListener('click', () => {
+            vscode.postMessage({
+                type: 'acceptAllChanges'
+            });
+            // Hide with animation
+            bulkActions.classList.remove('show');
+            setTimeout(() => {
+                bulkActions.style.display = 'none';
+            }, 300);
+        });
+
+        rejectAllButton.addEventListener('click', () => {
+            vscode.postMessage({
+                type: 'rejectAllChanges'
+            });
+            // Hide with animation
+            bulkActions.classList.remove('show');
+            setTimeout(() => {
+                bulkActions.style.display = 'none';
+            }, 300);
         });
 
         // Create a code block with header and copy button
@@ -554,6 +678,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     updateButtonStates();
                     if (!isProcessing) {
                         loading.style.display = 'none';
+                    }
+                    break;
+                case 'showBulkActions':
+                    if (currentMode === 'agent' && message.show) {
+                        bulkActions.style.display = 'block';
+                        // Small delay to ensure the element is rendered before starting animation
+                        setTimeout(() => {
+                            bulkActions.classList.add('show');
+                        }, 10);
+                    } else {
+                        bulkActions.classList.remove('show');
+                        // Hide after animation completes
+                        setTimeout(() => {
+                            if (!bulkActions.classList.contains('show')) {
+                                bulkActions.style.display = 'none';
+                            }
+                        }, 300);
                     }
                     break;
                 case 'addMessage':

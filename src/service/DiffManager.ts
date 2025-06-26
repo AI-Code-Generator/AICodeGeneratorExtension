@@ -545,6 +545,88 @@ export class DiffManager {
         }
     }
 
+    public acceptAllChanges(): void {
+        // Simply clear all pending changes since they're already applied to files
+        const changeCount = Array.from(this.pendingChanges.values()).reduce((total, changes) => total + changes.length, 0);
+        this.pendingChanges.clear();
+        
+        // Clear all dynamic decorations
+        for (const decorations of this.dynamicDecorations.values()) {
+            decorations.forEach(decoration => decoration.dispose());
+        }
+        this.dynamicDecorations.clear();
+
+        // Force immediate decoration update
+        this.updateAllVisibleDecorations();
+        vscode.window.showInformationMessage(`Accepted ${changeCount} AI-generated changes`);
+    }
+
+    public async rejectAllChanges(): Promise<void> {
+        // Collect all changes and their file info for batch processing
+        const filesToRevert: Map<string, { absolutePath: string, changes: DiffChange[] }> = new Map();
+        
+        for (const [filePath, changes] of this.pendingChanges) {
+            if (changes.length > 0) {
+                filesToRevert.set(filePath, {
+                    absolutePath: this.getAbsolutePath(filePath),
+                    changes: [...changes] // Create a copy
+                });
+            }
+        }
+
+        // Process each file
+        for (const [filePath, fileInfo] of filesToRevert) {
+            try {
+                // Read current content
+                const currentContent = await fs.readFile(fileInfo.absolutePath, 'utf-8');
+                let lines = currentContent.split('\n');
+                
+                // Sort changes by line number in reverse order to avoid line number shifting
+                const sortedChanges = fileInfo.changes.sort((a, b) => b.startLine - a.startLine);
+                
+                // Apply reverts in reverse order
+                for (const change of sortedChanges) {
+                    if (change.changeType === 'delete') {
+                        // Re-insert deleted content
+                        const originalLines = change.originalContent.split('\n');
+                        lines.splice(change.startLine, 0, ...originalLines);
+                    } else if (change.changeType === 'insert') {
+                        // Remove inserted content
+                        const linesToRemove = change.endLine - change.startLine + 1;
+                        lines.splice(change.startLine, linesToRemove);
+                    } else if (change.changeType === 'replace') {
+                        // Replace with original content
+                        const linesToReplace = change.endLine - change.startLine + 1;
+                        const originalLines = change.originalContent.split('\n');
+                        lines.splice(change.startLine, linesToReplace, ...originalLines);
+                    }
+                }
+                
+                // Write reverted content back to file
+                await fs.writeFile(fileInfo.absolutePath, lines.join('\n'), 'utf-8');
+                
+            } catch (error) {
+                console.error(`Failed to revert changes in ${filePath}:`, error);
+                vscode.window.showErrorMessage(`Failed to revert changes in ${filePath}`);
+            }
+        }
+
+        const changeCount = Array.from(this.pendingChanges.values()).reduce((total, changes) => total + changes.length, 0);
+        
+        // Clear all pending changes
+        this.pendingChanges.clear();
+        
+        // Clear all dynamic decorations
+        for (const decorations of this.dynamicDecorations.values()) {
+            decorations.forEach(decoration => decoration.dispose());
+        }
+        this.dynamicDecorations.clear();
+
+        // Force immediate decoration update
+        this.updateAllVisibleDecorations();
+        vscode.window.showInformationMessage(`Rejected ${changeCount} AI-generated changes`);
+    }
+
     public getPendingChanges(filePath: string): DiffChange[] {
         return this.pendingChanges.get(filePath) || [];
     }
