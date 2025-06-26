@@ -14,6 +14,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private agentService: AgentService;
     private currentAbortController?: AbortController;
     private isProcessing: boolean = false;
+    private currentMode: 'ask' | 'agent' = 'ask'; // Track current mode
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -110,9 +111,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
+        setTimeout(() => {
+            this.updateProcessingState();
+        }, 100);
+
         // Handle messages from the webview
         const agentUrl = this._queryUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
+            if (data.type === 'requestState') {
+                // Send current processing state and mode to webview
+                this.updateProcessingState();
+                this._view?.webview.postMessage({
+                    type: 'updateMode',
+                    mode: this.currentMode
+                });
+                return;
+            }
+
             if (data.type === 'stopProcess') {
                 this.stopCurrentProcess();
                 return;
@@ -129,6 +144,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             if (data.mode === 'agent') {
+                this.currentMode = 'agent'; // Update current mode
                 this.isProcessing = true;
                 this.updateProcessingState();
                 
@@ -165,6 +181,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             switch (data.type) {
                 case 'sendMessage':
+                    this.currentMode = 'ask'; // Update current mode for regular chat
                     try {
                         this.isProcessing = true;
                         this.updateProcessingState();
@@ -386,7 +403,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-style: italic;
             color: var(--vscode-descriptionForeground);
             position: fixed;
-            bottom: 130px; /* Adjusted for bulk actions */
+            bottom: 145px;
             left: 20px;
             background: var(--vscode-editor-background);
             padding: 5px 10px;
@@ -441,7 +458,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .bulk-actions {
             display: none;
             position: fixed;
-            bottom: 70px; /* Position above input container */
+            bottom: 85px;
             left: 10px;
             right: 10px;
             margin: 0;
@@ -680,6 +697,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         loading.style.display = 'none';
                     }
                     break;
+                case 'updateMode':
+                    currentMode = message.mode;
+                    // Update button states based on the mode
+                    if (currentMode === 'ask') {
+                        askButton.classList.add('active');
+                        agentButton.classList.remove('active');
+                        bulkActions.classList.remove('show');
+                        bulkActions.style.display = 'none';
+                    } else {
+                        agentButton.classList.add('active');
+                        askButton.classList.remove('active');
+                    }
+                    break;
                 case 'showBulkActions':
                     if (currentMode === 'agent' && message.show) {
                         bulkActions.style.display = 'block';
@@ -750,6 +780,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Initial setup
         messageInput.focus();
         updateButtonStates();
+        
+        // Request current processing state from extension
+        vscode.postMessage({
+            type: 'requestState'
+        });
     </script>
 </body>
 </html>
