@@ -17,16 +17,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private currentMode: 'ask' | 'agent' = 'ask'; // Track current mode
     private askHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
     private agentHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
+    private currentAgentResponseIndex: number = -1; // Track current streaming response
+    private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        baseUrl: string
+        baseUrl: string,
+        private readonly _context: vscode.ExtensionContext
     ) {
         this._queryUrl = `${baseUrl}/ask-ai`;
         this._embedUrl = `${baseUrl}/embed`;
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService();
+        
+        // Load persisted history
+        this.loadHistory();
     }
 
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
@@ -153,6 +159,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     mode: this.currentMode
                 });
                 this.sendHistoryToWebview();
+                // Save mode change
+                this.saveHistory();
                 return;
             }
 
@@ -189,6 +197,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             message: update,
                             sender: 'assistant'
                         });
+                        
+                        // Add initial assistant message to history immediately
+                        this.addToHistory('agent', 'assistant', update);
+                        this.currentAgentResponseIndex = this.agentHistory.length - 1;
                         isFirstUpdate = false;
                     } else {
                         // Append to the existing assistant message bubble
@@ -197,10 +209,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             message: update,
                             sender: 'assistant'
                         });
+                        
+                        // Update the agent response in history
+                        if (this.currentAgentResponseIndex >= 0) {
+                            this.agentHistory[this.currentAgentResponseIndex].message = agentResponse.trim();
+                            this.debouncedSaveHistory();
+                        }
                     }
                 }).finally(() => {
-                    // Add complete agent response to history
-                    this.addToHistory('agent', 'assistant', agentResponse.trim());
+                    // Ensure final agent response is saved to history
+                    if (this.currentAgentResponseIndex >= 0) {
+                        this.agentHistory[this.currentAgentResponseIndex].message = agentResponse.trim();
+                        this.saveHistory();
+                    }
+                    this.currentAgentResponseIndex = -1;
                     
                     this.isProcessing = false;
                     this.updateProcessingState();
@@ -358,6 +380,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private addToHistory(mode: 'ask' | 'agent', type: 'user' | 'assistant', message: string) {
         const historyArray = mode === 'ask' ? this.askHistory : this.agentHistory;
         historyArray.push({ type, message });
+        // Save history to extension storage
+        this.saveHistory();
     }
 
     private getCurrentHistory(): Array<{type: 'user' | 'assistant', message: string}> {
@@ -370,6 +394,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             type: 'loadHistory',
             history: history
         });
+    }
+
+    private async loadHistory() {
+        try {
+            const askHistoryData = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('askHistory');
+            const agentHistoryData = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('agentHistory');
+            const savedMode = this._context.globalState.get<'ask' | 'agent'>('currentMode');
+            
+            if (askHistoryData) {
+                this.askHistory = askHistoryData;
+            }
+            if (agentHistoryData) {
+                this.agentHistory = agentHistoryData;
+            }
+            if (savedMode) {
+                this.currentMode = savedMode;
+            }
+        } catch (error) {
+            console.error('Failed to load chat history:', error);
+        }
+    }
+
+    private async saveHistory() {
+        try {
+            await this._context.globalState.update('askHistory', this.askHistory);
+            await this._context.globalState.update('agentHistory', this.agentHistory);
+            await this._context.globalState.update('currentMode', this.currentMode);
+        } catch (error) {
+            console.error('Failed to save chat history:', error);
+        }
+    }
+
+    private debouncedSaveHistory() {
+        // Clear existing timeout
+        if (this.saveHistoryTimeout) {
+            clearTimeout(this.saveHistoryTimeout);
+        }
+        
+        // Set new timeout to save after 500ms of inactivity
+        this.saveHistoryTimeout = setTimeout(() => {
+            this.saveHistory();
+        }, 500);
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {

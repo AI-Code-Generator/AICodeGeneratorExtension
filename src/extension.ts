@@ -8,7 +8,7 @@ import { DiffManager } from './service/DiffManager';
 import { DiffCodeLensProvider } from './service/DiffCodeLensProvider';
 
 export function activate(context: vscode.ExtensionContext) {
-    const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl);
+    const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl, context);
     
     let output = vscode.window.createOutputChannel("AI code assist");
 
