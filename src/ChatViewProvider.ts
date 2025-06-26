@@ -19,6 +19,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private agentHistory: Array<{type: 'user' | 'assistant', message: string}> = [];
     private currentAgentResponseIndex: number = -1; // Track current streaming response
     private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
+    private pendingTerminalCommandResolve?: (value: boolean) => void; // For terminal command confirmations
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -30,6 +31,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService();
+        
+        // Set up terminal command callback
+        this.agentService.setTerminalCommandCallback(this.handleTerminalCommandConfirmation.bind(this));
         
         // Load persisted history
         this.loadHistory();
@@ -166,6 +170,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             if (data.type === 'clearMessages') {
                 this.clearMessages();
+                return;
+            }
+
+            if (data.type === 'confirmTerminalCommand') {
+                if (this.pendingTerminalCommandResolve) {
+                    this.pendingTerminalCommandResolve(data.allow);
+                    this.pendingTerminalCommandResolve = undefined;
+                }
                 return;
             }
 
@@ -740,6 +752,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .reject-all-button:hover {
             opacity: 0.8;
         }
+        .terminal-command-confirmation {
+            background: var(--vscode-editorWidget-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 8px;
+            margin: 10px 0;
+            padding: 15px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .terminal-command-confirmation h4 {
+            margin: 0 0 10px 0;
+            color: var(--vscode-foreground);
+            font-size: 14px;
+        }
+        .terminal-command {
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 10px;
+            margin: 10px 0;
+            font-family: var(--vscode-editor-font-family);
+            font-size: var(--vscode-editor-font-size);
+            color: var(--vscode-editor-foreground);
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .terminal-command-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 15px;
+        }
+        .terminal-command-button {
+            padding: 8px 16px;
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .allow-command-button {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        .allow-command-button:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .deny-command-button {
+            background: var(--vscode-errorForeground);
+            color: white;
+        }
+        .deny-command-button:hover {
+            opacity: 0.8;
+        }
     </style>
 </head>
 <body>
@@ -1026,6 +1091,57 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 .replace(/\`([^\`]+)\`/g, '<code>$1</code>');
         }
 
+        function showTerminalCommandConfirmation(command) {
+            const confirmationDiv = document.createElement('div');
+            confirmationDiv.className = 'terminal-command-confirmation';
+            
+            const title = document.createElement('h4');
+            title.textContent = '🖥️ Terminal Command Request';
+            confirmationDiv.appendChild(title);
+            
+            const description = document.createElement('p');
+            description.textContent = 'The agent wants to run the following command:';
+            confirmationDiv.appendChild(description);
+            
+            const commandDiv = document.createElement('div');
+            commandDiv.className = 'terminal-command';
+            commandDiv.textContent = command;
+            confirmationDiv.appendChild(commandDiv);
+            
+            const buttonsDiv = document.createElement('div');
+            buttonsDiv.className = 'terminal-command-buttons';
+            
+            const allowButton = document.createElement('button');
+            allowButton.className = 'terminal-command-button allow-command-button';
+            allowButton.textContent = '✓ Allow';
+            allowButton.onclick = () => {
+                vscode.postMessage({
+                    type: 'confirmTerminalCommand',
+                    allow: true
+                });
+                confirmationDiv.remove();
+            };
+            
+            const denyButton = document.createElement('button');
+            denyButton.className = 'terminal-command-button deny-command-button';
+            denyButton.textContent = '✗ Deny';
+            denyButton.onclick = () => {
+                vscode.postMessage({
+                    type: 'confirmTerminalCommand',
+                    allow: false
+                });
+                confirmationDiv.remove();
+            };
+            
+            buttonsDiv.appendChild(allowButton);
+            buttonsDiv.appendChild(denyButton);
+            confirmationDiv.appendChild(buttonsDiv);
+            
+            // Add to chat messages
+            chatMessages.appendChild(confirmationDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
         function sendMessage() {
             const message = messageInput.value.trim();
             if (message && !isProcessing) {
@@ -1117,6 +1233,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             }
                         }, 300);
                     }
+                    break;
+                case 'showTerminalCommandConfirmation':
+                    showTerminalCommandConfirmation(message.command);
                     break;
                 case 'addMessage':
                     loading.style.display = 'none';
@@ -1255,5 +1374,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>
     `;
+    }
+
+    private async handleTerminalCommandConfirmation(command: string): Promise<boolean> {
+        return new Promise((resolve) => {
+            this.pendingTerminalCommandResolve = resolve;
+            
+            // Send terminal command confirmation request to webview
+            this._view?.webview.postMessage({
+                type: 'showTerminalCommandConfirmation',
+                command: command
+            });
+        });
     }
 }
