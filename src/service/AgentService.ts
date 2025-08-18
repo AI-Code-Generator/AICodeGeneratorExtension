@@ -27,7 +27,9 @@ class ToolBox {
         return this.workingDirectory;
     }
 
-    public async list_files(): Promise<string[]> {
+    public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
+        let allFiles: string[] = [];
+        
         if (this.workingDirectory) {
             // Use fs to list files recursively in the specific directory
             const fs = require('fs');
@@ -60,12 +62,26 @@ class ToolBox {
                 return arrayOfFiles;
             };
             
-            return getAllFiles(this.workingDirectory);
+            allFiles = getAllFiles(this.workingDirectory);
         } else {
             // Find all files, ignoring .git, node_modules, and other common exclusions
             const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
-            return files.map(file => vscode.workspace.asRelativePath(file));
+            allFiles = files.map(file => vscode.workspace.asRelativePath(file));
         }
+
+        // Sort files for consistent ordering
+        allFiles.sort();
+        
+        // Paginate the results
+        const startIndex = offset;
+        const endIndex = Math.min(offset + limit, allFiles.length);
+        const paginatedFiles = allFiles.slice(startIndex, endIndex);
+        
+        return {
+            files: paginatedFiles,
+            total: allFiles.length,
+            hasMore: endIndex < allFiles.length
+        };
     }
 
     public async read_file(filePath: string): Promise<string> {
@@ -233,7 +249,8 @@ export class AgentService {
             try {
                 // @ts-ignore
                 const result = await this.toolbox[tool](...args);
-                const resultString = JSON.stringify(result, null, 2);
+                let resultString = JSON.stringify(result, null, 2);
+                
                 sendUpdate(`Tool ${tool} executed successfully`);
                 sendUpdate(`Tool ${tool} result length: ${resultString.length}`);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: resultString });
@@ -259,7 +276,7 @@ export class AgentService {
 
     private getToolDefinitions() {
         return [
-            { name: 'list_files', description: 'List all files in the workspace. Returns an array of relative file paths.' },
+            { name: 'list_files', description: 'List files in the workspace with pagination. Returns an object with files array, total count, and hasMore flag. Use offset and limit for pagination.', args: [{ name: 'offset', type: 'number' }, { name: 'limit', type: 'number' }] },
             { name: 'read_file', description: 'Read the content of a file at a given relative path.', args: [{ name: 'filePath', type: 'string' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
@@ -271,43 +288,61 @@ export class AgentService {
         sendUpdate("Asking the model for the next step...");
         sendUpdate(`Making request to: ${serverUrl}`);
 
-        const systemPrompt = `
-            You are an expert AI programmer agent.
-            Your goal is to complete the user's request: "${prompt}"
-            
-            CRITICAL INSTRUCTIONS:
-            1. You operate autonomously - make file changes immediately without asking permission
-            2. apply_file_change tool applies changes instantly to files
-            3. Users see diffs with accept/reject buttons after you make changes
-            4. NEVER ask "Should I..." or "Would you like me to..." - just do it
-            5. Complete the entire task by making all necessary changes
-            6. Only use 'finish' when the task is completely done
-            
-            You operate in a loop. In each step, choose the appropriate tool and execute it.
-            Do not ask for clarification or permission.
+        const systemPrompt = `You are an expert AI programmer agent.
+Your goal is to complete the user's request: "${prompt}"
 
-            Tools:
-            ${JSON.stringify(this.getToolDefinitions(), null, 2)}
+CRITICAL INSTRUCTIONS:
+1. You operate autonomously - make file changes immediately without asking permission
+2. apply_file_change tool applies changes instantly to files
+3. Users see diffs with accept/reject buttons after you make changes
+4. NEVER ask "Should I..." or "Would you like me to..." - just do it
+5. Complete the entire task by making all necessary changes
+6. Only use 'finish' when the task is completely done
 
-            Respond with a single JSON object with two keys: "thought" and "tool_call".
-            "thought" should be a string explaining your reasoning for the chosen action.
-            "tool_call" should be an object with two keys: "name" and "args".
-            Example response:
-            {
-                "thought": "I need to see the files in the workspace to understand the project structure.",
-                "tool_call": {
-                    "name": "list_files",
-                    "args": []
-                }
+IMPORTANT: list_files is paginated. Use offset and limit parameters:
+- list_files(0, 100) gets first 100 files
+- list_files(100, 100) gets next 100 files
+- The response includes hasMore flag to indicate if there are more files
+- Use this to explore the codebase efficiently instead of loading all files at once
+
+You operate in a loop. In each step, choose the appropriate tool and execute it.
+Do not ask for clarification or permission.
+
+Tools:
+${JSON.stringify(this.getToolDefinitions())}
+
+Respond with a single JSON object with two keys: "thought" and "tool_call".
+"thought" should be a string explaining your reasoning for the chosen action.
+"tool_call" should be an object with two keys: "name" and "args".
+Example response:
+{
+    "thought": "I need to see the files in the workspace to understand the project structure.",
+    "tool_call": {
+        "name": "list_files",
+        "args": {"offset": 0, "limit": 100}
+    }
+}`;
+
+        // Truncate history more aggressively to prevent argument list too long errors
+        const truncatedHistory = history.slice(-2).map(entry => {
+            // Truncate very long results to prevent prompt explosion
+            let result = entry.result;
+            if (typeof result === 'string' && result.length > 5000) {
+                result = result.substring(0, 5000) + '... [TRUNCATED]';
             }
-        `;
+            return {
+                action: entry.action,
+                result: result
+            };
+        });
+        
+        const fullPrompt = `System Prompt: ${systemPrompt}
+User Request: ${prompt}
+History:
+${JSON.stringify(truncatedHistory)}`;
 
-        const fullPrompt = `
-            System Prompt: ${systemPrompt}
-            User Request: ${prompt}
-            History:
-            ${JSON.stringify(history, null, 2)}
-        `;
+        sendUpdate(`Full prompt length: ${fullPrompt.length} characters`);
+        sendUpdate(`History entries: ${history.length}, truncated to: ${truncatedHistory.length}`);
 
         try {
             this.currentAbortController = new AbortController();
@@ -341,6 +376,16 @@ export class AgentService {
 
             const jsonResponse = await response.json();
             sendUpdate(`Response JSON keys: ${Object.keys(jsonResponse)}`);
+
+            // Check if server returned an error
+            if (jsonResponse.error) {
+                sendUpdate(`Server returned error: ${jsonResponse.error}`);
+                return {
+                    thought: "Server returned an error.",
+                    tool: 'finish',
+                    args: [`Server error: ${jsonResponse.error}`]
+                };
+            }
 
             let modelResponseText = jsonResponse.response;
             sendUpdate(`Model response length: ${modelResponseText ? modelResponseText.length : 0} characters`);
@@ -411,7 +456,19 @@ export class AgentService {
             if (!Array.isArray(args) && typeof args === 'object' && args !== null) {
                 const toolDef = this.getToolDefinitions().find(t => t.name === toolName);
                 if (toolDef && toolDef.args) {
-                    args = toolDef.args.map((argDef: any) => args[argDef.name]);
+                    args = toolDef.args.map((argDef: any) => {
+                        const value = args[argDef.name];
+                        // Handle optional parameters with defaults
+                        if (value === undefined) {
+                            if (argDef.name === 'offset') {
+                                return 0;
+                            }
+                            if (argDef.name === 'limit') {
+                                return 100;
+                            }
+                        }
+                        return value;
+                    });
                     sendUpdate(`Converted object args to array: ${JSON.stringify(args)}`);
                 } else {
                     // If no tool definition found or no args defined, convert object values to array
