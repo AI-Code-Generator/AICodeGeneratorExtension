@@ -71,8 +71,13 @@ class ToolBox {
     public async read_file(filePath: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
-            return await fs.readFile(absolutePath, 'utf-8');
+            const content = await fs.readFile(absolutePath, 'utf-8');
+            return content;
         } catch (error) {
+            // If file not found, try to provide helpful error message
+            if ((error as any).code === 'ENOENT') {
+                return `Error: File not found at path: ${absolutePath}. Working directory: ${this.workingDirectory}`;
+            }
             return `Error reading file: ${error}`;
         }
     }
@@ -176,9 +181,9 @@ export class AgentService {
     }
 
     public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void) {
-        console.log(`[AgentService] Starting processRequest with serverUrl: ${serverUrl}`);
-        console.log(`[AgentService] Working directory: ${this.toolbox.getWorkingDirectory() || 'Not set'}`);
-        console.log(`[AgentService] Prompt length: ${prompt.length} characters`);
+        sendUpdate(`[AgentService] Starting processRequest with serverUrl: ${serverUrl}`);
+        sendUpdate(`[AgentService] Working directory: ${this.toolbox.getWorkingDirectory() || 'Not set'}`);
+        sendUpdate(`[AgentService] Prompt length: ${prompt.length} characters`);
         
         this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
@@ -186,19 +191,16 @@ export class AgentService {
 
         for (let i = 0; i < maxSteps; i++) {
             if (this.shouldStop) {
-                console.log(`[AgentService] Agent stopped by user at step ${i + 1}`);
                 sendUpdate("Agent stopped by user.");
                 return;
             }
 
             sendUpdate(`## Step ${i + 1}`);
-            console.log(`[AgentService] Starting step ${i + 1}/${maxSteps}`);
 
             const { tool, args, thought } = await this.getNextActionFromModel(prompt, history, sendUpdate, serverUrl);
-            console.log(`[AgentService] Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
+            sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
 
             if (this.shouldStop) {
-                console.log(`[AgentService] Agent stopped by user after getting model response at step ${i + 1}`);
                 sendUpdate("Agent stopped by user.");
                 return;
             }
@@ -208,37 +210,43 @@ export class AgentService {
             }
 
             if (tool === 'finish') {
-                console.log(`[AgentService] Agent finished at step ${i + 1} with message: ${args[0]}`);
                 sendUpdate(`**Agent finished: ${args[0]}**`);
                 return;
             }
 
-            if (!Object.getOwnPropertyNames(ToolBox.prototype).includes(tool)) {
-                const errorMsg = `Error: Model tried to use an unknown tool: ${tool}`;
-                console.error(`[AgentService] Unknown tool error at step ${i + 1}: ${tool}`);
+            // Check if the tool exists in the toolbox
+            const availableTools = Object.getOwnPropertyNames(ToolBox.prototype);
+            sendUpdate(`Available tools: ${availableTools.join(', ')}`);
+            sendUpdate(`Checking tool: ${tool}`);
+            
+            if (!availableTools.includes(tool) && !(this.toolbox as any)[tool]) {
+                const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableTools.join(', ')}`;
                 sendUpdate(errorMsg);
                 history.push({ action: `unknown_tool(${tool})`, result: errorMsg });
                 continue;
             }
 
             sendUpdate(`Action: ${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`);
-            console.log(`[AgentService] Executing tool: ${tool} with args:`, args);
+            sendUpdate(`Executing tool: ${tool} with args: ${JSON.stringify(args)}`);
+            sendUpdate(`Toolbox method exists: ${typeof (this.toolbox as any)[tool]}`);
 
             try {
                 // @ts-ignore
                 const result = await this.toolbox[tool](...args);
                 const resultString = JSON.stringify(result, null, 2);
+                sendUpdate(`Tool ${tool} executed successfully`);
+                sendUpdate(`Tool ${tool} result length: ${resultString.length}`);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: resultString });
                 sendUpdate(`Result: ${resultString.substring(0, 500)}${resultString.length > 500 ? '...' : ''}`);
-                console.log(`[AgentService] Tool ${tool} result:`, resultString.substring(0, 200));
+                sendUpdate(`Tool ${tool} result preview: ${resultString.substring(0, 200)}`);
             } catch (error: any) {
                 const errorMessage = `Error executing tool: ${error.message}`;
-                console.error(`[AgentService] Tool execution error at step ${i + 1}:`, error);
+                sendUpdate(`Tool execution error at step ${i + 1}: ${error.message}`);
+                sendUpdate(`Error stack: ${error.stack}`);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: errorMessage });
                 sendUpdate(errorMessage);
             }
         }
-        console.log(`[AgentService] Agent stopped after reaching max steps (${maxSteps})`);
         sendUpdate("Agent stopped after reaching max steps.");
     }
 
@@ -261,7 +269,7 @@ export class AgentService {
 
     private async getNextActionFromModel(prompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
         sendUpdate("Asking the model for the next step...");
-        console.log(`[AgentService] Making request to: ${serverUrl}`);
+        sendUpdate(`Making request to: ${serverUrl}`);
 
         const systemPrompt = `
             You are an expert AI programmer agent.
@@ -332,44 +340,90 @@ export class AgentService {
             }
 
             const jsonResponse = await response.json();
-            console.log(`[AgentService] Response JSON keys: ${Object.keys(jsonResponse)}`);
+            sendUpdate(`Response JSON keys: ${Object.keys(jsonResponse)}`);
 
             let modelResponseText = jsonResponse.response;
-            console.log(`[AgentService] Model response length: ${modelResponseText ? modelResponseText.length : 0} characters`);
-            console.log(`[AgentService] Model response preview: ${modelResponseText ? modelResponseText.substring(0, 200) : 'No response'}...`);
+            sendUpdate(`Model response length: ${modelResponseText ? modelResponseText.length : 0} characters`);
+            sendUpdate(`Model response preview: ${modelResponseText ? modelResponseText.substring(0, 500) : 'No response'}...`);
 
+            // Check if the response field is missing
+            if (!modelResponseText) {
+                sendUpdate(`Server response structure: ${JSON.stringify(jsonResponse, null, 2)}`);
+                return {
+                    thought: "Server returned empty or missing response field.",
+                    tool: 'finish',
+                    args: [`Server returned empty response. Full response: ${JSON.stringify(jsonResponse)}`]
+                };
+            }
+
+            // Check if the response is wrapped in markdown code blocks
             const jsonMatch = modelResponseText.match(/```(json)?\s*([\s\S]*?)\s*```/);
             if (jsonMatch && jsonMatch[2]) {
+                sendUpdate(`Found JSON in markdown, extracting...`);
                 modelResponseText = jsonMatch[2];
-                console.log(`[AgentService] Extracted JSON from markdown: ${modelResponseText.substring(0, 200)}...`);
+                sendUpdate(`Extracted JSON from markdown: ${modelResponseText.substring(0, 500)}...`);
             }
             
-            console.log(`[AgentService] Parsing JSON response...`);
-            const modelOutput = JSON.parse(modelResponseText);
-            console.log(`[AgentService] Parsed model output keys: ${Object.keys(modelOutput)}`);
+            sendUpdate(`Parsing JSON response...`);
+            sendUpdate(`Raw JSON to parse: ${modelResponseText}`);
+            
+            let modelOutput;
+            try {
+                modelOutput = JSON.parse(modelResponseText);
+            } catch (parseError: any) {
+                sendUpdate(`JSON parsing failed: ${parseError.message || parseError}`);
+                sendUpdate(`Raw response that failed to parse: ${modelResponseText}`);
+                return {
+                    thought: "Failed to parse model response as JSON.",
+                    tool: 'finish',
+                    args: [`JSON parsing error: ${parseError.message || parseError}`]
+                };
+            }
+            
+            sendUpdate(`Parsed model output keys: ${Object.keys(modelOutput)}`);
+            sendUpdate(`Model output: ${JSON.stringify(modelOutput, null, 2)}`);
+            
+            // Validate model output structure
+            if (!modelOutput.tool_call) {
+                sendUpdate(`Model output missing tool_call field`);
+                return {
+                    thought: modelOutput.thought || "Model response missing tool_call",
+                    tool: 'finish',
+                    args: [`Invalid model response: missing tool_call field`]
+                };
+            }
+            
+            if (!modelOutput.tool_call.name) {
+                sendUpdate(`Model output missing tool_call.name field`);
+                return {
+                    thought: modelOutput.thought || "Model response missing tool name",
+                    tool: 'finish',
+                    args: [`Invalid model response: missing tool_call.name field`]
+                };
+            }
             
             const toolName = modelOutput.tool_call.name;
             let args = modelOutput.tool_call.args;
             
-            console.log(`[AgentService] Tool name: ${toolName}, args type: ${typeof args}`);
+            sendUpdate(`Tool name: ${toolName}, args type: ${typeof args}`);
 
             // Convert args from object to array based on tool definition
             if (!Array.isArray(args) && typeof args === 'object' && args !== null) {
                 const toolDef = this.getToolDefinitions().find(t => t.name === toolName);
                 if (toolDef && toolDef.args) {
                     args = toolDef.args.map((argDef: any) => args[argDef.name]);
-                    console.log(`[AgentService] Converted object args to array: ${JSON.stringify(args)}`);
+                    sendUpdate(`Converted object args to array: ${JSON.stringify(args)}`);
                 } else {
                     // If no tool definition found or no args defined, convert object values to array
                     args = Object.values(args);
-                    console.log(`[AgentService] Converted object values to array: ${JSON.stringify(args)}`);
+                    sendUpdate(`Converted object values to array: ${JSON.stringify(args)}`);
                 }
             } else if (!Array.isArray(args)) {
                 args = [];
-                console.log(`[AgentService] No args provided, using empty array`);
+                sendUpdate(`No args provided, using empty array`);
             }
 
-            console.log(`[AgentService] Final result - tool: ${toolName}, args: ${JSON.stringify(args)}, thought: ${modelOutput.thought}`);
+            sendUpdate(`Final result - tool: ${toolName}, args: ${JSON.stringify(args)}, thought: ${modelOutput.thought}`);
 
             return {
                 thought: modelOutput.thought,
@@ -379,10 +433,10 @@ export class AgentService {
 
         } catch (error: any) {
             this.currentAbortController = undefined;
-            console.error(`[AgentService] Error in getNextActionFromModel:`, error);
+            sendUpdate(`Error in getNextActionFromModel: ${error.message}`);
             
             if (error.name === 'AbortError') {
-                console.log(`[AgentService] Request was aborted`);
+                sendUpdate(`Request was aborted`);
                 return {
                     thought: "Request was stopped by user.",
                     tool: 'finish',
@@ -390,7 +444,7 @@ export class AgentService {
                 };
             }
             
-            console.error(`[AgentService] Network or parsing error: ${error.message}`);
+            sendUpdate(`Network or parsing error: ${error.message}`);
             return {
                 thought: "There was an error calling the model.",
                 tool: 'finish',

@@ -236,7 +236,7 @@ async function processSWEBenchTask(output: vscode.OutputChannel) {
 
         // Create and run the SWE-bench agent
         const sweBenchAgent = new SWEBenchAgent();
-        const generated_patch = await sweBenchAgent.generatePatch(problem_statement, repo_path);
+        const generated_patch = await sweBenchAgent.generatePatch(problem_statement, repo_path, output);
 
         // Write the result to the output file
         const result = {

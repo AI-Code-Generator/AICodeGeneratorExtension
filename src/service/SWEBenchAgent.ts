@@ -19,7 +19,7 @@ export class SWEBenchAgent {
     /**
      * Main function to process a SWE-bench problem statement and generate a patch
      */
-    public async generatePatch(problemStatement: string, repositoryPath?: string): Promise<string> {
+    public async generatePatch(problemStatement: string, repositoryPath?: string, outputChannel?: vscode.OutputChannel): Promise<string> {
         if (repositoryPath) {
             this.repositoryPath = repositoryPath;
             // Set the working directory for the agent service
@@ -36,10 +36,14 @@ export class SWEBenchAgent {
             // Capture all updates from the agent
             const sendUpdate = (update: string) => {
                 console.log(`[SWE-bench Agent] ${update}`);
+                if (outputChannel) {
+                    outputChannel.appendLine(`[Agent] ${update}`);
+                }
                 
                 // Check if this is a finish message
                 if (update.includes('**Agent finished:') || update.includes('Agent stopped')) {
                     console.log(`[SWE-bench Agent] Agent completed, attempting to extract patch...`);
+                    console.log(`[SWE-bench Agent] Working directory: ${this.repositoryPath}`);
                     isFinished = true;
                     clearTimeout(processingTimeout);
                     
@@ -49,6 +53,8 @@ export class SWEBenchAgent {
                             console.log(`[SWE-bench Agent] Extracted patch with ${patch.length} characters`);
                             if (patch.length > 0) {
                                 console.log(`[SWE-bench Agent] Patch preview: ${patch.substring(0, 200)}...`);
+                            } else {
+                                console.log(`[SWE-bench Agent] No patch generated - this indicates the agent may not have made any file changes`);
                             }
                             generatedPatch = patch;
                             resolve(generatedPatch);
@@ -91,7 +97,7 @@ export class SWEBenchAgent {
                         })
                         .catch(() => resolve(''));
                 }
-            }, 60000); // 1 minute timeout for testing
+            }, 120000); // 2 minute timeout for testing
             
             this.agentService.processRequest(
                 problemStatement,
@@ -135,6 +141,21 @@ export class SWEBenchAgent {
             const execAsync = promisify(exec);
 
             console.log(`[SWE-bench Agent] Extracting patch from: ${workingDirectory}`);
+
+            // Initialize git repo if it doesn't exist
+            try {
+                await execAsync('git status', { cwd: workingDirectory });
+            } catch (statusError) {
+                console.log(`[SWE-bench Agent] No git repository found, initializing...`);
+                try {
+                    await execAsync('git init', { cwd: workingDirectory });
+                    await execAsync('git add .', { cwd: workingDirectory });
+                    await execAsync('git commit -m "Initial commit"', { cwd: workingDirectory });
+                    console.log(`[SWE-bench Agent] Git repository initialized`);
+                } catch (initError) {
+                    console.log(`[SWE-bench Agent] Failed to initialize git: ${initError}`);
+                }
+            }
 
             // First, add all files to git (in case new files were created)
             try {
