@@ -84,6 +84,49 @@ class ToolBox {
         };
     }
 
+    public async search_files(pattern: string): Promise<string[]> {
+        if (this.workingDirectory) {
+            const fs = require('fs');
+            const path = require('path');
+            
+            const searchFiles = (dirPath: string, pattern: string, arrayOfFiles: string[] = []): string[] => {
+                try {
+                    const files = fs.readdirSync(dirPath);
+                    
+                    files.forEach((file: string) => {
+                        const fullPath = path.join(dirPath, file);
+                        
+                        // Skip common directories we don't want to index
+                        if (['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'].includes(file)) {
+                            return;
+                        }
+                        
+                        if (fs.statSync(fullPath).isDirectory()) {
+                            searchFiles(fullPath, pattern, arrayOfFiles);
+                        } else {
+                            const relativePath = path.relative(this.workingDirectory, fullPath);
+                            // Simple pattern matching - contains the pattern or matches file extension
+                            if (relativePath.toLowerCase().includes(pattern.toLowerCase()) || 
+                                relativePath.endsWith(pattern)) {
+                                arrayOfFiles.push(relativePath);
+                            }
+                        }
+                    });
+                } catch (error) {
+                    console.error(`Error reading directory ${dirPath}:`, error);
+                }
+                
+                return arrayOfFiles;
+            };
+            
+            return searchFiles(this.workingDirectory, pattern).slice(0, 50); // Limit to 50 results
+        } else {
+            // Find files using vscode
+            const files = await vscode.workspace.findFiles(`**/*${pattern}*`, '{.git,node_modules,**/__pycache__,.vscode}/**');
+            return files.map(file => vscode.workspace.asRelativePath(file)).slice(0, 50);
+        }
+    }
+
     public async read_file(filePath: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
@@ -277,6 +320,7 @@ export class AgentService {
     private getToolDefinitions() {
         return [
             { name: 'list_files', description: 'List files in the workspace with pagination. Returns an object with files array, total count, and hasMore flag. Use offset and limit for pagination.', args: [{ name: 'offset', type: 'number' }, { name: 'limit', type: 'number' }] },
+            { name: 'search_files', description: 'Search for files by pattern/name. More efficient than listing all files when looking for specific files.', args: [{ name: 'pattern', type: 'string' }] },
             { name: 'read_file', description: 'Read the content of a file at a given relative path.', args: [{ name: 'filePath', type: 'string' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
@@ -299,11 +343,11 @@ CRITICAL INSTRUCTIONS:
 5. Complete the entire task by making all necessary changes
 6. Only use 'finish' when the task is completely done
 
-IMPORTANT: list_files is paginated. Use offset and limit parameters:
-- list_files(0, 100) gets first 100 files
-- list_files(100, 100) gets next 100 files
+IMPORTANT: Use tools efficiently to explore codebase:
+- search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
+- list_files(offset, limit) for paginated browsing when exploring structure
+- list_files(0, 100) gets first 100 files, list_files(100, 100) gets next 100
 - The response includes hasMore flag to indicate if there are more files
-- Use this to explore the codebase efficiently instead of loading all files at once
 
 You operate in a loop. In each step, choose the appropriate tool and execute it.
 Do not ask for clarification or permission.
@@ -327,8 +371,8 @@ Example response:
         const truncatedHistory = history.slice(-2).map(entry => {
             // Truncate very long results to prevent prompt explosion
             let result = entry.result;
-            if (typeof result === 'string' && result.length > 5000) {
-                result = result.substring(0, 5000) + '... [TRUNCATED]';
+            if (typeof result === 'string' && result.length > 2000) {
+                result = result.substring(0, 2000) + '... [TRUNCATED - content too long]';
             }
             return {
                 action: entry.action,
@@ -410,14 +454,20 @@ ${JSON.stringify(truncatedHistory)}`;
             }
             
             sendUpdate(`Parsing JSON response...`);
-            sendUpdate(`Raw JSON to parse: ${modelResponseText}`);
+            sendUpdate(`Raw JSON to parse: ${modelResponseText.substring(0, 500)}...`);
             
             let modelOutput;
             try {
-                modelOutput = JSON.parse(modelResponseText);
+                // Try to clean up common JSON issues
+                let cleanedJson = modelResponseText
+                    .replace(/\n/g, '\\n')  // Escape newlines
+                    .replace(/\r/g, '\\r')  // Escape carriage returns
+                    .replace(/\t/g, '\\t'); // Escape tabs
+                
+                modelOutput = JSON.parse(cleanedJson);
             } catch (parseError: any) {
                 sendUpdate(`JSON parsing failed: ${parseError.message || parseError}`);
-                sendUpdate(`Raw response that failed to parse: ${modelResponseText}`);
+                sendUpdate(`Raw response that failed to parse: ${modelResponseText.substring(0, 500)}...`);
                 return {
                     thought: "Failed to parse model response as JSON.",
                     tool: 'finish',
