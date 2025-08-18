@@ -458,21 +458,50 @@ ${JSON.stringify(truncatedHistory)}`;
             
             let modelOutput;
             try {
-                // Try to clean up common JSON issues
-                let cleanedJson = modelResponseText
-                    .replace(/\n/g, '\\n')  // Escape newlines
-                    .replace(/\r/g, '\\r')  // Escape carriage returns
-                    .replace(/\t/g, '\\t'); // Escape tabs
-                
-                modelOutput = JSON.parse(cleanedJson);
-            } catch (parseError: any) {
-                sendUpdate(`JSON parsing failed: ${parseError.message || parseError}`);
-                sendUpdate(`Raw response that failed to parse: ${modelResponseText.substring(0, 500)}...`);
-                return {
-                    thought: "Failed to parse model response as JSON.",
-                    tool: 'finish',
-                    args: [`JSON parsing error: ${parseError.message || parseError}`]
-                };
+                // First try parsing as-is
+                modelOutput = JSON.parse(modelResponseText);
+            } catch (firstError: any) {
+                try {
+                    // Simple approach: find and fix the specific issue with unescaped characters
+                    // The most common issue is unescaped newlines and quotes in the "thought" field
+                    let fixedJson = modelResponseText;
+                    
+                    // Look for the pattern: "thought": "some text with unescaped chars"
+                    fixedJson = fixedJson.replace(/"thought":\s*"([^"]*(?:\\.[^"]*)*)"(?=\s*[,}])/g, (match: string, content: string) => {
+                        // Properly escape the content
+                        const escaped = content
+                            .replace(/\\/g, '\\\\')  // Escape backslashes first
+                            .replace(/"/g, '\\"')    // Escape quotes
+                            .replace(/\n/g, '\\n')   // Escape newlines
+                            .replace(/\r/g, '\\r')   // Escape carriage returns
+                            .replace(/\t/g, '\\t');  // Escape tabs
+                        return `"thought": "${escaped}"`;
+                    });
+                    
+                    modelOutput = JSON.parse(fixedJson);
+                } catch (secondError: any) {
+                    // If still failing, try removing problematic content after the JSON
+                    try {
+                        // Look for the JSON object boundaries and extract just that
+                        const jsonStart = modelResponseText.indexOf('{');
+                        const jsonEnd = modelResponseText.lastIndexOf('}');
+                        
+                        if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+                            const extractedJson = modelResponseText.substring(jsonStart, jsonEnd + 1);
+                            modelOutput = JSON.parse(extractedJson);
+                        } else {
+                            throw new Error('Could not find valid JSON boundaries');
+                        }
+                    } catch (thirdError: any) {
+                        sendUpdate(`JSON parsing failed after all attempts: ${firstError.message || firstError}`);
+                        sendUpdate(`Full raw response: ${modelResponseText}`);
+                        return {
+                            thought: "Failed to parse model response as JSON.",
+                            tool: 'finish',
+                            args: [`JSON parsing error: ${firstError.message || firstError}`]
+                        };
+                    }
+                }
             }
             
             sendUpdate(`Parsed model output keys: ${Object.keys(modelOutput)}`);
