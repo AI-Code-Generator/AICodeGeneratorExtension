@@ -246,7 +246,7 @@ export class AgentService {
         
         this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
-        const maxSteps = 30;
+        const maxSteps = 60;
 
         let currentPrompt = prompt; // Use the full prompt for the first step
         let isFirstStep = true;
@@ -384,18 +384,34 @@ Example response:
     }
 }`;
 
-        // Truncate history more aggressively to prevent argument list too long errors
-        const truncatedHistory = history.slice(-2).map(entry => {
-            // Truncate very long results to prevent prompt explosion
+        const HISTORY_CHAR_BUDGET = 8000; 
+        let currentChars = 0;
+        const truncatedHistory = [];
+
+        // Loop backwards from the most recent entry to the oldest.
+        for (let i = history.length - 1; i >= 0; i--) {
+            const entry = history[i];
+
+            // Truncate very long individual results to prevent any single entry from dominating.
             let result = entry.result;
             if (typeof result === 'string' && result.length > 2000) {
                 result = result.substring(0, 2000) + '... [TRUNCATED - content too long]';
             }
-            return {
-                action: entry.action,
-                result: result
-            };
-        });
+
+            const sanitizedEntry = { action: entry.action, result: result };
+            const entryString = JSON.stringify(sanitizedEntry);
+
+            // Check if adding this next entry would blow our budget.
+            if (currentChars + entryString.length > HISTORY_CHAR_BUDGET) {
+                // If so, we have enough history and can stop.
+                break;
+            }
+
+            // Add the entry to the beginning of our new array to maintain the correct order.
+            truncatedHistory.unshift(sanitizedEntry);
+            currentChars += entryString.length;
+        }
+
         
         const fullPrompt = `System Prompt: ${systemPrompt}
 User Request: ${prompt}
