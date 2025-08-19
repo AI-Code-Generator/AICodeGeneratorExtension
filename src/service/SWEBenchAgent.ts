@@ -127,116 +127,151 @@ export class SWEBenchAgent {
     /**
      * Extract git diff patch from the specified repository path
      */
+    // private async extractPatchFromWorkspace(): Promise<string> {
+    //     const workingDirectory = this.repositoryPath || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        
+    //     if (!workingDirectory) {
+    //         throw new Error('No working directory found');
+    //     }
+
+    //     try {
+    //         // Use git command directly since we may not be in the VS Code workspace
+    //         const { exec } = require('child_process');
+    //         const { promisify } = require('util');
+    //         const execAsync = promisify(exec);
+
+    //         console.log(`[SWE-bench Agent] Extracting patch from: ${workingDirectory}`);
+
+    //         // Initialize git repo if it doesn't exist
+    //         try {
+    //             await execAsync('git status', { cwd: workingDirectory });
+    //         } catch (statusError) {
+    //             console.log(`[SWE-bench Agent] No git repository found, initializing...`);
+    //             try {
+    //                 await execAsync('git init', { cwd: workingDirectory });
+    //                 await execAsync('git add .', { cwd: workingDirectory });
+    //                 await execAsync('git commit -m "Initial commit"', { cwd: workingDirectory });
+    //                 console.log(`[SWE-bench Agent] Git repository initialized`);
+    //             } catch (initError) {
+    //                 console.log(`[SWE-bench Agent] Failed to initialize git: ${initError}`);
+    //             }
+    //         }
+
+    //         // First, add all files to git (in case new files were created)
+    //         try {
+    //             await execAsync('git add .', { cwd: workingDirectory });
+    //             console.log(`[SWE-bench Agent] Added all files to git`);
+    //         } catch (addError) {
+    //             console.log(`[SWE-bench Agent] Git add failed (may be normal): ${addError}`);
+    //         }
+
+    //         // Get git status first to see what changed
+    //         const { stdout: statusOutput } = await execAsync('git status --porcelain', {
+    //             cwd: workingDirectory
+    //         });
+
+    //         console.log(`[SWE-bench Agent] Git status output: ${statusOutput}`);
+
+    //         if (!statusOutput.trim()) {
+    //             console.log('[SWE-bench Agent] No changes detected in git status');
+                
+    //             // Try to get diff of any uncommitted changes
+    //             try {
+    //                 const { stdout: diffUnstaged } = await execAsync('git diff', {
+    //                     cwd: workingDirectory
+    //                 });
+                    
+    //                 const { stdout: diffStaged } = await execAsync('git diff --cached', {
+    //                     cwd: workingDirectory
+    //                 });
+                    
+    //                 const combinedDiff = diffUnstaged + diffStaged;
+    //                 console.log(`[SWE-bench Agent] Combined diff length: ${combinedDiff.length}`);
+    //                 return combinedDiff;
+    //             } catch (diffError) {
+    //                 console.log(`[SWE-bench Agent] Failed to get any diff: ${diffError}`);
+    //                 return '';
+    //             }
+    //         }
+
+    //         // Get the diff of all changes (staged and unstaged)
+    //         let diffOutput = '';
+            
+    //         try {
+    //             // Try to get diff against HEAD
+    //             const { stdout: headDiff } = await execAsync('git diff HEAD', {
+    //                 cwd: workingDirectory
+    //             });
+    //             diffOutput = headDiff;
+    //         } catch (headError) {
+    //             console.log(`[SWE-bench Agent] Git diff HEAD failed: ${headError}`);
+                
+    //             // Fallback: get diff of staged changes
+    //             try {
+    //                 const { stdout: cachedDiff } = await execAsync('git diff --cached', {
+    //                     cwd: workingDirectory
+    //                 });
+    //                 diffOutput = cachedDiff;
+    //             } catch (cachedError) {
+    //                 console.log(`[SWE-bench Agent] Git diff --cached failed: ${cachedError}`);
+                    
+    //                 // Last fallback: get diff of unstaged changes
+    //                 try {
+    //                     const { stdout: unstagedDiff } = await execAsync('git diff', {
+    //                         cwd: workingDirectory
+    //                     });
+    //                     diffOutput = unstagedDiff;
+    //                 } catch (unstagedError) {
+    //                     console.log(`[SWE-bench Agent] All git diff attempts failed`);
+    //                     return '';
+    //                 }
+    //             }
+    //         }
+
+    //         console.log(`[SWE-bench Agent] Generated patch length: ${diffOutput.length} characters`);
+    //         return diffOutput || '';
+
+    //     } catch (error) {
+    //         console.error('[SWE-bench Agent] Error extracting patch:', error);
+    //         return '';
+    //     }
+    // }
+
     private async extractPatchFromWorkspace(): Promise<string> {
-        const workingDirectory = this.repositoryPath || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const workingDirectory = this.repositoryPath;
         
         if (!workingDirectory) {
-            throw new Error('No working directory found');
+            console.error('[SWE-bench Agent] Cannot extract patch, working directory not set.');
+            return '';
         }
 
         try {
-            // Use git command directly since we may not be in the VS Code workspace
             const { exec } = require('child_process');
             const { promisify } = require('util');
             const execAsync = promisify(exec);
 
             console.log(`[SWE-bench Agent] Extracting patch from: ${workingDirectory}`);
 
-            // Initialize git repo if it doesn't exist
-            try {
-                await execAsync('git status', { cwd: workingDirectory });
-            } catch (statusError) {
-                console.log(`[SWE-bench Agent] No git repository found, initializing...`);
-                try {
-                    await execAsync('git init', { cwd: workingDirectory });
-                    await execAsync('git add .', { cwd: workingDirectory });
-                    await execAsync('git commit -m "Initial commit"', { cwd: workingDirectory });
-                    console.log(`[SWE-bench Agent] Git repository initialized`);
-                } catch (initError) {
-                    console.log(`[SWE-bench Agent] Failed to initialize git: ${initError}`);
-                }
-            }
-
-            // First, add all files to git (in case new files were created)
-            try {
-                await execAsync('git add .', { cwd: workingDirectory });
-                console.log(`[SWE-bench Agent] Added all files to git`);
-            } catch (addError) {
-                console.log(`[SWE-bench Agent] Git add failed (may be normal): ${addError}`);
-            }
-
-            // Get git status first to see what changed
-            const { stdout: statusOutput } = await execAsync('git status --porcelain', {
+            // 1. Stage all changes, including new files.
+            await execAsync('git add .', { cwd: workingDirectory });
+            
+            // 2. Get the diff of the staged changes. This is the correct command.
+            const { stdout: patch, stderr } = await execAsync('git diff --cached', {
                 cwd: workingDirectory
             });
 
-            console.log(`[SWE-bench Agent] Git status output: ${statusOutput}`);
-
-            if (!statusOutput.trim()) {
-                console.log('[SWE-bench Agent] No changes detected in git status');
-                
-                // Try to get diff of any uncommitted changes
-                try {
-                    const { stdout: diffUnstaged } = await execAsync('git diff', {
-                        cwd: workingDirectory
-                    });
-                    
-                    const { stdout: diffStaged } = await execAsync('git diff --cached', {
-                        cwd: workingDirectory
-                    });
-                    
-                    const combinedDiff = diffUnstaged + diffStaged;
-                    console.log(`[SWE-bench Agent] Combined diff length: ${combinedDiff.length}`);
-                    return combinedDiff;
-                } catch (diffError) {
-                    console.log(`[SWE-bench Agent] Failed to get any diff: ${diffError}`);
-                    return '';
-                }
+            if (stderr) {
+                console.error(`[SWE-bench Agent] Git diff stderr: ${stderr}`);
             }
-
-            // Get the diff of all changes (staged and unstaged)
-            let diffOutput = '';
             
-            try {
-                // Try to get diff against HEAD
-                const { stdout: headDiff } = await execAsync('git diff HEAD', {
-                    cwd: workingDirectory
-                });
-                diffOutput = headDiff;
-            } catch (headError) {
-                console.log(`[SWE-bench Agent] Git diff HEAD failed: ${headError}`);
-                
-                // Fallback: get diff of staged changes
-                try {
-                    const { stdout: cachedDiff } = await execAsync('git diff --cached', {
-                        cwd: workingDirectory
-                    });
-                    diffOutput = cachedDiff;
-                } catch (cachedError) {
-                    console.log(`[SWE-bench Agent] Git diff --cached failed: ${cachedError}`);
-                    
-                    // Last fallback: get diff of unstaged changes
-                    try {
-                        const { stdout: unstagedDiff } = await execAsync('git diff', {
-                            cwd: workingDirectory
-                        });
-                        diffOutput = unstagedDiff;
-                    } catch (unstagedError) {
-                        console.log(`[SWE-bench Agent] All git diff attempts failed`);
-                        return '';
-                    }
-                }
-            }
-
-            console.log(`[SWE-bench Agent] Generated patch length: ${diffOutput.length} characters`);
-            return diffOutput || '';
+            console.log(`[SWE-bench Agent] Final patch length: ${patch.length} characters.`);
+            return patch;
 
         } catch (error) {
-            console.error('[SWE-bench Agent] Error extracting patch:', error);
+            console.error('[SWE-bench Agent] CRITICAL ERROR extracting patch:', error);
             return '';
         }
     }
-
     /**
      * Stop the current agent processing
      */

@@ -9,6 +9,9 @@ import { ASTManager } from './service/ASTManager';
 import { DiffManager } from './service/DiffManager';
 import { DiffCodeLensProvider } from './service/DiffCodeLensProvider';
 import { SWEBenchAgent } from './service/SWEBenchAgent';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
 
 export function activate(context: vscode.ExtensionContext) {
     const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl, context);
@@ -231,6 +234,10 @@ async function processSWEBenchTask(output: vscode.OutputChannel) {
             
             output.appendLine(`[SWE-bench] Will work with repository at: ${repo_path}`);
         }
+
+        output.appendLine(`[SWE-bench] Cleaning repository for a fresh start...`);
+        await execAsync('git reset --hard HEAD', { cwd: repo_path });
+        await execAsync('git clean -fdx', { cwd: repo_path });
 
         output.appendLine(`[SWE-bench] Processing problem statement for ${instance_id}`);
 

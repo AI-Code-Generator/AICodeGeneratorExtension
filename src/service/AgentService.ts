@@ -248,6 +248,9 @@ export class AgentService {
         let history: { action: string, result: any }[] = [];
         const maxSteps = 200;
 
+        let currentPrompt = prompt; // Use the full prompt for the first step
+        let isFirstStep = true;
+
         for (let i = 0; i < maxSteps; i++) {
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
@@ -256,12 +259,17 @@ export class AgentService {
 
             sendUpdate(`## Step ${i + 1}`);
 
-            const { tool, args, thought } = await this.getNextActionFromModel(prompt, history, sendUpdate, serverUrl);
+            const { tool, args, thought } = await this.getNextActionFromModel(currentPrompt, history, sendUpdate, serverUrl);
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
 
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
                 return;
+            }
+
+            if (isFirstStep) {
+                isFirstStep = false;
+                currentPrompt = "Continue with the next step based on the history to complete the original request.";
             }
 
             if (thought) {
@@ -336,6 +344,8 @@ export class AgentService {
 Your goal is to complete the user's request: "${prompt}"
 
 CRITICAL INSTRUCTIONS:
+**you are trying to fix SWE-Bench Lite benchmark tasks with the aid of tool calls**
+**if you ever try package installing,,, please try one time and if not found, move on to fix the problem by reading logic**
 1. You operate autonomously - make file changes immediately without asking permission
 2. apply_file_change tool applies changes instantly to files
 3. Users see diffs with accept/reject buttons after you make changes
