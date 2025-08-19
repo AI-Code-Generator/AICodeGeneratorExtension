@@ -200,45 +200,6 @@ async function processSWEBenchTask(output: vscode.OutputChannel) {
 
         output.appendLine(`[SWE-bench] Received task: ${instance_id}`);
 
-        // Check if we're already in the correct workspace
-        const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        
-        if (currentWorkspace !== repo_path) {
-            output.appendLine(`[SWE-bench] Current workspace: ${currentWorkspace}`);
-            output.appendLine(`[SWE-bench] Required workspace: ${repo_path}`);
-            
-            // Ensure the repository directory exists
-            try {
-                await fs.mkdir(repo_path, { recursive: true });
-                output.appendLine(`[SWE-bench] Created repository directory: ${repo_path}`);
-                
-                // Initialize git if not already initialized
-                const gitDir = path.join(repo_path, '.git');
-                try {
-                    await fs.access(gitDir);
-                    output.appendLine(`[SWE-bench] Git repository already initialized`);
-                } catch {
-                    // Initialize git repository
-                    const { exec } = require('child_process');
-                    const { promisify } = require('util');
-                    const execAsync = promisify(exec);
-                    
-                    await execAsync('git init', { cwd: repo_path });
-                    await execAsync('git config user.name "SWE-bench Agent"', { cwd: repo_path });
-                    await execAsync('git config user.email "swe-bench@example.com"', { cwd: repo_path });
-                    output.appendLine(`[SWE-bench] Initialized git repository`);
-                }
-            } catch (error) {
-                output.appendLine(`[SWE-bench] Error setting up repository: ${error}`);
-            }
-            
-            output.appendLine(`[SWE-bench] Will work with repository at: ${repo_path}`);
-        }
-
-        output.appendLine(`[SWE-bench] Cleaning repository for a fresh start...`);
-        await execAsync('git reset --hard HEAD', { cwd: repo_path });
-        await execAsync('git clean -fdx', { cwd: repo_path });
-
         output.appendLine(`[SWE-bench] Processing problem statement for ${instance_id}`);
 
         // Create and run the SWE-bench agent

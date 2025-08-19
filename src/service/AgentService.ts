@@ -281,6 +281,13 @@ export class AgentService {
                 return;
             }
 
+            if (tool === 'retry_with_valid_json') {
+                const errorMsg = `Model generated invalid JSON. Adding error to history and retrying.`;
+                sendUpdate(errorMsg);
+                history.push({ action: `invalid_json_response`, result: args[0] });
+                continue; // Skip to the next iteration of the loop
+            }
+
             // Check if the tool exists in the toolbox
             const availableTools = Object.getOwnPropertyNames(ToolBox.prototype);
             sendUpdate(`Available tools: ${availableTools.join(', ')}`);
@@ -495,7 +502,8 @@ ${JSON.stringify(truncatedHistory)}`;
                         // Look for the JSON object boundaries and extract just that
                         const jsonStart = modelResponseText.indexOf('{');
                         const jsonEnd = modelResponseText.lastIndexOf('}');
-                        
+                        sendUpdate(`JSON parsing failed after all attempts: ${firstError.message || firstError}`);
+                        sendUpdate(`Full raw response: ${modelResponseText}`);
                         if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
                             const extractedJson = modelResponseText.substring(jsonStart, jsonEnd + 1);
                             modelOutput = JSON.parse(extractedJson);
@@ -503,12 +511,12 @@ ${JSON.stringify(truncatedHistory)}`;
                             throw new Error('Could not find valid JSON boundaries');
                         }
                     } catch (thirdError: any) {
-                        sendUpdate(`JSON parsing failed after all attempts: ${firstError.message || firstError}`);
-                        sendUpdate(`Full raw response: ${modelResponseText}`);
+                        const errorMessage = `Failed to parse model response as JSON. The model returned malformed text. Error: ${firstError.message || firstError}. Full response: ${modelResponseText}`;
+                        sendUpdate(`[Agent Error] (JSON parsing error) ${errorMessage}`);
                         return {
-                            thought: "Failed to parse model response as JSON.",
-                            tool: 'finish',
-                            args: [`JSON parsing error: ${firstError.message || firstError}`]
+                            thought: "The last response was not valid JSON. I must correct my output format and try again.",
+                            tool: 'retry_with_valid_json',
+                            args: [`JSON parsing error: ${errorMessage}`]
                         };
                     }
                 }

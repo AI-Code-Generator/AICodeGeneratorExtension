@@ -45,7 +45,7 @@ export class SWEBenchAgent {
                     console.log(`[SWE-bench Agent] Agent completed, attempting to extract patch...`);
                     console.log(`[SWE-bench Agent] Working directory: ${this.repositoryPath}`);
                     isFinished = true;
-                    clearTimeout(processingTimeout);
+                    //clearTimeout(processingTimeout);
                     
                     // Try to extract the patch from git diff
                     this.extractPatchFromWorkspace()
@@ -66,7 +66,7 @@ export class SWEBenchAgent {
                 } else if (update.includes('Agent stopped after reaching max steps')) {
                     console.log(`[SWE-bench Agent] Agent reached max steps, attempting to extract patch...`);
                     isFinished = true;
-                    clearTimeout(processingTimeout);
+                    //clearTimeout(processingTimeout);
                     
                     this.extractPatchFromWorkspace()
                         .then(patch => {
@@ -85,19 +85,19 @@ export class SWEBenchAgent {
             console.log(`[SWE-bench Agent] Starting agent processing...`);
             
             // Add a shorter timeout for faster debugging
-            const processingTimeout = setTimeout(() => {
-                if (!isFinished) {
-                    console.log('[SWE-bench Agent] Processing timeout reached, stopping agent');
-                    this.agentService.stop();
-                    // Try to extract whatever changes we have
-                    this.extractPatchFromWorkspace()
-                        .then(patch => {
-                            console.log(`[SWE-bench Agent] Timeout - extracted patch with ${patch.length} characters`);
-                            resolve(patch);
-                        })
-                        .catch(() => resolve(''));
-                }
-            }, 120000); // 2 minute timeout for testing
+            // const processingTimeout = setTimeout(() => {
+            //     if (!isFinished) {
+            //         console.log('[SWE-bench Agent] Processing timeout reached, stopping agent');
+            //         this.agentService.stop();
+            //         // Try to extract whatever changes we have
+            //         this.extractPatchFromWorkspace()
+            //             .then(patch => {
+            //                 console.log(`[SWE-bench Agent] Timeout - extracted patch with ${patch.length} characters`);
+            //                 resolve(patch);
+            //             })
+            //             .catch(() => resolve(''));
+            //     }
+            // }, 120000); // 2 minute timeout for testing
             
             this.agentService.processRequest(
                 problemStatement,
@@ -105,22 +105,23 @@ export class SWEBenchAgent {
                 sendUpdate
             ).catch(error => {
                 console.error('[SWE-bench Agent] Error during processing:', error);
-                clearTimeout(processingTimeout);
+                // clearTimeout(processingTimeout);
                 if (!isFinished) {
                     reject(error);
                 }
             });
 
-            // Set a timeout to prevent hanging
-            setTimeout(() => {
-                if (!isFinished) {
-                    console.log('[SWE-bench Agent] Timeout reached, stopping agent');
-                    this.agentService.stop();
-                    this.extractPatchFromWorkspace()
-                        .then(patch => resolve(patch))
-                        .catch(() => resolve(''));
-                }
-            }, 60000); // 1 minute timeout for testing
+
+            // // Set a timeout to prevent hanging
+            // setTimeout(() => {
+            //     if (!isFinished) {
+            //         console.log('[SWE-bench Agent] Timeout reached, stopping agent');
+            //         this.agentService.stop();
+            //         this.extractPatchFromWorkspace()
+            //             .then(patch => resolve(patch))
+            //             .catch(() => resolve(''));
+            //     }
+            // }, 60000); // 1 minute timeout for testing
         });
     }
 
