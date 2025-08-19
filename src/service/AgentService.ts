@@ -246,7 +246,7 @@ export class AgentService {
         
         this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
-        const maxSteps = 200;
+        const maxSteps = 30;
 
         let currentPrompt = prompt; // Use the full prompt for the first step
         let isFirstStep = true;
