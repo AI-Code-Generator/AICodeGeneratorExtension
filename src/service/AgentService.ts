@@ -190,6 +190,11 @@ class ToolBox {
         try {
             const content = await fs.readFile(absolutePath, 'utf-8');
             const totalChunks = Math.ceil(content.length / chunkSize);
+
+            if (chunkNumber < 1) {
+                chunkNumber = 1;
+            }
+
             const start = (chunkNumber - 1) * chunkSize;
             
             if (start > content.length) {
@@ -356,11 +361,12 @@ export class AgentService {
             }
 
             // Check if the tool exists in the toolbox
-            const availableTools = Object.getOwnPropertyNames(ToolBox.prototype);
+            const availableTools = this.getToolDefinitions();
+            const availableToolNames = availableTools.map(t => t.name);
             sendUpdate(`Available tools: ${availableTools.join(', ')}`);
             sendUpdate(`Checking tool: ${tool}`);
             
-            if (!availableTools.includes(tool) && !(this.toolbox as any)[tool]) {
+            if (!availableToolNames.includes(tool) && !(this.toolbox as any)[tool]) {
                 const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableTools.join(', ')}`;
                 sendUpdate(errorMsg);
                 history.push({ action: `unknown_tool(${tool})`, result: errorMsg });
@@ -434,6 +440,11 @@ IMPORTANT: Use tools efficiently to explore codebase:
 - list_files(offset, limit) for paginated browsing when exploring structure
 - list_files(0, 100) gets first 100 files, list_files(100, 100) gets next 100
 - The response includes hasMore flag to indicate if there are more files
+
+CRITICAL WORKFLOW FOR READING FILES:
+1. Your first step when reading a file should ALWAYS be the 'read_file' tool.
+2. If 'read_file' returns a "File is too long" error, your immediate next step MUST be to use the 'search_in_file' tool with a relevant keyword from the problem description. Do NOT use 'read_file_chunk' unless you have a specific reason to read from the beginning.
+3. Only use 'read_file_chunk' if you need to browse the file from the start or 'search_in_file' does not yield results.
 
 You operate in a loop. In each step, choose the appropriate tool and execute it.
 Do not ask for clarification or permission.
