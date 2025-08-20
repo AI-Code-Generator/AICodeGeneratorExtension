@@ -363,11 +363,11 @@ export class AgentService {
             // Check if the tool exists in the toolbox
             const availableTools = this.getToolDefinitions();
             const availableToolNames = availableTools.map(t => t.name);
-            sendUpdate(`Available tools: ${availableTools.join(', ')}`);
+            sendUpdate(`Available tools: ${availableToolNames.join(', ')}`);
             sendUpdate(`Checking tool: ${tool}`);
             
             if (!availableToolNames.includes(tool) && !(this.toolbox as any)[tool]) {
-                const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableTools.join(', ')}`;
+                const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableToolNames.join(', ')}`;
                 sendUpdate(errorMsg);
                 history.push({ action: `unknown_tool(${tool})`, result: errorMsg });
                 continue;
