@@ -131,13 +131,80 @@ class ToolBox {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
             const content = await fs.readFile(absolutePath, 'utf-8');
+            const FILE_SIZE_LIMIT = 15000; // Set a reasonable character limit
+
+            if (content.length > FILE_SIZE_LIMIT) {
+                // If file is too long, return a summary and instructions
+                return `Error: File '${filePath}' is too long (${content.length} characters). ` +
+                       `File content has been truncated. ` +
+                       `To find specific content, use the 'search_in_file(filePath, keyword)' tool. ` +
+                       `To read the file in chunks, use 'read_file_chunk(filePath, chunkNumber, chunkSize)'.\n\n` +
+                       `Start of file:\n${content.substring(0, 4000)}`;
+            }
             return content;
         } catch (error) {
-            // If file not found, try to provide helpful error message
             if ((error as any).code === 'ENOENT') {
                 return `Error: File not found at path: ${absolutePath}. Working directory: ${this.workingDirectory}`;
             }
             return `Error reading file: ${error}`;
+        }
+    }
+
+    public async search_in_file(filePath: string, keyword: string): Promise<string> {
+        const absolutePath = this.getAbsolutePath(filePath);
+        try {
+            const content = await fs.readFile(absolutePath, 'utf-8');
+            const lines = content.split('\n');
+            const matchingLines: string[] = [];
+            const CONTEXT_LINES = 5; // How many lines before and after to show
+
+            lines.forEach((line, index) => {
+                if (line.toLowerCase().includes(keyword.toLowerCase())) {
+                    matchingLines.push(`\n--- Match found on line ${index + 1} ---\n`);
+                    const start = Math.max(0, index - CONTEXT_LINES);
+                    const end = Math.min(lines.length, index + CONTEXT_LINES + 1);
+                    for (let i = start; i < end; i++) {
+                        // Add line numbers for context
+                        matchingLines.push(`${i + 1}: ${lines[i]}`);
+                    }
+                }
+            });
+
+            if (matchingLines.length === 0) {
+                return `Keyword '${keyword}' not found in file '${filePath}'.`;
+            }
+
+            // Join the results and cap the total length to prevent explosions
+            return matchingLines.join('\n').substring(0, 8000);
+
+        } catch (error) {
+            if ((error as any).code === 'ENOENT') {
+                return `Error: File not found at path: ${absolutePath}.`;
+            }
+            return `Error searching in file: ${error}`;
+        }
+    }
+
+    public async read_file_chunk(filePath: string, chunkNumber: number = 1, chunkSize: number = 8000): Promise<string> {
+        const absolutePath = this.getAbsolutePath(filePath);
+        try {
+            const content = await fs.readFile(absolutePath, 'utf-8');
+            const totalChunks = Math.ceil(content.length / chunkSize);
+            const start = (chunkNumber - 1) * chunkSize;
+            
+            if (start > content.length) {
+                return `Error: Chunk number ${chunkNumber} is out of bounds. The file only has ${totalChunks} chunks.`;
+            }
+
+            const chunkContent = content.substring(start, start + chunkSize);
+
+            return `--- Showing chunk ${chunkNumber} of ${totalChunks} from file '${filePath}' ---\n\n` + chunkContent;
+
+        } catch (error) {
+            if ((error as any).code === 'ENOENT') {
+                return `Error: File not found at path: ${absolutePath}.`;
+            }
+            return `Error reading file chunk: ${error}`;
         }
     }
 
@@ -336,7 +403,9 @@ export class AgentService {
         return [
             { name: 'list_files', description: 'List files in the workspace with pagination. Returns an object with files array, total count, and hasMore flag. Use offset and limit for pagination.', args: [{ name: 'offset', type: 'number' }, { name: 'limit', type: 'number' }] },
             { name: 'search_files', description: 'Search for files by pattern/name. More efficient than listing all files when looking for specific files.', args: [{ name: 'pattern', type: 'string' }] },
-            { name: 'read_file', description: 'Read the content of a file at a given relative path.', args: [{ name: 'filePath', type: 'string' }] },
+            { name: 'read_file', description: 'Read the FULL content of a file at a given relative path. CRITICAL: If a file is too long, this tool will fail and instruct you to use search_in_file or read_file_chunk instead.', args: [{ name: 'filePath', type: 'string' }] },
+            { name: 'search_in_file', description: 'Search for a specific keyword within a single file (given relative path). This is the most efficient way to find relevant code in long files. Returns the matching lines with surrounding context.', args: [{ name: 'filePath', type: 'string' }, { name: 'keyword', type: 'string' }] },
+            { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
             { name: 'finish', description: 'Finishes the task with a message.', args: [{ name: 'message', type: 'string' }] }
