@@ -377,6 +377,45 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
     }
 }
 
+export async function deleteSingleFile(uri: vscode.Uri, storageUri: vscode.Uri): Promise<void> {
+    const filePath = uri.fsPath;
+
+    // Skip excluded directories
+    const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
+    if (isInExcludedDir(filePath, excludeDirs)) {
+        return;
+    }
+
+    // Skip if not an indexable file type
+    if (!shouldIndexFile(filePath)) {
+        console.log(`Skipping deletion for excluded file type: ${filePath}`);
+        return;
+    }
+
+    // Initialize DB if needed
+    if (!state.db) {
+        STORAGEPATH = storageUri;
+        await initializeLanceDB(storageUri);
+    }
+
+    try {
+        // Delete chunks from code_chunks table
+        if (state.table) {
+            await state.table.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+        }
+
+        // Delete from file_tracking table
+        if (state.fileTrackingTable) {
+            await state.fileTrackingTable.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+        }
+
+        console.log(`Deleted index data for file: ${filePath}`);
+    } catch (error) {
+        console.error(`Error deleting index data for ${filePath}:`, error);
+        throw error;
+    }
+}
+
 async function initializeLanceDB(storageUri: vscode.Uri) {
     try {
         const lanceDbPath = path.join(storageUri.fsPath, 'lancedb');

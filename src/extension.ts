@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ChatViewProvider } from './ChatViewProvider';
 //import { AICompletionProvider } from './CompletionProvider';
 import { config } from './config';
-import { indexWorkspaceFiles, indexSingleFile } from './service/FileIndexer';
+import { indexWorkspaceFiles, indexSingleFile, deleteSingleFile } from './service/FileIndexer';
 import { ASTManager } from './service/ASTManager';
 import { DiffManager } from './service/DiffManager';
 import { DiffCodeLensProvider } from './service/DiffCodeLensProvider';
@@ -57,8 +57,13 @@ export function activate(context: vscode.ExtensionContext) {
     });
     
     // Handle file deletion
-    fileWatcher.onDidDelete((uri) => {
-        output.appendLine(`File deleted: ${uri.fsPath} (will be cleaned up on next full indexing)`);
+    fileWatcher.onDidDelete(async (uri) => {
+        try {
+            await deleteSingleFile(uri, context.globalStorageUri);
+            output.appendLine(`Deleted index for file: ${uri.fsPath}`);
+        } catch (err) {
+            output.appendLine(`Error deleting index for file ${uri.fsPath}: ${err}`);
+        }
     });
 
     context.subscriptions.push(fileWatcher);
