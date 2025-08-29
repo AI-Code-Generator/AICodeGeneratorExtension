@@ -241,7 +241,6 @@ export async function readFilesRecursive(directory: string, excludeList: string[
         await flushRemainingMetadata();
         await flushRemainingFileTracking();
 
-        await removeDeletedFiles(directory, results, excludeList);
     } catch (error) {
         console.error('Error reading directory:', error);
     }
@@ -303,6 +302,7 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
     const rootDirectory = workspaceFolders[0].uri.fsPath;
     const startTime = Date.now();
     const files = await readFilesRecursive(rootDirectory, excludeDirs);
+    await removeDeletedFiles(rootDirectory, files, excludeDirs);
     const endTime = Date.now();
 
     console.log(`Found ${files.length} files. Indexing completed in ${(endTime - startTime) / 1000} seconds.`);
