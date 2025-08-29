@@ -4,6 +4,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { DiffManager } from './DiffManager';
+import { state, initializeEmbedder, embedText } from './FileIndexer';
 
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
@@ -246,6 +247,28 @@ class ToolBox {
         });
     }
 
+    public async similar_search(query: string, limit: number = 8): Promise<object[]> {
+        if (!state.table) {
+            return [{ error: 'Database not initialized' }];
+        }
+
+        try {
+            await initializeEmbedder();
+            const embedding = await embedText(query);
+            const results = await state.table.vectorSearch(embedding).limit(limit).toArray();
+            return results.map(result => ({
+                filePath: result.filePath,
+                startLine: result.startLine,
+                endLine: result.endLine,
+                chunkType: result.chunkType,
+                content: result.content,
+                score: result._distance
+            }));
+        } catch (error) {
+            return [{ error: error }];
+        }
+    }
+
     private getAbsolutePath(filePath: string): string {
         if (path.isAbsolute(filePath)) {
             return filePath;
@@ -384,6 +407,7 @@ export class AgentService {
             { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
+            { name: 'similar_search', description: 'Perform semantic similarity search on the indexed codebase to find relevant code snippets. Useful for understanding code patterns or finding similar implementations. Returns list of matching chunks with metadata and similarity score.', args: [{ name: 'query', type: 'string' }, { name: 'limit', type: 'number' }] },
             { name: 'finish', description: 'Finishes the task with a message.', args: [{ name: 'message', type: 'string' }] }
         ];
     }

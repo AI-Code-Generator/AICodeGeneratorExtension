@@ -42,7 +42,7 @@ export const bulkState = {
     batchSize: 100
 };
 
-async function initializeEmbedder() {
+export async function initializeEmbedder() {
     if (!embedder) {
         const { pipeline } = await import('@huggingface/transformers');
         embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5');
@@ -276,7 +276,7 @@ function isInExcludedDir(filePath: string, excludeList: string[]): boolean {
     return excludeList.some(dir => filePath.includes(`/${dir}/`) || filePath.includes(`\\${dir}\\`));
 }
 
-async function embedText(text: string): Promise<number[]> {
+export async function embedText(text: string): Promise<number[]> {
     if (!embedder) {
         throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
     }
@@ -374,6 +374,45 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
     } catch (error) {
         console.error(`Error indexing file ${filePath}:`, error);
         return false;
+    }
+}
+
+export async function deleteSingleFile(uri: vscode.Uri, storageUri: vscode.Uri): Promise<void> {
+    const filePath = uri.fsPath;
+
+    // Skip excluded directories
+    const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
+    if (isInExcludedDir(filePath, excludeDirs)) {
+        return;
+    }
+
+    // Skip if not an indexable file type
+    if (!shouldIndexFile(filePath)) {
+        console.log(`Skipping deletion for excluded file type: ${filePath}`);
+        return;
+    }
+
+    // Initialize DB if needed
+    if (!state.db) {
+        STORAGEPATH = storageUri;
+        await initializeLanceDB(storageUri);
+    }
+
+    try {
+        // Delete chunks from code_chunks table
+        if (state.table) {
+            await state.table.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+        }
+
+        // Delete from file_tracking table
+        if (state.fileTrackingTable) {
+            await state.fileTrackingTable.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+        }
+
+        console.log(`Deleted index data for file: ${filePath}`);
+    } catch (error) {
+        console.error(`Error deleting index data for ${filePath}:`, error);
+        throw error;
     }
 }
 
