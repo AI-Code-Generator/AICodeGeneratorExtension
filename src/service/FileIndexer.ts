@@ -114,6 +114,75 @@ async function saveFileTrackingBatch(): Promise<void> {
     }
 }
 
+// File extensions to exclude from indexing (config files, documentation, etc.)
+const EXCLUDED_EXTENSIONS = new Set([
+    '.gitignore', '.gitattributes', '.gitmodules',
+    '.md', '.txt', '.rst', '.doc', '.docx', '.pdf',
+    '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.lock', '.log', '.tmp', '.temp',
+    '.babelrc', '.eslintrc', '.prettierrc', '.editorconfig',
+    '.env', '.env.local', '.env.development', '.env.production',
+    '.min.js', '.min.css', '.map',
+    '.ico', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
+    '.woff', '.woff2', '.ttf', '.eot',
+    '.zip', '.tar', '.gz', '.rar', '.7z'
+]);
+
+// File names to exclude (regardless of extension)
+const EXCLUDED_FILENAMES = new Set([
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+    'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
+    'LICENSE', 'CHANGELOG', 'AUTHORS', 'CONTRIBUTORS',
+    'Makefile', 'Rakefile', 'Gemfile', 'Procfile',
+    '.DS_Store', 'Thumbs.db'
+]);
+
+// Preferred code file extensions to prioritize
+const CODE_EXTENSIONS = new Set([
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.vue', '.svelte', '.astro',
+    '.py', '.rb', '.go', '.rs', '.java', '.kt',
+    '.c', '.cpp', '.h', '.hpp',
+    '.cs', '.php', '.swift',
+    '.html', '.css', '.scss', '.sass', '.less',
+    '.sql', '.graphql', '.gql'
+]);
+
+function shouldIndexFile(filePath: string): boolean {
+    const fileName = path.basename(filePath);
+    const extension = path.extname(filePath).toLowerCase();
+    
+    // Check if filename is excluded
+    if (EXCLUDED_FILENAMES.has(fileName) || EXCLUDED_FILENAMES.has(fileName.toLowerCase())) {
+        return false;
+    }
+    
+    // Check if extension is excluded
+    if (EXCLUDED_EXTENSIONS.has(extension)) {
+        return false;
+    }
+    
+    // Check for files without extension that should be excluded
+    if (!extension && EXCLUDED_EXTENSIONS.has(fileName)) {
+        return false;
+    }
+    
+    // Prioritize known code file extensions
+    if (CODE_EXTENSIONS.has(extension)) {
+        return true;
+    }
+    
+    // For files without recognized extensions, be more conservative
+    // Only include if they're not in our exclude list and seem code-like
+    if (!extension) {
+        // Include files like 'Dockerfile', shell scripts without extensions, etc.
+        const codeKeywords = ['script', 'dockerfile', 'makefile', 'rakefile'];
+        return codeKeywords.some(keyword => fileName.toLowerCase().includes(keyword));
+    }
+    
+    return false;
+}
+
 export async function readFilesRecursive(directory: string, excludeList: string[] = []): Promise<string[]> {
     let results: string[] = [];
 
@@ -130,7 +199,7 @@ export async function readFilesRecursive(directory: string, excludeList: string[
             if (file.isDirectory()) {
                 const subFiles = await readFilesRecursive(fullPath, excludeList);
                 results = results.concat(subFiles);
-            } else {
+            } else if (shouldIndexFile(fullPath)) {
                 results.push(fullPath);
                 const content: string = await fs.readFile(fullPath, 'utf8');
 
@@ -138,7 +207,6 @@ export async function readFilesRecursive(directory: string, excludeList: string[
 
                 if (shouldProcess) {
                     const chunks = CodeParser.parseCode(content, fullPath);
-                    console.log(`Processing changed/new file: ${fullPath}`);
 
                     await initializeEmbedder();
 
@@ -165,13 +233,14 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                 } else {
                     console.log(`Skipping unchanged file: ${fullPath}`);
                 }
+            } else {
+                console.log(`Skipping excluded file: ${fullPath}`);
             }
         }
 
         await flushRemainingMetadata();
         await flushRemainingFileTracking();
 
-        await removeDeletedFiles(directory, results, excludeList);
     } catch (error) {
         console.error('Error reading directory:', error);
     }
@@ -233,6 +302,7 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
     const rootDirectory = workspaceFolders[0].uri.fsPath;
     const startTime = Date.now();
     const files = await readFilesRecursive(rootDirectory, excludeDirs);
+    await removeDeletedFiles(rootDirectory, files, excludeDirs);
     const endTime = Date.now();
 
     console.log(`Found ${files.length} files. Indexing completed in ${(endTime - startTime) / 1000} seconds.`);
@@ -246,6 +316,12 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
         // Skip excluded directories
         const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
         if (isInExcludedDir(filePath, excludeDirs)) {
+            return false;
+        }
+
+        // Skip excluded file types
+        if (!shouldIndexFile(filePath)) {
+            console.log(`Skipping excluded file type: ${filePath}`);
             return false;
         }
 
