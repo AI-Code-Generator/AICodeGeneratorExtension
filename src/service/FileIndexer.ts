@@ -42,7 +42,7 @@ export const bulkState = {
     batchSize: 100
 };
 
-async function initializeEmbedder() {
+export async function initializeEmbedder() {
     if (!embedder) {
         const { pipeline } = await import('@huggingface/transformers');
         embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5');
@@ -276,7 +276,7 @@ function isInExcludedDir(filePath: string, excludeList: string[]): boolean {
     return excludeList.some(dir => filePath.includes(`/${dir}/`) || filePath.includes(`\\${dir}\\`));
 }
 
-async function embedText(text: string): Promise<number[]> {
+export async function embedText(text: string): Promise<number[]> {
     if (!embedder) {
         throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
     }
