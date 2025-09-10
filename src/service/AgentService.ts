@@ -128,6 +128,102 @@ class ToolBox {
         }
     }
 
+    /**
+     * Search for a keyword across the workspace file contents.
+     * Returns an array of compact match objects with file path and line snippets.
+     * This is different from search_files which matches file NAMES only.
+     */
+    public async search_text(keyword: string, maxFiles: number = 200, maxMatchesPerFile: number = 5): Promise<Array<{ file: string, matches: Array<{ line: number, text: string }> }>> {
+        const results: Array<{ file: string, matches: Array<{ line: number, text: string }> }> = [];
+
+        // Helper to scan a single file content for keyword
+        const scanContent = (content: string, file: string) => {
+            const lower = content.toLowerCase();
+            const idx = lower.indexOf(keyword.toLowerCase());
+            if (idx === -1) {
+                return; // quick reject
+            }
+
+            const lines = content.split('\n');
+            const fileMatches: Array<{ line: number, text: string }> = [];
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].toLowerCase().includes(keyword.toLowerCase())) {
+                    fileMatches.push({ line: i + 1, text: lines[i].slice(0, 500) });
+                    if (fileMatches.length >= maxMatchesPerFile) {
+                        break;
+                    }
+                }
+            }
+            if (fileMatches.length) {
+                results.push({ file, matches: fileMatches });
+            }
+        };
+
+        const EXCLUDES = ['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'];
+
+        if (this.workingDirectory) {
+            const fsSync = require('fs');
+            const pathMod = require('path');
+
+            const gatherFiles = (dirPath: string, acc: string[] = []) => {
+                try {
+                    for (const entry of fsSync.readdirSync(dirPath)) {
+                        if (EXCLUDES.includes(entry)) {
+                            continue;
+                        }
+                        const full = pathMod.join(dirPath, entry);
+                        const stat = fsSync.statSync(full);
+                        if (stat.isDirectory()) {
+                            gatherFiles(full, acc);
+                        } else {
+                            acc.push(full);
+                            if (acc.length >= maxFiles) {
+                                return acc;
+                            }
+                        }
+                    }
+                } catch (_) { /* ignore */ }
+                return acc;
+            };
+
+            const files = gatherFiles(this.workingDirectory, []);
+            for (const abs of files) {
+                try {
+                    // Skip large files (>1MB)
+                    const stat = fsSync.statSync(abs);
+                    if (stat.size > 1_000_000) {
+                        continue;
+                    }
+                    const content = fsSync.readFileSync(abs, 'utf-8');
+                    const rel = pathMod.relative(this.workingDirectory, abs);
+                    scanContent(content, rel);
+                } catch (_) { /* ignore */ }
+            }
+        } else {
+            // VS Code API path
+            const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
+            let count = 0;
+            for (const uri of files) {
+                if (count >= maxFiles) {
+                    break;
+                }
+                try {
+                    const doc = await vscode.workspace.fs.readFile(uri);
+                    // Limit size to 1MB
+                    if (doc.byteLength > 1_000_000) {
+                        continue;
+                    }
+                    const content = Buffer.from(doc).toString('utf-8');
+                    const rel = vscode.workspace.asRelativePath(uri);
+                    scanContent(content, rel);
+                    count++;
+                } catch (_) { /* ignore */ }
+            }
+        }
+
+        return results.slice(0, maxFiles);
+    }
+
     public async read_file(filePath: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
@@ -401,7 +497,8 @@ export class AgentService {
     private getToolDefinitions() {
         return [
             { name: 'list_files', description: 'List files in the workspace with pagination. Returns an object with files array, total count, and hasMore flag. Use offset and limit for pagination.', args: [{ name: 'offset', type: 'number' }, { name: 'limit', type: 'number' }] },
-            { name: 'search_files', description: 'Search for files by pattern/name. More efficient than listing all files when looking for specific files.', args: [{ name: 'pattern', type: 'string' }] },
+            { name: 'search_files', description: 'Search for files by NAME or pattern only (does NOT search file contents).', args: [{ name: 'pattern', type: 'string' }] },
+            { name: 'search_text', description: 'Search for a keyword across file CONTENTS. Returns file paths with matching line numbers and snippets.', args: [{ name: 'keyword', type: 'string' }, { name: 'maxFiles', type: 'number' }, { name: 'maxMatchesPerFile', type: 'number' }] },
             { name: 'read_file', description: 'Read the FULL content of a file at a given relative path. CRITICAL: If a file is too long, this tool will fail and instruct you to use search_in_file or read_file_chunk instead.', args: [{ name: 'filePath', type: 'string' }] },
             { name: 'search_in_file', description: 'Search for a specific keyword within a single file (given relative path). This is the most efficient way to find relevant code in long files. Returns the matching lines with surrounding context.', args: [{ name: 'filePath', type: 'string' }, { name: 'keyword', type: 'string' }] },
             { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
