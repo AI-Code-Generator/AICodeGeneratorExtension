@@ -307,6 +307,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Now perform similarity search with enhanced query
                         const similarity = await similaritySearch(enhancedQuery);
 
+                        // Determine if this is the first message of a new ask conversation
+                        // We must check BEFORE pushing to history so the server can reset correctly.
+                        const isNewAskTask = this.askHistory.length === 0;
+
                         // Add user message to ask history
                         this.addToHistory('ask', 'user', data.message);
 
@@ -326,7 +330,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             body: JSON.stringify({ 
                                 query: query,
                                 context: similarity,
-                                user_ID: "0001"
+                                user_ID: "0001",
+                                is_new_task: isNewAskTask
                             }),
                             signal: this.currentAbortController.signal
                         });
