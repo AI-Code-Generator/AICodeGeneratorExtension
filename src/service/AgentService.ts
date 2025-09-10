@@ -32,14 +32,17 @@ class ToolBox {
 
     private ensureTerminal(): vscode.Terminal {
         const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!this.terminal) {
+        if (!this.terminal || this.terminal.exitStatus) {
             this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
+        } else {
+            // If cwd changed after terminal creation, send hidden cd command
+            if (cwd) {
+                // Use a hidden cd command that doesn't show in terminal
+                this.terminal.sendText(`cd "${cwd.replace(/"/g, '\\"')}" > /dev/null 2>&1`);
+            }
         }
-        // If cwd changed after terminal creation, send cd command
-        if (cwd) {
-            this.terminal.sendText(`cd "${cwd.replace(/"/g, '\\"')}"`);
-        }
-        this.terminal.show(true);
+        // Show terminal but don't steal focus, and it will open in a split view
+        this.terminal.show(false);
         return this.terminal;
     }
 
@@ -348,44 +351,34 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Use VS Code Integrated Terminal so the user can see output live.
+        // Use VS Code Integrated Terminal for user visibility + subprocess for output capture
         const term = this.ensureTerminal();
-        const tmpLogPath = path.join(os.tmpdir(), `ai-agent-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
-        const safeLog = tmpLogPath.replace(/"/g, '\\"');
-
-        // Announce in terminal and run command while tee-ing output to log for later summary
-        term.sendText(`echo "[AI Agent] Running: ${command.replace(/"/g, '\\"')}"`);
-        // Pipe both stdout and stderr, write to log, then mark completion
-        const combined = `( ${command} ) |& tee "${safeLog}"; echo "__AI_DONE__" >> "${safeLog}"`;
-        term.sendText(combined);
-
-        // Wait briefly for output and try to read log. If the process is long-running, return partial.
-        const TIMEOUT_MS = 60000; // 60s max wait
-        const START = Date.now();
-        let content = '';
-        while (Date.now() - START < TIMEOUT_MS) {
-            try {
-                content = await fs.readFile(tmpLogPath, 'utf-8');
-                if (content.includes('__AI_DONE__')) {
-                    break;
+        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        
+        // Show command in terminal for user visibility
+        term.sendText(command);
+        
+        // Also run the command via subprocess to capture output for the agent
+        return new Promise((resolve) => {
+            exec(command, { cwd, timeout: 30000 }, (error, stdout, stderr) => {
+                let output = stdout || '';
+                let errorOutput = stderr || '';
+                
+                if (error) {
+                    errorOutput = error.message;
                 }
-            } catch (_) {
-                // file may not exist yet
-            }
-            await new Promise(res => setTimeout(res, 500));
-        }
-
-        // Trim content and remove marker
-        if (content) {
-            content = content.replace(/\n?__AI_DONE__\n?/g, '\n');
-            // cap to last 8000 chars to keep history small
-            if (content.length > 8000) {
-                content = content.slice(-8000);
-            }
-        }
-
-        // We cannot reliably separate stderr from stdout via terminal API
-        return { stdout: content || `[Dispatched to terminal] Log: ${tmpLogPath}`, stderr: '' };
+                
+                // Limit output size to prevent history bloat
+                if (output.length > 8000) {
+                    output = output.slice(-8000);
+                }
+                if (errorOutput.length > 4000) {
+                    errorOutput = errorOutput.slice(-4000);
+                }
+                
+                resolve({ stdout: output, stderr: errorOutput });
+            });
+        });
     }
 
     public async similar_search(query: string, limit: number = 8): Promise<object[]> {
