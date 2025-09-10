@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
+import * as os from 'os';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedText } from './FileIndexer';
 
@@ -11,6 +12,7 @@ class ToolBox {
     private diffManager: DiffManager;
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
     private workingDirectory: string = '';
+    private terminal?: vscode.Terminal;
 
     constructor() {
         this.diffManager = DiffManager.getInstance();
@@ -26,6 +28,19 @@ class ToolBox {
 
     public getWorkingDirectory(): string {
         return this.workingDirectory;
+    }
+
+    private ensureTerminal(): vscode.Terminal {
+        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!this.terminal) {
+            this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
+        }
+        // If cwd changed after terminal creation, send cd command
+        if (cwd) {
+            this.terminal.sendText(`cd "${cwd.replace(/"/g, '\\"')}"`);
+        }
+        this.terminal.show(true);
+        return this.terminal;
     }
 
     public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
@@ -315,12 +330,11 @@ class ToolBox {
     }
 
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
+        // Ask for permission
         let allow = false;
-        
         if (this.terminalCommandCallback) {
             allow = await this.terminalCommandCallback(command);
         } else {
-            // Fallback to popup if no callback is set
             const result = await vscode.window.showInformationMessage(
                 `The agent wants to run the following command:\n\n${command}\n\nDo you want to allow it?`,
                 { modal: true },
@@ -334,13 +348,44 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        // Use VS Code Integrated Terminal so the user can see output live.
+        const term = this.ensureTerminal();
+        const tmpLogPath = path.join(os.tmpdir(), `ai-agent-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+        const safeLog = tmpLogPath.replace(/"/g, '\\"');
 
-        return new Promise((resolve) => {
-            exec(command, { cwd }, (error, stdout, stderr) => {
-                resolve({ stdout, stderr: error ? error.message : stderr });
-            });
-        });
+        // Announce in terminal and run command while tee-ing output to log for later summary
+        term.sendText(`echo "[AI Agent] Running: ${command.replace(/"/g, '\\"')}"`);
+        // Pipe both stdout and stderr, write to log, then mark completion
+        const combined = `( ${command} ) |& tee "${safeLog}"; echo "__AI_DONE__" >> "${safeLog}"`;
+        term.sendText(combined);
+
+        // Wait briefly for output and try to read log. If the process is long-running, return partial.
+        const TIMEOUT_MS = 60000; // 60s max wait
+        const START = Date.now();
+        let content = '';
+        while (Date.now() - START < TIMEOUT_MS) {
+            try {
+                content = await fs.readFile(tmpLogPath, 'utf-8');
+                if (content.includes('__AI_DONE__')) {
+                    break;
+                }
+            } catch (_) {
+                // file may not exist yet
+            }
+            await new Promise(res => setTimeout(res, 500));
+        }
+
+        // Trim content and remove marker
+        if (content) {
+            content = content.replace(/\n?__AI_DONE__\n?/g, '\n');
+            // cap to last 8000 chars to keep history small
+            if (content.length > 8000) {
+                content = content.slice(-8000);
+            }
+        }
+
+        // We cannot reliably separate stderr from stdout via terminal API
+        return { stdout: content || `[Dispatched to terminal] Log: ${tmpLogPath}`, stderr: '' };
     }
 
     public async similar_search(query: string, limit: number = 8): Promise<object[]> {
