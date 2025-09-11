@@ -10,6 +10,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _queryUrl: string;
     private readonly _embedUrl: string;
     private readonly _enhanceUrl: string;
+    private readonly _deleteMessageUrl?: string; // optional; server must implement
     private contextGatherer: ContextGatherer;
     private agentService: AgentService;
     private currentAbortController?: AbortController;
@@ -27,8 +28,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         private readonly _context: vscode.ExtensionContext
     ) {
         this._queryUrl = `${baseUrl}/ask-ai`;
-    this._embedUrl = `${baseUrl}/embed`;
-    this._enhanceUrl = `${baseUrl}/enhance-query`;
+        this._embedUrl = `${baseUrl}/embed`;
+        this._enhanceUrl = `${baseUrl}/enhance-query`;
+        this._deleteMessageUrl = `${baseUrl}/delete-message`;
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService();
         
@@ -199,7 +201,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 this.updateProcessingState();
                 
                 // Add user message to agent history
-                this.addToHistory('agent', 'user', data.message, this.generateId('ag_u'));
+                const agentUserId = this.generateId('ag_u');
+                this.addToHistory('agent', 'user', data.message, agentUserId);
                 
                 // Display the user message first
                 this._view?.webview.postMessage({
@@ -224,7 +227,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         this._view?.webview.postMessage({
                             type: 'addMessage',
                             message: agentResponse.trim(),
-                            sender: 'assistant'
+                            sender: 'assistant',
+                            id: this.agentHistory[this.agentHistory.length-1].id
                         });
                         
                         // Add initial assistant message to history immediately
@@ -331,7 +335,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         this._view?.webview.postMessage({
                             type: 'addMessage',
                             message: data.message,
-                            sender: 'user'
+                            sender: 'user',
+                            id: userMessageId
                         });
 
                         // Send request to query endpoint
@@ -361,7 +366,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
                                 message: jsonResponse.response,
-                                sender: 'assistant'
+                                sender: 'assistant',
+                                id: respId
                             });
                         } else {
                             throw new Error('Server request failed');
@@ -373,7 +379,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             this._view?.webview.postMessage({
                                 type: 'addMessage',
                                 message: errorMessage,
-                                sender: 'assistant'
+                                sender: 'assistant',
+                                id: this.generateId('abort')
                             });
                         } else {
                             vscode.window.showErrorMessage(`Error: ${error}`);
@@ -387,12 +394,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Add error message to history
                         const errId = this.generateId('e');
                         this.addToHistory('ask', 'assistant', errorMessage, errId);
+                        this._view?.webview.postMessage({
+                            type: 'addMessage',
+                            message: errorMessage,
+                            sender: 'assistant',
+                            id: errId
+                        });
                     } finally {
                         this.isProcessing = false;
                         this.currentAbortController = undefined;
                         this.updateProcessingState();
                     }
                     break;
+            }
+            if (data.type === 'deleteMessage') {
+                const { id } = data;
+                // Only allow deletion in ask mode for now
+                const list = this.askHistory;
+                const idx = list.findIndex(m => m.id === id);
+                if (idx !== -1) {
+                    const [removed] = list.splice(idx,1);
+                    // Persist change
+                    this.saveHistory();
+                    // If user message, attempt server deletion
+                    if (removed.type === 'user' && this._deleteMessageUrl) {
+                        try {
+                            fetch(this._deleteMessageUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ user_ID: '0001', message_id: id })
+                            }).catch(()=>{});
+                        } catch(e) {
+                            // swallow network errors silently
+                        }
+                    }
+                    this._view?.webview.postMessage({ type: 'messageDeleted', id });
+                }
+                return;
             }
         });
     }
@@ -543,6 +581,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             padding: 8px; 
             border-radius: 4px; 
             white-space: pre-wrap;
+            position: relative;
         }
         .user { 
             background: var(--vscode-input-background);
@@ -551,6 +590,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .assistant { 
             background: var(--vscode-editor-background);
             margin-right: 20px;
+        }
+        .delete-btn { 
+            position: absolute; 
+            top: 4px; 
+            right: 6px; 
+            background: transparent; 
+            border: none; 
+            cursor: pointer; 
+            color: var(--vscode-descriptionForeground); 
+            display: none;
+            font-size: 14px;
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            z-index: 10;
+        }
+        .message.user:hover .delete-btn { 
+            display: inline-block; 
+        }
+        .delete-btn:hover { 
+            color: var(--vscode-errorForeground);
+            background: var(--vscode-input-background);
         }
         .input-container {
             position: fixed;
@@ -1258,6 +1319,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     loading.style.display = 'none';
                     const messageDiv = document.createElement('div');
                     messageDiv.className = 'message ' + message.sender;
+                    if (message.id) messageDiv.dataset.id = message.id;
+                    if (message.sender === 'user') {
+                        const del = document.createElement('button');
+                        del.textContent = '✕';
+                        del.className = 'delete-btn';
+                        del.title = 'Delete message';
+                        del.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            if (messageDiv.dataset.id) {
+                                vscode.postMessage({ type: 'deleteMessage', id: messageDiv.dataset.id });
+                            }
+                        });
+                        messageDiv.appendChild(del);
+                    }
                     
                     if (message.sender === 'assistant') {
                         // Split content by code blocks
@@ -1292,8 +1367,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             messageDiv.appendChild(textNode);
                         }
                     } else {
-                        // User messages are displayed as-is
-                        messageDiv.textContent = message.message;
+                        // User messages: preserve delete button; add text container
+                        const userText = document.createElement('div');
+                        userText.className = 'text-content';
+                        userText.textContent = message.message;
+                        messageDiv.appendChild(userText);
                     }
                     
                     chatMessages.appendChild(messageDiv);
@@ -1404,6 +1482,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Clear all messages from the chat
                     chatMessages.innerHTML = '';
                     break;
+                case 'messageDeleted':
+                    const sel = '.message[data-id="' + message.id + '"]';
+                    const toRemove = chatMessages.querySelector(sel);
+                    if (toRemove) toRemove.remove();
+                    break;
             }
         });
 
@@ -1415,6 +1498,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             for (const historyItem of history) {
                 const messageDiv = document.createElement('div');
                 messageDiv.className = 'message ' + historyItem.type;
+                if (historyItem.id) messageDiv.dataset.id = historyItem.id;
+                if (historyItem.type === 'user') {
+                    const del = document.createElement('button');
+                    del.textContent = '✕';
+                    del.className = 'delete-btn';
+                    del.title = 'Delete message';
+                    del.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        if (messageDiv.dataset.id) {
+                            vscode.postMessage({ type: 'deleteMessage', id: messageDiv.dataset.id });
+                        }
+                    });
+                    messageDiv.appendChild(del);
+                }
                 
                 if (historyItem.type === 'assistant') {
                     // Process assistant messages for code blocks
@@ -1449,8 +1546,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         messageDiv.appendChild(textNode);
                     }
                 } else {
-                    // User messages are displayed as-is
-                    messageDiv.textContent = historyItem.message;
+                    // User message: keep delete button; add text container
+                    const userText = document.createElement('div');
+                    userText.className = 'text-content';
+                    userText.textContent = historyItem.message;
+                    messageDiv.appendChild(userText);
                 }
                 
                 chatMessages.appendChild(messageDiv);
