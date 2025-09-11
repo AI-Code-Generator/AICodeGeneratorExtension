@@ -413,22 +413,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 const list = this.askHistory;
                 const idx = list.findIndex(m => m.id === id);
                 if (idx !== -1) {
-                    const [removed] = list.splice(idx,1);
-                    // Persist change
+                    const removedIds: string[] = [];
+                    const removed = list[idx];
+                    removedIds.push(removed.id);
+                    // If next message is assistant reply, remove it too
+                    if (idx + 1 < list.length && list[idx + 1].type === 'assistant') {
+                        removedIds.push(list[idx + 1].id);
+                        list.splice(idx, 2);
+                    } else {
+                        list.splice(idx, 1);
+                    }
                     this.saveHistory();
-                    // If user message, attempt server deletion
                     if (removed.type === 'user' && this._deleteMessageUrl) {
                         try {
                             fetch(this._deleteMessageUrl, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ user_ID: '0001', message_id: id })
+                                body: JSON.stringify({ user_ID: '0001', message_id: id, cascade: true })
                             }).catch(()=>{});
-                        } catch(e) {
-                            // swallow network errors silently
-                        }
+                        } catch(e) {}
                     }
-                    this._view?.webview.postMessage({ type: 'messageDeleted', id });
+                    this._view?.webview.postMessage({ type: 'messageDeleted', ids: removedIds });
                 }
                 return;
             }
@@ -1483,9 +1488,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     chatMessages.innerHTML = '';
                     break;
                 case 'messageDeleted':
-                    const sel = '.message[data-id="' + message.id + '"]';
-                    const toRemove = chatMessages.querySelector(sel);
-                    if (toRemove) toRemove.remove();
+                    if (message.ids && Array.isArray(message.ids)) {
+                        message.ids.forEach(mid => {
+                            const selMulti = '.message[data-id="' + mid + '"]';
+                            const node = chatMessages.querySelector(selMulti);
+                            if (node) node.remove();
+                        });
+                    } else if (message.id) {
+                        const selSingle = '.message[data-id="' + message.id + '"]';
+                        const node = chatMessages.querySelector(selSingle);
+                        if (node) node.remove();
+                    }
                     break;
             }
         });
