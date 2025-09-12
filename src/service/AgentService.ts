@@ -442,73 +442,60 @@ export class AgentService {
         sendUpdate(`[AgentService] Starting processRequest with serverUrl: ${serverUrl}`);
         sendUpdate(`[AgentService] Working directory: ${this.toolbox.getWorkingDirectory() || 'Not set'}`);
         sendUpdate(`[AgentService] Prompt length: ${prompt.length} characters`);
-        
         this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
         const maxSteps = 60;
-
-        let currentPrompt = prompt; // Use the full prompt for the first step
+        // Preserve the original user request for all subsequent iterations.
+        const originalPrompt = prompt;
+        let currentInstruction = prompt; // Instruction for the model (first step uses full prompt)
         let isFirstStep = true;
-
         for (let i = 0; i < maxSteps; i++) {
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
                 return;
             }
-
             sendUpdate(`## Step ${i + 1}`);
-
-            const { tool, args, thought } = await this.getNextActionFromModel(currentPrompt, history, sendUpdate, serverUrl);
+            const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
-
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
                 return;
             }
-
             if (isFirstStep) {
                 isFirstStep = false;
-                currentPrompt = "Continue with the next step based on the history to complete the original request.";
+                // After first step, switch to continuation instruction while retaining originalPrompt separately.
+                currentInstruction = "Continue with the next step based on the history to complete the original request.";
             }
-
             if (thought) {
                 sendUpdate(`Thought: ${thought}`);
             }
-
             if (tool === 'finish') {
                 sendUpdate(`**Agent finished: ${args[0]}**`);
                 return;
             }
-
             if (tool === 'retry_with_valid_json') {
                 const errorMsg = `Model generated invalid JSON. Adding error to history and retrying.`;
                 sendUpdate(errorMsg);
                 history.push({ action: `invalid_json_response`, result: args[0] });
-                continue; // Skip to the next iteration of the loop
+                continue; // retry loop
             }
-
-            // Check if the tool exists in the toolbox
             const availableTools = this.getToolDefinitions();
             const availableToolNames = availableTools.map(t => t.name);
             sendUpdate(`Available tools: ${availableToolNames.join(', ')}`);
             sendUpdate(`Checking tool: ${tool}`);
-            
             if (!availableToolNames.includes(tool) && !(this.toolbox as any)[tool]) {
                 const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableToolNames.join(', ')}`;
                 sendUpdate(errorMsg);
                 history.push({ action: `unknown_tool(${tool})`, result: errorMsg });
                 continue;
             }
-
             sendUpdate(`Action: ${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`);
             sendUpdate(`Executing tool: ${tool} with args: ${JSON.stringify(args)}`);
             sendUpdate(`Toolbox method exists: ${typeof (this.toolbox as any)[tool]}`);
-
             try {
                 // @ts-ignore
                 const result = await this.toolbox[tool](...args);
                 let resultString = JSON.stringify(result, null, 2);
-                
                 sendUpdate(`Tool ${tool} executed successfully`);
                 sendUpdate(`Tool ${tool} result length: ${resultString.length}`);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: resultString });
@@ -547,12 +534,14 @@ export class AgentService {
         ];
     }
 
-    private async getNextActionFromModel(prompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
+    private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
         sendUpdate("Asking the model for the next step...");
         sendUpdate(`Making request to: ${serverUrl}`);
 
         const systemPrompt = `You are an expert AI programmer agent.
-Your goal is to complete the user's request: "${prompt}"
+Your goal is to complete the user's ORIGINAL request: "${originalPrompt}"
+
+Current Step Instruction: "${currentInstruction}"
 
 CRITICAL INSTRUCTIONS:
 1. You operate autonomously - make file changes immediately without asking permission
@@ -621,9 +610,10 @@ Example response:
 
         
         const fullPrompt = `System Prompt: ${systemPrompt}
-User Request: ${prompt}
-History:
-${JSON.stringify(truncatedHistory)}`;
+        Original User Request: ${originalPrompt}
+        Current Instruction: ${currentInstruction}
+        History:
+        ${JSON.stringify(truncatedHistory)}`;
 
         sendUpdate(`Full prompt length: ${fullPrompt.length} characters`);
         sendUpdate(`History entries: ${history.length}, truncated to: ${truncatedHistory.length}`);
