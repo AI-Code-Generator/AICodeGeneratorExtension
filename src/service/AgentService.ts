@@ -425,6 +425,8 @@ export class AgentService {
     private shouldStop = false;
     private currentAbortController?: AbortController;
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
+    private recentThoughts: string[] = []; // store last N model thoughts
+    private readonly MAX_RECENT_THOUGHTS = 5;
 
     constructor() {
     }
@@ -456,6 +458,14 @@ export class AgentService {
             }
             sendUpdate(`## Step ${i + 1}`);
             const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
+            // Capture thought (truncate each to 500 chars to avoid bloat)
+            if (thought) {
+                const truncatedThought = thought.length > 500 ? thought.substring(0, 500) + '... [TRUNCATED]' : thought;
+                this.recentThoughts.push(truncatedThought);
+                if (this.recentThoughts.length > this.MAX_RECENT_THOUGHTS) {
+                    this.recentThoughts.splice(0, this.recentThoughts.length - this.MAX_RECENT_THOUGHTS);
+                }
+            }
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
@@ -608,12 +618,8 @@ Example response:
             currentChars += entryString.length;
         }
 
-        
-        const fullPrompt = `System Prompt: ${systemPrompt}
-        Original User Request: ${originalPrompt}
-        Current Instruction: ${currentInstruction}
-        History:
-        ${JSON.stringify(truncatedHistory)}`;
+        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t, i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
+        const fullPrompt = `System Prompt: ${systemPrompt}\nOriginal User Request: ${originalPrompt}\nCurrent Instruction: ${currentInstruction}\n${thoughtsSection}\nHistory:\n${JSON.stringify(truncatedHistory)}`;
 
         sendUpdate(`Full prompt length: ${fullPrompt.length} characters`);
         sendUpdate(`History entries: ${history.length}, truncated to: ${truncatedHistory.length}`);
