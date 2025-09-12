@@ -641,8 +641,7 @@ ${JSON.stringify(truncatedHistory)}`;
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,
-                    user_ID: "0001",
-                    is_new_task: history.length === 0 
+                    user_ID: "0001"
                 }),
                 signal: this.currentAbortController.signal
             });
