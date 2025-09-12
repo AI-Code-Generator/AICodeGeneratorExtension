@@ -29,6 +29,7 @@ const EMBEDDING_DIM = 768;
 const LANCEDB_TABLE_NAME = 'code_chunks';
 const FILE_TRACKING_TABLE = 'file_tracking';
 let STORAGEPATH: any = null;
+let CURRENT_PROJECT_KEY: string | null = null;
 
 export const state = {
     db: null as lancedb.Connection | null,
@@ -416,16 +417,35 @@ export async function deleteSingleFile(uri: vscode.Uri, storageUri: vscode.Uri):
     }
 }
 
+function getProjectKey(): string | null {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return null;
+    }
+    const root = workspaceFolders[0].uri.fsPath;
+    return crypto.createHash('sha1').update(root).digest('hex').slice(0,16);
+}
+
 async function initializeLanceDB(storageUri: vscode.Uri) {
     try {
-        const lanceDbPath = path.join(storageUri.fsPath, 'lancedb');
+        const projectKey = getProjectKey();
+        const lanceDbPath = path.join(storageUri.fsPath, 'lancedb', projectKey || 'default');
+
+        // If project changed, reset cached handles so new connection is created
+        if (CURRENT_PROJECT_KEY && projectKey && CURRENT_PROJECT_KEY !== projectKey) {
+            state.db = null;
+            state.table = null;
+            state.fileTrackingTable = null;
+        }
+
+        CURRENT_PROJECT_KEY = projectKey || null;
         state.db = await lancedb.connect(lanceDbPath);
 
         const tableNames = await state.db.tableNames();
 
         if (tableNames.includes(LANCEDB_TABLE_NAME)) {
             state.table = await state.db.openTable(LANCEDB_TABLE_NAME);
-            console.log('Loaded existing LanceDB table');
+            console.log(`Loaded existing LanceDB table for project ${CURRENT_PROJECT_KEY}`);
         } else {
             const sampleData = [{
                 id: 'sample',
@@ -441,12 +461,12 @@ async function initializeLanceDB(storageUri: vscode.Uri) {
 
             state.table = await state.db.createTable(LANCEDB_TABLE_NAME, sampleData);
             await state.table.delete('id = "sample"');
-            console.log('Created new LanceDB table');
+            console.log(`Created new LanceDB table for project ${CURRENT_PROJECT_KEY}`);
         }
 
         if (tableNames.includes(FILE_TRACKING_TABLE)) {
             state.fileTrackingTable = await state.db.openTable(FILE_TRACKING_TABLE);
-            console.log('Loaded existing file tracking table');
+            console.log(`Loaded existing file tracking table for project ${CURRENT_PROJECT_KEY}`);
         } else {
             const sampleData = [{
                 filePath: 'sample/path',
@@ -456,7 +476,7 @@ async function initializeLanceDB(storageUri: vscode.Uri) {
 
             state.fileTrackingTable = await state.db.createTable(FILE_TRACKING_TABLE, sampleData);
             await state.fileTrackingTable.delete('\`filePath\` = "sample/path"');
-            console.log('Created new file tracking table');
+            console.log(`Created new file tracking table for project ${CURRENT_PROJECT_KEY}`);
         }
     } catch (error) {
         console.error('Failed to initialize LanceDB:', error);
@@ -514,7 +534,17 @@ export async function flushRemainingFileTracking() {
     }
 }
 
-export async function similaritySearch(text: string, limit: number = 8) {
+export interface SimilaritySearchResultMetadata {
+    id: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    chunkType: string;
+    content: string;
+    score: number;
+}
+
+export async function similaritySearch(text: string, limit: number = 8): Promise<SimilaritySearchResultMetadata[] | null> {
     if (!text || !state.table) {
         return null;
     }
@@ -528,18 +558,15 @@ export async function similaritySearch(text: string, limit: number = 8) {
             .limit(limit)
             .toArray();
 
-        // return results.map(result => ({
-        //     score: result._distance,
-        //     metadata: {
-        //         id: result.id,
-        //         content: result.content,
-        //         filePath: result.filePath,
-        //         startLine: result.startLine,
-        //         endLine: result.endLine,
-        //         chunkType: result.chunkType
-        //     }
-        // }));
-        return results.map(result => result.content);
+        return results.map(result => ({
+            id: result.id,
+            filePath: result.filePath,
+            startLine: result.startLine,
+            endLine: result.endLine,
+            chunkType: result.chunkType,
+            content: result.content,
+            score: result._distance
+        }));
     } catch (error) {
         console.error('Error in similarity search:', error);
         return null;
