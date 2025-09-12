@@ -349,6 +349,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             id: userMessageId
                         });
 
+                        // Server expects context: Optional[List[str]]; convert metadata objects to formatted strings
+                        const contextStrings = similarity.map(s => {
+                            const header = `<Chunk Info> ${s.filePath}: Line${s.startLine}-${s.endLine} [${s.type}] similarity score=${s.score.toFixed(3)}`;
+                            // Trim content to avoid huge payloads
+                            const trimmed = s.content.length > 800 ? s.content.slice(0, 800) + '...<trimmed>' : s.content;
+                            return header + "\n" + trimmed;
+                        });
+
+                        // Ensure non-empty query content for model
+                        if (!query.trim()) {
+                            query = data.message || 'User query not provided';
+                        }
+
                         // Send request to query endpoint
                         const response = await fetch(this._queryUrl, {
                             method: 'POST',
@@ -357,7 +370,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             },
                             body: JSON.stringify({ 
                                 query: query,
-                                context: similarity,
+                                context: contextStrings,
                                 user_ID: "0001",
                                 is_new_task: isNewAskTask,
                                 message_id: userMessageId
