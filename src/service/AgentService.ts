@@ -475,13 +475,30 @@ export class AgentService {
         }
     }
 
+    private normalizeThought(t: string): string {
+        return t.replace(/\s+/g, ' ').trim();
+    }
     private recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string) {
         if (!thought) { return; }
-        if (this.recentThoughts.length >= 5) {
+        const norm = this.normalizeThought(thought);
+        if (!norm) { return; }
+        // If same as the most recent stored thought, skip to avoid repetition noise
+        const last = this.recentThoughts[this.recentThoughts.length - 1];
+        if (last && this.normalizeThought(last) === norm) {
+            sendUpdate('[Thoughts] Skipping duplicate consecutive thought.');
+            return;
+        }
+        // Cap individual thought length sensibly (retain beginning & end if extremely long)
+        let finalThought = norm;
+        const MAX_SINGLE_THOUGHT = 600;
+        if (finalThought.length > MAX_SINGLE_THOUGHT) {
+            finalThought = finalThought.slice(0, 400) + ' ... ' + finalThought.slice(-120) + ' [TRUNCATED]';
+        }
+        if (this.recentThoughts.length >= this.MAX_RECENT_THOUGHTS) {
             const shifted = this.recentThoughts.shift();
             if (shifted) { this.archivedThoughts.push(shifted); }
         }
-        this.recentThoughts.push(thought.trim());
+        this.recentThoughts.push(finalThought);
         this.summarizeOldThoughtsIfNeeded(sendUpdate, serverUrl);
     }
 
@@ -507,16 +524,8 @@ export class AgentService {
             }
             sendUpdate(`## Step ${i + 1}`);
             const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
-            // Record thought after each model response
             this.recordThought(thought, sendUpdate, serverUrl);
-            // Capture thought (truncate each to 500 chars to avoid bloat)
-            if (thought) {
-                const truncatedThought = thought.length > 500 ? thought.substring(0, 500) + '... [TRUNCATED]' : thought;
-                this.recentThoughts.push(truncatedThought);
-                if (this.recentThoughts.length > this.MAX_RECENT_THOUGHTS) {
-                    this.recentThoughts.splice(0, this.recentThoughts.length - this.MAX_RECENT_THOUGHTS);
-                }
-            }
+            // Removed earlier manual duplicate push of thought.
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
