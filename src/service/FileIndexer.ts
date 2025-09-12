@@ -534,7 +534,17 @@ export async function flushRemainingFileTracking() {
     }
 }
 
-export async function similaritySearch(text: string, limit: number = 8) {
+export interface SimilaritySearchResultMetadata {
+    id: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    chunkType: string;
+    content: string;
+    score: number;
+}
+
+export async function similaritySearch(text: string, limit: number = 8): Promise<SimilaritySearchResultMetadata[] | null> {
     if (!text || !state.table) {
         return null;
     }
@@ -548,18 +558,15 @@ export async function similaritySearch(text: string, limit: number = 8) {
             .limit(limit)
             .toArray();
 
-        // return results.map(result => ({
-        //     score: result._distance,
-        //     metadata: {
-        //         id: result.id,
-        //         content: result.content,
-        //         filePath: result.filePath,
-        //         startLine: result.startLine,
-        //         endLine: result.endLine,
-        //         chunkType: result.chunkType
-        //     }
-        // }));
-        return results.map(result => result.content);
+        return results.map(result => ({
+            id: result.id,
+            filePath: result.filePath,
+            startLine: result.startLine,
+            endLine: result.endLine,
+            chunkType: result.chunkType,
+            content: result.content,
+            score: result._distance
+        }));
     } catch (error) {
         console.error('Error in similarity search:', error);
         return null;

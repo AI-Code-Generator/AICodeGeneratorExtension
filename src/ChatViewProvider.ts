@@ -321,7 +321,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         );
 
                         // Now perform similarity search with enhanced query
-                        const similarity = await similaritySearch(enhancedQuery);
+                        const similarityResults = await similaritySearch(enhancedQuery);
+
+                        // Transform similarity results to a compact metadata + content structure for server
+                        const similarity = (similarityResults || []).map(r => ({
+                            filePath: r.filePath,
+                            startLine: r.startLine,
+                            endLine: r.endLine,
+                            type: r.chunkType,
+                            score: r.score,
+                            content: r.content
+                        }));
 
                         // Determine if this is the first message of a new ask conversation
                         // We must check BEFORE pushing to history so the server can reset correctly.
