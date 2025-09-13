@@ -552,7 +552,7 @@ export class AgentService {
             if (evicted) {
                 // Add to rolling summary (not losing content)
                 const remaining = this.recentThoughts.slice();
-                this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
+                await this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
             }
         }
         this.recentThoughts.push(finalThought);
@@ -560,8 +560,8 @@ export class AgentService {
     }
 
     private buildThoughtSections() {
-    const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
-    const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
+        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
+        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
         return { thoughtsSection, archiveSummarySection };
     }
 
@@ -591,7 +591,7 @@ export class AgentService {
             }
             sendUpdate(`## Step ${i + 1}`);
             const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
-            this.recordThought(thought, sendUpdate, serverUrl);
+            await this.recordThought(thought, sendUpdate, serverUrl);
             // Removed earlier manual duplicate push of thought.
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
             if (this.shouldStop) {
