@@ -429,7 +429,6 @@ export class AgentService {
     private summarizedArchive: string = ''; // cumulative summary of ALL prior (evicted) thoughts
     private summarizing: boolean = false;
     private readonly MAX_RECENT_THOUGHTS = 5;
-    private readonly SINGLE_SUMMARY_CALL_DEBOUNCE_MS = 1500;
     private pendingSummaryTimeout?: NodeJS.Timeout;
 
     constructor() {
@@ -444,42 +443,93 @@ export class AgentService {
         this.toolbox.setWorkingDirectory(directory);
     }
 
-    private async summarizeOldThoughtsIfNeeded(sendUpdate: (u: string)=>void, serverUrl: string) { /* deprecated no-op after rolling summary change */ }
+    private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string) {
+        // If this is the first eviction, show it directly as the previous thought summary without calling the endpoint.
+        if (!this.summarizedArchive) {
+            this.summarizedArchive = evicted;
+            sendUpdate('[ThoughtSummary] Initialized Previous Thought Summary with first evicted thought.');
+            return;
+        }
 
-    private async summarizeEvictedThought(evicted: string, sendUpdate: (u: string)=>void, serverUrl: string) {
         // Debounce rapid consecutive evictions to batch them slightly
         if (this.pendingSummaryTimeout) {
             clearTimeout(this.pendingSummaryTimeout);
         }
         const payloadSummaryBefore = this.summarizedArchive;
-        const toSummarize = payloadSummaryBefore
-            ? `Existing Summary (keep concise):\n${payloadSummaryBefore}\n\nNew Thought To Integrate:\n${evicted}`
-            : `First Archived Thought:\n${evicted}`;
-        this.pendingSummaryTimeout = setTimeout(async () => {
-            try {
-                const prompt = `You are a summarizer maintaining a rolling concise summary of an agent's prior reasoning. Integrate the NEW content into the EXISTING summary (if any), removing redundancy, limiting to ~12 bullet lines or short paragraphs. Preserve unresolved questions and decisions.\n\n${toSummarize}`;
-                sendUpdate(`[ThoughtSummary] Updating rolling summary with new evicted thought (${evicted.length} chars).`);
-                const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
-                if (!resp.ok) {
-                    sendUpdate(`[ThoughtSummary] Summarization request failed status ${resp.status}`);
-                    return;
-                }
-                const jr = await resp.json();
-                let text: string = jr.response || '';
-                const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
-                if (match && match[1]) { text = match[1]; }
-                this.summarizedArchive = text.trim();
-                sendUpdate(`[ThoughtSummary] New summary length ${this.summarizedArchive.length}`);
-            } catch (e: any) {
-                sendUpdate(`[ThoughtSummary] Error ${e.message}`);
+        const toSummarize = `Existing Summary (keep concise):\n${payloadSummaryBefore}\n\nEvicted Thought:\n${evicted}`;
+        try {
+            const prompt = `You are a summarizer maintaining a rolling concise summary of an agent's prior reasoning. Update the EXISTING summary by integrating the Evicted Thought.\n- Keep the summary focused on key decisions, constraints, unresolved items, and next actions.\n- Do not include information about current recent thoughts.\n- Limit to ~12 bullets or short paragraphs.\n\n${toSummarize}`;
+            sendUpdate(`[ThoughtSummary] Updating rolling summary with new evicted thought (${evicted.length} chars).`);
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            if (!resp.ok) {
+                sendUpdate(`[ThoughtSummary] Summarization request failed status ${resp.status}`);
+                return;
             }
-        }, this.SINGLE_SUMMARY_CALL_DEBOUNCE_MS);
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+            this.summarizedArchive = text.trim();
+            sendUpdate(`[ThoughtSummary] New summary length ${this.summarizedArchive.length}`);
+            // If the rolling summary itself grows too large, ask for a shorter version.
+            if (this.summarizedArchive.length > 2000) {
+                await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
+            }
+        } catch (e: any) {
+            sendUpdate(`[ThoughtSummary] Error ${e.message}`);
+        }
+    }
+
+    private async shortenArchiveIfTooLong(sendUpdate: (u: string)=>void, serverUrl: string) {
+        if (this.summarizing) { return; }
+        if (!this.summarizedArchive || this.summarizedArchive.length <= 2000) { return; }
+        try {
+            this.summarizing = true;
+            const prompt = `Shorten the following rolling summary to ~1200 characters while preserving all key decisions, constraints, unresolved items, and next actions. Use compact bullets or short paragraphs.\n\n${this.summarizedArchive}`;
+            sendUpdate('[ThoughtSummary] Shortening rolling summary (too long).');
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            if (!resp.ok) {
+                sendUpdate(`[ThoughtSummary] Shorten request failed status ${resp.status}`);
+                return;
+            }
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+            this.summarizedArchive = text.trim();
+            sendUpdate(`[ThoughtSummary] Shortened summary length ${this.summarizedArchive.length}`);
+        } catch (e: any) {
+            sendUpdate(`[ThoughtSummary] Error while shortening: ${e.message}`);
+        } finally {
+            this.summarizing = false;
+        }
+    }
+
+    private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string) {
+        try {
+            const prompt = `Summarize the following agent thought into <= 400 characters, preserving concrete next actions, file targets, and decisions. Remove repetition.\n\n${rawThought}`;
+            sendUpdate(`[Thoughts] Summarizing the thought output`);
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            if (!resp.ok) {
+                sendUpdate(`[Thoughts] Thought summarization failed with status ${resp.status}`);
+                return;
+            }
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+            const condensed = text.trim();
+            return condensed;
+        } catch (e: any) {
+            sendUpdate(`[Thoughts] Error summarizing long thought: ${e.message}`);
+            return rawThought;
+        }
     }
 
     private normalizeThought(t: string): string {
         return t.replace(/\s+/g, ' ').trim();
     }
-    private recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string) {
         if (!thought) { return; }
         const norm = this.normalizeThought(thought);
         if (!norm) { return; }
@@ -489,26 +539,29 @@ export class AgentService {
             sendUpdate('[Thoughts] Skipping duplicate consecutive thought.');
             return;
         }
-        // Cap individual thought length sensibly (retain beginning & end if extremely long)
-        let finalThought = norm;
-        const MAX_SINGLE_THOUGHT = 600;
-        if (finalThought.length > MAX_SINGLE_THOUGHT) {
-            finalThought = finalThought.slice(0, 400) + ' ... ' + finalThought.slice(-120) + ' [TRUNCATED]';
+        // If the thought is very long, temporarily truncate for display and kick off an async summarization
+        // so the recent list gets a condensed version shortly after.
+        let finalThought: any = norm;
+        const LONG_THOUGHT_THRESHOLD = 800;
+        const isLong = finalThought.length > LONG_THOUGHT_THRESHOLD;
+        if (isLong) {
+            finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl);
         }
         if (this.recentThoughts.length >= this.MAX_RECENT_THOUGHTS) {
             const evicted = this.recentThoughts.shift();
             if (evicted) {
                 // Add to rolling summary (not losing content)
-                this.summarizeEvictedThought(evicted, sendUpdate, serverUrl);
+                const remaining = this.recentThoughts.slice();
+                this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
             }
         }
         this.recentThoughts.push(finalThought);
-        this.summarizeOldThoughtsIfNeeded(sendUpdate, serverUrl);
+        // If long, summarize asynchronously and replace the truncated version in-place when ready.
     }
 
     private buildThoughtSections() {
-        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
-        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
+    const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
+    const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
         return { thoughtsSection, archiveSummarySection };
     }
 
