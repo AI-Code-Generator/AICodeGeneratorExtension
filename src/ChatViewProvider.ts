@@ -10,6 +10,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _queryUrl: string;
     private readonly _embedUrl: string;
     private readonly _enhanceUrl: string;
+    private readonly _agentUrl: string;
     private readonly _deleteMessageUrl?: string; // optional; server must implement
     private contextGatherer: ContextGatherer;
     private agentService: AgentService;
@@ -31,6 +32,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._embedUrl = `${baseUrl}/embed`;
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this._deleteMessageUrl = `${baseUrl}/delete-message`;
+        this._agentUrl = `${baseUrl}/agent`;
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService();
         
@@ -142,7 +144,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }, 100);
 
         // Handle messages from the webview
-        const agentUrl = this._queryUrl.valueOf();
+        const agentUrl = this._agentUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'requestState') {
                 // Send current processing state, mode, and history to webview

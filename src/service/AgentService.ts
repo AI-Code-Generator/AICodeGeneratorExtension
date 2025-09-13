@@ -425,6 +425,11 @@ export class AgentService {
     private shouldStop = false;
     private currentAbortController?: AbortController;
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
+    private recentThoughts: string[] = []; // last up to 5 raw thoughts
+    private summarizedArchive: string = ''; // cumulative summary of ALL prior (evicted) thoughts
+    private summarizing: boolean = false;
+    private readonly MAX_RECENT_THOUGHTS = 5;
+    private pendingSummaryTimeout?: NodeJS.Timeout;
 
     constructor() {
     }
@@ -438,77 +443,196 @@ export class AgentService {
         this.toolbox.setWorkingDirectory(directory);
     }
 
+    private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string) {
+        // If this is the first eviction, show it directly as the previous thought summary without calling the endpoint.
+        if (!this.summarizedArchive) {
+            this.summarizedArchive = evicted;
+            sendUpdate('[ThoughtSummary] Initialized Previous Thought Summary with first evicted thought.');
+            return;
+        }
+
+        // Debounce rapid consecutive evictions to batch them slightly
+        if (this.pendingSummaryTimeout) {
+            clearTimeout(this.pendingSummaryTimeout);
+        }
+        const payloadSummaryBefore = this.summarizedArchive;
+        const toSummarize = `Existing Summary (keep concise):\n${payloadSummaryBefore}\n\nEvicted Thought:\n${evicted}`;
+        try {
+            const prompt = `You are a summarizer maintaining a rolling concise summary of an agent's prior reasoning. Update the EXISTING summary by integrating the Evicted Thought.\n- Keep the summary focused on key decisions, constraints, unresolved items, and next actions.\n- Do not include information about current recent thoughts.\n- Limit to ~12 bullets or short paragraphs.\n\n${toSummarize}`;
+            sendUpdate(`[ThoughtSummary] Updating rolling summary with new evicted thought (${evicted.length} chars).`);
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            if (!resp.ok) {
+                sendUpdate(`[ThoughtSummary] Summarization request failed status ${resp.status}`);
+                return;
+            }
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+            this.summarizedArchive = text.trim();
+            sendUpdate(`[ThoughtSummary] New summary length ${this.summarizedArchive.length}`);
+            // If the rolling summary itself grows too large, ask for a shorter version.
+            if (this.summarizedArchive.length > 2000) {
+                await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
+            }
+        } catch (e: any) {
+            sendUpdate(`[ThoughtSummary] Error ${e.message}`);
+        }
+    }
+
+    private async shortenArchiveIfTooLong(sendUpdate: (u: string)=>void, serverUrl: string) {
+        if (this.summarizing) { return; }
+        if (!this.summarizedArchive || this.summarizedArchive.length <= 2000) { return; }
+        try {
+            this.summarizing = true;
+            const prompt = `Shorten the following rolling summary to ~1200 characters while preserving all key decisions, constraints, unresolved items, and next actions. Use compact bullets or short paragraphs.\n\n${this.summarizedArchive}`;
+            sendUpdate('[ThoughtSummary] Shortening rolling summary (too long).');
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            if (!resp.ok) {
+                sendUpdate(`[ThoughtSummary] Shorten request failed status ${resp.status}`);
+                return;
+            }
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+            this.summarizedArchive = text.trim();
+            sendUpdate(`[ThoughtSummary] Shortened summary length ${this.summarizedArchive.length}`);
+        } catch (e: any) {
+            sendUpdate(`[ThoughtSummary] Error while shortening: ${e.message}`);
+        } finally {
+            this.summarizing = false;
+        }
+    }
+
+    private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string) {
+        try {
+            const prompt = `Summarize the following agent thought into <= 400 characters, preserving concrete next actions, file targets, and decisions. Remove repetition.\n\n${rawThought}`;
+            sendUpdate(`[Thoughts] Summarizing the thought output`);
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            if (!resp.ok) {
+                sendUpdate(`[Thoughts] Thought summarization failed with status ${resp.status}`);
+                return;
+            }
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+            const condensed = text.trim();
+            return condensed;
+        } catch (e: any) {
+            sendUpdate(`[Thoughts] Error summarizing long thought: ${e.message}`);
+            return rawThought;
+        }
+    }
+
+    private normalizeThought(t: string): string {
+        return t.replace(/\s+/g, ' ').trim();
+    }
+    private async recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string) {
+        if (!thought) { return; }
+        const norm = this.normalizeThought(thought);
+        if (!norm) { return; }
+        // If same as the most recent stored thought, skip to avoid repetition noise
+        const last = this.recentThoughts[this.recentThoughts.length - 1];
+        if (last && this.normalizeThought(last) === norm) {
+            sendUpdate('[Thoughts] Skipping duplicate consecutive thought.');
+            return;
+        }
+        // If the thought is very long, temporarily truncate for display and kick off an async summarization
+        // so the recent list gets a condensed version shortly after.
+        let finalThought: any = norm;
+        const LONG_THOUGHT_THRESHOLD = 800;
+        const isLong = finalThought.length > LONG_THOUGHT_THRESHOLD;
+        if (isLong) {
+            finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl);
+        }
+        if (this.recentThoughts.length >= this.MAX_RECENT_THOUGHTS) {
+            const evicted = this.recentThoughts.shift();
+            if (evicted) {
+                // Add to rolling summary (not losing content)
+                const remaining = this.recentThoughts.slice();
+                this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
+            }
+        }
+        this.recentThoughts.push(finalThought);
+        // If long, summarize asynchronously and replace the truncated version in-place when ready.
+    }
+
+    private buildThoughtSections() {
+    const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
+    const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
+        return { thoughtsSection, archiveSummarySection };
+    }
+
+    public getThoughtsDebug() {
+        return { recentThoughts: this.recentThoughts.slice(), summarizedArchive: this.summarizedArchive };
+    }
+
     public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void) {
         sendUpdate(`[AgentService] Starting processRequest with serverUrl: ${serverUrl}`);
         sendUpdate(`[AgentService] Working directory: ${this.toolbox.getWorkingDirectory() || 'Not set'}`);
         sendUpdate(`[AgentService] Prompt length: ${prompt.length} characters`);
-        
         this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
         const maxSteps = 60;
-
-        let currentPrompt = prompt; // Use the full prompt for the first step
+        // Preserve the original user request for all subsequent iterations.
+        const originalPrompt = prompt;
+        let currentInstruction = prompt; // Instruction for the model (first step uses full prompt)
         let isFirstStep = true;
-
         for (let i = 0; i < maxSteps; i++) {
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
                 return;
             }
-
+            if(isFirstStep) {
+                this.recentThoughts = [];
+                this.summarizedArchive = '';
+            }
             sendUpdate(`## Step ${i + 1}`);
-
-            const { tool, args, thought } = await this.getNextActionFromModel(currentPrompt, history, sendUpdate, serverUrl);
+            const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
+            this.recordThought(thought, sendUpdate, serverUrl);
+            // Removed earlier manual duplicate push of thought.
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
-
             if (this.shouldStop) {
                 sendUpdate("Agent stopped by user.");
                 return;
             }
-
             if (isFirstStep) {
                 isFirstStep = false;
-                currentPrompt = "Continue with the next step based on the history to complete the original request.";
+                // After first step, switch to continuation instruction while retaining originalPrompt separately.
+                currentInstruction = "Continue with the next step based on the history to complete the original request.";
             }
-
             if (thought) {
                 sendUpdate(`Thought: ${thought}`);
             }
-
             if (tool === 'finish') {
                 sendUpdate(`**Agent finished: ${args[0]}**`);
                 return;
             }
-
             if (tool === 'retry_with_valid_json') {
                 const errorMsg = `Model generated invalid JSON. Adding error to history and retrying.`;
                 sendUpdate(errorMsg);
                 history.push({ action: `invalid_json_response`, result: args[0] });
-                continue; // Skip to the next iteration of the loop
+                continue; // retry loop
             }
-
-            // Check if the tool exists in the toolbox
             const availableTools = this.getToolDefinitions();
             const availableToolNames = availableTools.map(t => t.name);
             sendUpdate(`Available tools: ${availableToolNames.join(', ')}`);
             sendUpdate(`Checking tool: ${tool}`);
-            
             if (!availableToolNames.includes(tool) && !(this.toolbox as any)[tool]) {
                 const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableToolNames.join(', ')}`;
                 sendUpdate(errorMsg);
                 history.push({ action: `unknown_tool(${tool})`, result: errorMsg });
                 continue;
             }
-
             sendUpdate(`Action: ${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`);
             sendUpdate(`Executing tool: ${tool} with args: ${JSON.stringify(args)}`);
             sendUpdate(`Toolbox method exists: ${typeof (this.toolbox as any)[tool]}`);
-
             try {
                 // @ts-ignore
                 const result = await this.toolbox[tool](...args);
                 let resultString = JSON.stringify(result, null, 2);
-                
                 sendUpdate(`Tool ${tool} executed successfully`);
                 sendUpdate(`Tool ${tool} result length: ${resultString.length}`);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: resultString });
@@ -547,12 +671,14 @@ export class AgentService {
         ];
     }
 
-    private async getNextActionFromModel(prompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
+    private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
         sendUpdate("Asking the model for the next step...");
         sendUpdate(`Making request to: ${serverUrl}`);
 
         const systemPrompt = `You are an expert AI programmer agent.
-Your goal is to complete the user's request: "${prompt}"
+Your goal is to complete the user's ORIGINAL request: "${originalPrompt}"
+
+Current Step Instruction: "${currentInstruction}"
 
 CRITICAL INSTRUCTIONS:
 1. You operate autonomously - make file changes immediately without asking permission
@@ -619,11 +745,8 @@ Example response:
             currentChars += entryString.length;
         }
 
-        
-        const fullPrompt = `System Prompt: ${systemPrompt}
-User Request: ${prompt}
-History:
-${JSON.stringify(truncatedHistory)}`;
+        const { thoughtsSection, archiveSummarySection } = this.buildThoughtSections();
+        const fullPrompt = `System Prompt: ${systemPrompt}\nOriginal User Request: ${originalPrompt}\nCurrent Instruction: ${currentInstruction}\n${archiveSummarySection}\n${thoughtsSection}\nHistory:\n${JSON.stringify(truncatedHistory)}`;
 
         sendUpdate(`Full prompt length: ${fullPrompt.length} characters`);
         sendUpdate(`History entries: ${history.length}, truncated to: ${truncatedHistory.length}`);
@@ -641,8 +764,7 @@ ${JSON.stringify(truncatedHistory)}`;
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,
-                    user_ID: "0001",
-                    is_new_task: history.length === 0 
+                    user_ID: "0001"
                 }),
                 signal: this.currentAbortController.signal
             });
