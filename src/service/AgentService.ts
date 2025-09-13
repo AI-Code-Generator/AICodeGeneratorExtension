@@ -46,6 +46,33 @@ class ToolBox {
         return this.terminal;
     }
 
+    // Attempt to stop any currently running process in the agent terminal.
+    // Strategy: send Ctrl+C a couple times, wait briefly, then dispose and recreate terminal to guarantee a clean state.
+    private async killRunningTerminalProcess(): Promise<void> {
+        if (!this.terminal || this.terminal.exitStatus) {
+            return;
+        }
+        try {
+            // Graceful interrupt (Ctrl+C) twice with small delays
+            this.terminal.sendText('\x03', false); // Ctrl+C without newline
+            await new Promise((r) => setTimeout(r, 200));
+            this.terminal.sendText('\x03', false);
+            await new Promise((r) => setTimeout(r, 300));
+        } catch {
+            // ignore
+        }
+
+        // Force-stop by disposing the terminal; we'll recreate a fresh one
+        try {
+            this.terminal.dispose();
+        } catch {
+            // ignore
+        }
+        this.terminal = undefined;
+        // Recreate immediately in the configured working directory
+        this.ensureTerminal();
+    }
+
     public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
         let allFiles: string[] = [];
         
@@ -352,6 +379,8 @@ class ToolBox {
         }
 
         // Use VS Code Integrated Terminal for user visibility + subprocess for output capture
+    // First, ensure any running process in the agent terminal is stopped to avoid interleaving output
+        await this.killRunningTerminalProcess();
         const term = this.ensureTerminal();
         const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         
