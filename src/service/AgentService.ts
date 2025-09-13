@@ -686,7 +686,8 @@ CRITICAL INSTRUCTIONS:
 3. Users see diffs with accept/reject buttons after you make changes
 4. NEVER ask "Should I..." or "Would you like me to..." - just do it
 5. Complete the entire task by making all necessary changes
-6. Only use 'finish' when the task is completely done
+6. When task is finished always test before calling 'finish' tool
+7. Only use 'finish' when the task is completely done
 
 IMPORTANT: Use tools efficiently to explore codebase:
 - search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
@@ -698,6 +699,11 @@ CRITICAL WORKFLOW FOR READING FILES:
 1. Your first step when reading a file should ALWAYS be the 'read_file' tool.
 2. If 'read_file' returns a "File is too long" error, your immediate next step MUST be to use the 'search_in_file' tool with a relevant keyword from the problem description. Do NOT use 'read_file_chunk' unless you have a specific reason to read from the beginning.
 3. Only use 'read_file_chunk' if you need to browse the file from the start or 'search_in_file' does not yield results.
+
+CRITICAL INSTRUCTIONS FOR TESTING THE APPLICATION:
+1. Consider the language or framework you are dealing with when testing
+2. First check for any compilation errors. To accomplish this you can try compiling or building the application
+3. Try running tests if any available. If not found or user denies testing just move on
 
 You operate in a loop. In each step, choose the appropriate tool and execute it.
 Do not ask for clarification or permission.
