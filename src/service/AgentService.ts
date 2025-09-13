@@ -585,6 +585,10 @@ export class AgentService {
                 sendUpdate("Agent stopped by user.");
                 return;
             }
+            if(isFirstStep) {
+                this.recentThoughts = [];
+                this.summarizedArchive = '';
+            }
             sendUpdate(`## Step ${i + 1}`);
             const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
             this.recordThought(thought, sendUpdate, serverUrl);
