@@ -2,8 +2,6 @@
 import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
-import * as os from 'os';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedText } from './FileIndexer';
 
@@ -13,6 +11,7 @@ class ToolBox {
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
     private workingDirectory: string = '';
     private terminal?: vscode.Terminal;
+    private captureTimeout?: NodeJS.Timeout;
 
     constructor() {
         this.diffManager = DiffManager.getInstance();
@@ -46,31 +45,31 @@ class ToolBox {
         return this.terminal;
     }
 
+    // Deleted the ensurePseudoTerminal method - we'll use the regular terminal only
+
     // Attempt to stop any currently running process in the agent terminal.
     // Strategy: send Ctrl+C a couple times, wait briefly, then dispose and recreate terminal to guarantee a clean state.
     private async killRunningTerminalProcess(): Promise<void> {
-        if (!this.terminal || this.terminal.exitStatus) {
-            return;
-        }
-        try {
-            // Graceful interrupt (Ctrl+C) twice with small delays
-            this.terminal.sendText('\x03', false); // Ctrl+C without newline
-            await new Promise((r) => setTimeout(r, 200));
-            this.terminal.sendText('\x03', false);
-            await new Promise((r) => setTimeout(r, 300));
-        } catch {
-            // ignore
+        // Clear any pending timeout
+        if (this.captureTimeout) {
+            clearTimeout(this.captureTimeout);
+            this.captureTimeout = undefined;
         }
 
-        // Force-stop by disposing the terminal; we'll recreate a fresh one
-        try {
-            this.terminal.dispose();
-        } catch {
-            // ignore
+        // Stop terminal if present
+        if (this.terminal && !this.terminal.exitStatus) {
+            try {
+                // Send Ctrl+C twice to gracefully terminate any running process
+                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                await new Promise((r) => setTimeout(r, 300));
+                this.terminal.sendText('\x03', false);
+                await new Promise((r) => setTimeout(r, 300));
+            } catch { /* ignore */ }
+            try { 
+                this.terminal.dispose(); 
+            } catch { /* ignore */ }
+            this.terminal = undefined;
         }
-        this.terminal = undefined;
-        // Recreate immediately in the configured working directory
-        this.ensureTerminal();
     }
 
     public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
@@ -378,34 +377,109 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Use VS Code Integrated Terminal for user visibility + subprocess for output capture
-    // First, ensure any running process in the agent terminal is stopped to avoid interleaving output
+        // First, ensure any running process is stopped
         await this.killRunningTerminalProcess();
-        const term = this.ensureTerminal();
-        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         
-        // Show command in terminal for user visibility
-        term.sendText(command);
+        // Create a new terminal or use existing one
+        const term = this.terminal || (this.terminal = vscode.window.createTerminal('AI Code Assistant'));
         
-        // Also run the command via subprocess to capture output for the agent
-        return new Promise((resolve) => {
-            exec(command, { cwd, timeout: 30000 }, (error, stdout, stderr) => {
-                let output = stdout || '';
-                let errorOutput = stderr || '';
-                
-                if (error) {
-                    errorOutput = error.message;
+        // Make sure we're in the right directory
+        if (this.workingDirectory) {
+            await new Promise<void>(resolve => {
+                term.sendText(`cd "${this.workingDirectory.replace(/"/g, '\\"')}"`, true);
+                setTimeout(resolve, 100);
+            });
+        }
+        
+        term.show(true); // Show terminal with focus
+
+        return new Promise(async (resolve) => {
+            let resolved = false;
+            
+            // Function to try shell integration
+            const tryShellIntegration = async () => {
+                if (term.shellIntegration && !resolved) {
+                    try {
+                        // Execute command using shell integration
+                        const execution = term.shellIntegration.executeCommand(command);
+                        
+                        // Capture output using the proper API
+                        let output = '';
+                        const stream = execution.read();
+                        
+                        // Read output stream
+                        for await (const data of stream) {
+                            output += data;
+                        }
+                        
+                        if (!resolved) {
+                            resolved = true;
+                            resolve({
+                                stdout: output,
+                                stderr: ''
+                            });
+                        }
+                        return true;
+                    } catch (error) {
+                        console.warn('Shell integration failed:', error);
+                        return false;
+                    }
                 }
-                
-                // Limit output size to prevent history bloat
-                if (output.length > 8000) {
-                    output = output.slice(-8000);
+                return false;
+            };
+
+            // Try shell integration immediately
+            if (await tryShellIntegration()) {
+                return;
+            }
+            
+            // Wait for shell integration to become available (up to 3 seconds)
+            const integrationWaitTimeout = setTimeout(async () => {
+                if (!resolved && !(await tryShellIntegration())) {
+                    // Fallback: Use sendText and monitor for command completion
+                    let output = '';
+                    let commandCompleted = false;
+                    
+                    // Listen for shell execution end events
+                    const executionListener = vscode.window.onDidEndTerminalShellExecution((event) => {
+                        if (event.terminal === term && !commandCompleted) {
+                            commandCompleted = true;
+                            executionListener.dispose();
+                            
+                            if (!resolved) {
+                                resolved = true;
+                                resolve({
+                                    stdout: output || `Command "${command}" completed. Exit code: ${event.exitCode}`,
+                                    stderr: event.exitCode !== 0 ? `Command failed with exit code: ${event.exitCode}` : ''
+                                });
+                            }
+                        }
+                    });
+                    
+                    // Send the command to terminal
+                    term.sendText(command);
+                    
+                    // Fallback timeout in case we can't detect completion
+                    setTimeout(() => {
+                        if (!resolved && !commandCompleted) {
+                            executionListener.dispose();
+                            resolved = true;
+                            resolve({
+                                stdout: `Command "${command}" executed in terminal. Unable to capture output automatically.`,
+                                stderr: ''
+                            });
+                        }
+                    }, 10000); // 10 second timeout
                 }
-                if (errorOutput.length > 4000) {
-                    errorOutput = errorOutput.slice(-4000);
+            }, 3000);
+
+            // Also listen for shell integration to become available
+            const integrationListener = vscode.window.onDidChangeTerminalShellIntegration(async (event) => {
+                if (event.terminal === term && event.shellIntegration && !resolved) {
+                    clearTimeout(integrationWaitTimeout);
+                    integrationListener.dispose();
+                    await tryShellIntegration();
                 }
-                
-                resolve({ stdout: output, stderr: errorOutput });
             });
         });
     }
