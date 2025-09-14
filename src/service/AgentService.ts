@@ -2,8 +2,6 @@
 import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
-import * as os from 'os';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedText } from './FileIndexer';
 
@@ -13,6 +11,7 @@ class ToolBox {
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
     private workingDirectory: string = '';
     private terminal?: vscode.Terminal;
+    private captureTimeout?: NodeJS.Timeout;
 
     constructor() {
         this.diffManager = DiffManager.getInstance();
@@ -44,6 +43,33 @@ class ToolBox {
         // Show terminal but don't steal focus, and it will open in a split view
         this.terminal.show(false);
         return this.terminal;
+    }
+
+    // Deleted the ensurePseudoTerminal method - we'll use the regular terminal only
+
+    // Attempt to stop any currently running process in the agent terminal.
+    // Strategy: send Ctrl+C a couple times, wait briefly, then dispose and recreate terminal to guarantee a clean state.
+    private async killRunningTerminalProcess(): Promise<void> {
+        // Clear any pending timeout
+        if (this.captureTimeout) {
+            clearTimeout(this.captureTimeout);
+            this.captureTimeout = undefined;
+        }
+
+        // Stop terminal if present
+        if (this.terminal && !this.terminal.exitStatus) {
+            try {
+                // Send Ctrl+C twice to gracefully terminate any running process
+                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                await new Promise((r) => setTimeout(r, 300));
+                this.terminal.sendText('\x03', false);
+                await new Promise((r) => setTimeout(r, 300));
+            } catch { /* ignore */ }
+            try { 
+                this.terminal.dispose(); 
+            } catch { /* ignore */ }
+            this.terminal = undefined;
+        }
     }
 
     public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
@@ -351,32 +377,109 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Use VS Code Integrated Terminal for user visibility + subprocess for output capture
-        const term = this.ensureTerminal();
-        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        // First, ensure any running process is stopped
+        await this.killRunningTerminalProcess();
         
-        // Show command in terminal for user visibility
-        term.sendText(command);
+        // Create a new terminal or use existing one
+        const term = this.terminal || (this.terminal = vscode.window.createTerminal('AI Code Assistant'));
         
-        // Also run the command via subprocess to capture output for the agent
-        return new Promise((resolve) => {
-            exec(command, { cwd, timeout: 30000 }, (error, stdout, stderr) => {
-                let output = stdout || '';
-                let errorOutput = stderr || '';
-                
-                if (error) {
-                    errorOutput = error.message;
+        // Make sure we're in the right directory
+        if (this.workingDirectory) {
+            await new Promise<void>(resolve => {
+                term.sendText(`cd "${this.workingDirectory.replace(/"/g, '\\"')}"`, true);
+                setTimeout(resolve, 100);
+            });
+        }
+        
+        term.show(true); // Show terminal with focus
+
+        return new Promise(async (resolve) => {
+            let resolved = false;
+            
+            // Function to try shell integration
+            const tryShellIntegration = async () => {
+                if (term.shellIntegration && !resolved) {
+                    try {
+                        // Execute command using shell integration
+                        const execution = term.shellIntegration.executeCommand(command);
+                        
+                        // Capture output using the proper API
+                        let output = '';
+                        const stream = execution.read();
+                        
+                        // Read output stream
+                        for await (const data of stream) {
+                            output += data;
+                        }
+                        
+                        if (!resolved) {
+                            resolved = true;
+                            resolve({
+                                stdout: output,
+                                stderr: ''
+                            });
+                        }
+                        return true;
+                    } catch (error) {
+                        console.warn('Shell integration failed:', error);
+                        return false;
+                    }
                 }
-                
-                // Limit output size to prevent history bloat
-                if (output.length > 8000) {
-                    output = output.slice(-8000);
+                return false;
+            };
+
+            // Try shell integration immediately
+            if (await tryShellIntegration()) {
+                return;
+            }
+            
+            // Wait for shell integration to become available (up to 3 seconds)
+            const integrationWaitTimeout = setTimeout(async () => {
+                if (!resolved && !(await tryShellIntegration())) {
+                    // Fallback: Use sendText and monitor for command completion
+                    let output = '';
+                    let commandCompleted = false;
+                    
+                    // Listen for shell execution end events
+                    const executionListener = vscode.window.onDidEndTerminalShellExecution((event) => {
+                        if (event.terminal === term && !commandCompleted) {
+                            commandCompleted = true;
+                            executionListener.dispose();
+                            
+                            if (!resolved) {
+                                resolved = true;
+                                resolve({
+                                    stdout: output || `Command "${command}" completed. Exit code: ${event.exitCode}`,
+                                    stderr: event.exitCode !== 0 ? `Command failed with exit code: ${event.exitCode}` : ''
+                                });
+                            }
+                        }
+                    });
+                    
+                    // Send the command to terminal
+                    term.sendText(command);
+                    
+                    // Fallback timeout in case we can't detect completion
+                    setTimeout(() => {
+                        if (!resolved && !commandCompleted) {
+                            executionListener.dispose();
+                            resolved = true;
+                            resolve({
+                                stdout: `Command "${command}" executed in terminal. Unable to capture output automatically.`,
+                                stderr: ''
+                            });
+                        }
+                    }, 10000); // 10 second timeout
                 }
-                if (errorOutput.length > 4000) {
-                    errorOutput = errorOutput.slice(-4000);
+            }, 3000);
+
+            // Also listen for shell integration to become available
+            const integrationListener = vscode.window.onDidChangeTerminalShellIntegration(async (event) => {
+                if (event.terminal === term && event.shellIntegration && !resolved) {
+                    clearTimeout(integrationWaitTimeout);
+                    integrationListener.dispose();
+                    await tryShellIntegration();
                 }
-                
-                resolve({ stdout: output, stderr: errorOutput });
             });
         });
     }
@@ -552,7 +655,7 @@ export class AgentService {
             if (evicted) {
                 // Add to rolling summary (not losing content)
                 const remaining = this.recentThoughts.slice();
-                this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
+                await this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
             }
         }
         this.recentThoughts.push(finalThought);
@@ -560,8 +663,8 @@ export class AgentService {
     }
 
     private buildThoughtSections() {
-    const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
-    const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
+        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
+        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
         return { thoughtsSection, archiveSummarySection };
     }
 
@@ -591,7 +694,7 @@ export class AgentService {
             }
             sendUpdate(`## Step ${i + 1}`);
             const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
-            this.recordThought(thought, sendUpdate, serverUrl);
+            await this.recordThought(thought, sendUpdate, serverUrl);
             // Removed earlier manual duplicate push of thought.
             sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
             if (this.shouldStop) {
@@ -686,7 +789,8 @@ CRITICAL INSTRUCTIONS:
 3. Users see diffs with accept/reject buttons after you make changes
 4. NEVER ask "Should I..." or "Would you like me to..." - just do it
 5. Complete the entire task by making all necessary changes
-6. Only use 'finish' when the task is completely done
+6. When task is finished always test before calling 'finish' tool
+7. Only use 'finish' when the task is completely done
 
 IMPORTANT: Use tools efficiently to explore codebase:
 - search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
@@ -698,6 +802,11 @@ CRITICAL WORKFLOW FOR READING FILES:
 1. Your first step when reading a file should ALWAYS be the 'read_file' tool.
 2. If 'read_file' returns a "File is too long" error, your immediate next step MUST be to use the 'search_in_file' tool with a relevant keyword from the problem description. Do NOT use 'read_file_chunk' unless you have a specific reason to read from the beginning.
 3. Only use 'read_file_chunk' if you need to browse the file from the start or 'search_in_file' does not yield results.
+
+CRITICAL INSTRUCTIONS FOR TESTING THE APPLICATION:
+1. Consider the language or framework you are dealing with when testing
+2. First check for any compilation errors. To accomplish this you can try compiling or building the application
+3. Try running tests if any available. If not found or user denies testing just move on
 
 You operate in a loop. In each step, choose the appropriate tool and execute it.
 Do not ask for clarification or permission.
