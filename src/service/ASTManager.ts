@@ -3,6 +3,21 @@ import * as path from 'path';
 import Parser from 'tree-sitter';
 import TreeSitterJavaScript from 'tree-sitter-javascript';
 import TreeSitterTypeScript from 'tree-sitter-typescript';
+import TreeSitterJava from 'tree-sitter-java';
+
+export interface SpringAnnotation {
+    name: string; // e.g., "Component", "RestController", "Service"
+    attributes?: { [key: string]: string }; // Annotation attributes
+    fullName: string; // Full annotation name with package
+}
+
+export interface RequestMapping {
+    path: string;
+    method: string; // GET, POST, PUT, DELETE, etc.
+    consumes?: string[];
+    produces?: string[];
+    params?: string[];
+}
 
 export interface ASTNode {
     id: string;
@@ -19,6 +34,16 @@ export interface ASTNode {
     exports?: string[]; // What this node exports
     imports?: string[]; // What this node imports
     references?: string[]; // Other nodes this references
+    // Java-specific properties
+    packageName?: string; // Java package declaration
+    annotations?: string[]; // Java annotations (e.g., @Component, @RestController)
+    modifiers?: string[]; // Access modifiers (public, private, static, etc.)
+    extends?: string; // Superclass name
+    implements?: string[]; // Implemented interfaces
+    // Spring Boot specific
+    isSpringComponent?: boolean; // Is this a Spring component/bean
+    springAnnotations?: SpringAnnotation[]; // Spring-specific annotations
+    requestMappings?: RequestMapping[]; // For REST controllers
 }
 
 export interface FileAST {
@@ -71,6 +96,9 @@ export class ASTManager {
             case '.jsx':
                 parser.setLanguage(TreeSitterJavaScript as unknown as Parser.Language);
                 return parser;
+            case '.java':
+                parser.setLanguage(TreeSitterJava as unknown as Parser.Language);
+                return parser;
             default:
                 return null;
         }
@@ -83,7 +111,7 @@ export class ASTManager {
 
     public async initializeWorkspace(context: vscode.ExtensionContext): Promise<void> {
         // Set up file watcher
-        this.fileWatcher = vscode.workspace.createFileSystemWatcher("**/*.{ts,tsx,js,jsx}", false, false, false);
+        this.fileWatcher = vscode.workspace.createFileSystemWatcher("**/*.{ts,tsx,js,jsx,java}", false, false, false);
         
         this.fileWatcher.onDidChange(async (uri) => {
             await this.updateFileAST(uri);
@@ -109,8 +137,11 @@ export class ASTManager {
             return;
         }
 
-        const excludeDirs = ['node_modules', '.git', 'dist', 'build', 'out'];
-        const pattern = "**/*.{ts,tsx,js,jsx}";
+        const excludeDirs = [
+            'node_modules', '.git', 'dist', 'build', 'out',
+            'target', 'bin', '.gradle', '.mvn', 'gradle/wrapper'
+        ];
+        const pattern = "**/*.{ts,tsx,js,jsx,java}";
         
         const files = await vscode.workspace.findFiles(pattern, `{${excludeDirs.map(dir => `**/${dir}/**`).join(',')}}`);
         
@@ -124,7 +155,7 @@ export class ASTManager {
         const ext = path.extname(filePath);
         
         // Skip unsupported file types
-        if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext.toLowerCase())) {
+        if (!['.ts', '.tsx', '.js', '.jsx', '.java'].includes(ext.toLowerCase())) {
             return;
         }
 
@@ -236,6 +267,7 @@ export class ASTManager {
     private extractNodeName(node: Parser.SyntaxNode, content: string): string | undefined {
         // Extract names based on node type
         switch (node.type) {
+            // TypeScript/JavaScript constructs
             case 'function_declaration':
             case 'class_declaration':
             case 'interface_declaration':
@@ -258,6 +290,35 @@ export class ASTManager {
                 const keyChild = node.childForFieldName('name');
                 return keyChild ? content.slice(keyChild.startIndex, keyChild.endIndex) : undefined;
             
+            // Java constructs
+            case 'class_declaration':
+            case 'interface_declaration':
+            case 'enum_declaration':
+            case 'annotation_type_declaration':
+                const javaNameChild = node.childForFieldName('name');
+                return javaNameChild ? content.slice(javaNameChild.startIndex, javaNameChild.endIndex) : undefined;
+            
+            case 'method_declaration':
+            case 'constructor_declaration':
+                const methodNameChild = node.childForFieldName('name');
+                return methodNameChild ? content.slice(methodNameChild.startIndex, methodNameChild.endIndex) : undefined;
+            
+            case 'field_declaration':
+                const fieldDeclarator = node.children.find(child => child.type === 'variable_declarator');
+                if (fieldDeclarator) {
+                    const fieldNameChild = fieldDeclarator.childForFieldName('name');
+                    return fieldNameChild ? content.slice(fieldNameChild.startIndex, fieldNameChild.endIndex) : undefined;
+                }
+                break;
+            
+            case 'local_variable_declaration':
+                const localDeclarator = node.children.find(child => child.type === 'variable_declarator');
+                if (localDeclarator) {
+                    const localNameChild = localDeclarator.childForFieldName('name');
+                    return localNameChild ? content.slice(localNameChild.startIndex, localNameChild.endIndex) : undefined;
+                }
+                break;
+            
             default:
                 return undefined;
         }
@@ -265,8 +326,8 @@ export class ASTManager {
 
     private extractSemanticInfo(astNode: ASTNode, node: Parser.SyntaxNode, content: string): void {
         // Extract imports
-        if (node.type === 'import_statement') {
-            const importClause = node.childForFieldName('import');
+        if (node.type === 'import_statement' || node.type === 'import_declaration') {
+            const importClause = node.childForFieldName('import') || node;
             if (importClause) {
                 astNode.imports = this.extractImportNames(importClause, content);
             }
@@ -278,12 +339,148 @@ export class ASTManager {
         }
 
         // Extract function calls and references
-        if (node.type === 'call_expression') {
-            const functionName = node.childForFieldName('function');
+        if (node.type === 'call_expression' || node.type === 'method_invocation') {
+            const functionName = node.childForFieldName('function') || node.childForFieldName('name');
             if (functionName) {
                 const refName = content.slice(functionName.startIndex, functionName.endIndex);
                 astNode.references?.push(refName);
             }
+        }
+
+        // Java-specific extractions
+        if (astNode.filePath.endsWith('.java')) {
+            this.extractJavaSemanticInfo(astNode, node, content);
+        }
+    }
+
+    private extractJavaSemanticInfo(astNode: ASTNode, node: Parser.SyntaxNode, content: string): void {
+        // Extract package declaration
+        if (node.type === 'package_declaration') {
+            const packageName = node.childForFieldName('name');
+            if (packageName) {
+                astNode.packageName = content.slice(packageName.startIndex, packageName.endIndex);
+            }
+        }
+
+        // Extract annotations
+        if (node.type === 'annotation' || node.type === 'marker_annotation') {
+            const annotationName = node.childForFieldName('name');
+            if (annotationName) {
+                const name = content.slice(annotationName.startIndex, annotationName.endIndex);
+                if (!astNode.annotations) {
+                    astNode.annotations = [];
+                }
+                astNode.annotations.push(name);
+
+                // Check for Spring annotations
+                this.processSpringAnnotation(astNode, name, node, content);
+            }
+        }
+
+        // Extract modifiers (public, private, static, etc.)
+        if (node.type === 'modifiers') {
+            if (!astNode.modifiers) {
+                astNode.modifiers = [];
+            }
+            for (const child of node.children) {
+                if (child.type !== 'annotation' && child.type !== 'marker_annotation') {
+                    astNode.modifiers.push(content.slice(child.startIndex, child.endIndex));
+                }
+            }
+        }
+
+        // Extract class inheritance
+        if (node.type === 'class_declaration') {
+            const superclass = node.childForFieldName('superclass');
+            if (superclass) {
+                astNode.extends = content.slice(superclass.startIndex, superclass.endIndex);
+            }
+
+            const interfaces = node.childForFieldName('interfaces');
+            if (interfaces) {
+                if (!astNode.implements) {
+                    astNode.implements = [];
+                }
+                for (const child of interfaces.children) {
+                    if (child.type === 'type_identifier') {
+                        astNode.implements.push(content.slice(child.startIndex, child.endIndex));
+                    }
+                }
+            }
+        }
+    }
+
+    private processSpringAnnotation(astNode: ASTNode, annotationName: string, node: Parser.SyntaxNode, content: string): void {
+        const springAnnotations = [
+            'Component', 'Service', 'Repository', 'Controller', 'RestController',
+            'Configuration', 'Bean', 'Autowired', 'Value', 'RequestMapping',
+            'GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping',
+            'Entity', 'Table', 'Column', 'Id', 'GeneratedValue', 'Transactional'
+        ];
+
+        if (springAnnotations.includes(annotationName)) {
+            astNode.isSpringComponent = true;
+            
+            if (!astNode.springAnnotations) {
+                astNode.springAnnotations = [];
+            }
+            
+            const springAnnotation: SpringAnnotation = {
+                name: annotationName,
+                fullName: `@${annotationName}`,
+                attributes: {}
+            };
+
+            // Extract annotation attributes
+            const argumentList = node.childForFieldName('arguments');
+            if (argumentList) {
+                for (const arg of argumentList.children) {
+                    if (arg.type === 'element_value_pair') {
+                        const key = arg.childForFieldName('key');
+                        const value = arg.childForFieldName('value');
+                        if (key && value) {
+                            const keyStr = content.slice(key.startIndex, key.endIndex);
+                            const valueStr = content.slice(value.startIndex, value.endIndex);
+                            springAnnotation.attributes![keyStr] = valueStr;
+                        }
+                    }
+                }
+            }
+
+            astNode.springAnnotations.push(springAnnotation);
+
+            // Process request mapping annotations
+            if (['RequestMapping', 'GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping'].includes(annotationName)) {
+                this.processRequestMapping(astNode, annotationName, springAnnotation);
+            }
+        }
+    }
+
+    private processRequestMapping(astNode: ASTNode, annotationType: string, annotation: SpringAnnotation): void {
+        if (!astNode.requestMappings) {
+            astNode.requestMappings = [];
+        }
+
+        const mapping: RequestMapping = {
+            path: annotation.attributes?.['value'] || annotation.attributes?.['path'] || '',
+            method: this.getHttpMethodFromAnnotation(annotationType),
+            consumes: annotation.attributes?.['consumes']?.split(',').map(s => s.trim()) || [],
+            produces: annotation.attributes?.['produces']?.split(',').map(s => s.trim()) || [],
+            params: annotation.attributes?.['params']?.split(',').map(s => s.trim()) || []
+        };
+
+        astNode.requestMappings.push(mapping);
+    }
+
+    private getHttpMethodFromAnnotation(annotationType: string): string {
+        switch (annotationType) {
+            case 'GetMapping': return 'GET';
+            case 'PostMapping': return 'POST';
+            case 'PutMapping': return 'PUT';
+            case 'DeleteMapping': return 'DELETE';
+            case 'PatchMapping': return 'PATCH';
+            case 'RequestMapping': return 'GET'; // Default
+            default: return 'GET';
         }
     }
 
@@ -444,6 +641,171 @@ export class ASTManager {
         return { 
             imports: [...new Set(imports)], 
             exports: [...new Set(exports)] 
+        };
+    }
+
+    // Spring Boot specific methods
+    public findSpringComponents(): ASTNode[] {
+        const results: ASTNode[] = [];
+        
+        for (const fileAST of this.fileASTs.values()) {
+            // Only check Java files
+            if (!fileAST.filePath.endsWith('.java')) {
+                continue;
+            }
+            
+            for (const node of fileAST.allNodes.values()) {
+                if (node.isSpringComponent) {
+                    results.push(node);
+                }
+            }
+        }
+        
+        return results;
+    }
+
+    public findControllers(): ASTNode[] {
+        return this.findNodesBySpringAnnotation(['Controller', 'RestController']);
+    }
+
+    public findServices(): ASTNode[] {
+        return this.findNodesBySpringAnnotation(['Service']);
+    }
+
+    public findRepositories(): ASTNode[] {
+        return this.findNodesBySpringAnnotation(['Repository']);
+    }
+
+    public findEntities(): ASTNode[] {
+        return this.findNodesBySpringAnnotation(['Entity']);
+    }
+
+    public findRequestMappings(): Array<{ node: ASTNode, mapping: RequestMapping }> {
+        const results: Array<{ node: ASTNode, mapping: RequestMapping }> = [];
+        
+        for (const fileAST of this.fileASTs.values()) {
+            if (!fileAST.filePath.endsWith('.java')) {
+                continue;
+            }
+            
+            for (const node of fileAST.allNodes.values()) {
+                if (node.requestMappings && node.requestMappings.length > 0) {
+                    for (const mapping of node.requestMappings) {
+                        results.push({ node, mapping });
+                    }
+                }
+            }
+        }
+        
+        return results;
+    }
+
+    private findNodesBySpringAnnotation(annotationNames: string[]): ASTNode[] {
+        const results: ASTNode[] = [];
+        
+        for (const fileAST of this.fileASTs.values()) {
+            if (!fileAST.filePath.endsWith('.java')) {
+                continue;
+            }
+            
+            for (const node of fileAST.allNodes.values()) {
+                if (node.springAnnotations) {
+                    for (const annotation of node.springAnnotations) {
+                        if (annotationNames.includes(annotation.name)) {
+                            results.push(node);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return results;
+    }
+
+    public getSpringBootConfiguration(): {
+        components: number;
+        controllers: number;
+        services: number;
+        repositories: number;
+        entities: number;
+        endpoints: number;
+    } {
+        const components = this.findSpringComponents().length;
+        const controllers = this.findControllers().length;
+        const services = this.findServices().length;
+        const repositories = this.findRepositories().length;
+        const entities = this.findEntities().length;
+        const endpoints = this.findRequestMappings().length;
+
+        return {
+            components,
+            controllers,
+            services,
+            repositories,
+            entities,
+            endpoints
+        };
+    }
+
+    public findSpringBootMainClass(): ASTNode | undefined {
+        for (const fileAST of this.fileASTs.values()) {
+            if (!fileAST.filePath.endsWith('.java')) {
+                continue;
+            }
+            
+            for (const node of fileAST.allNodes.values()) {
+                if (node.springAnnotations) {
+                    for (const annotation of node.springAnnotations) {
+                        if (annotation.name === 'SpringBootApplication') {
+                            return node;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return undefined;
+    }
+
+    public analyzeSpringBootProject(): {
+        mainClass?: ASTNode;
+        configuration: ReturnType<ASTManager['getSpringBootConfiguration']>;
+        packageStructure: { [packageName: string]: number };
+        dependencies: string[];
+    } {
+        const mainClass = this.findSpringBootMainClass();
+        const configuration = this.getSpringBootConfiguration();
+        const packageStructure: { [packageName: string]: number } = {};
+        const dependencies = new Set<string>();
+
+        for (const fileAST of this.fileASTs.values()) {
+            if (!fileAST.filePath.endsWith('.java')) {
+                continue;
+            }
+            
+            for (const node of fileAST.allNodes.values()) {
+                // Count classes per package
+                if (node.packageName && node.type === 'class_declaration') {
+                    packageStructure[node.packageName] = (packageStructure[node.packageName] || 0) + 1;
+                }
+                
+                // Collect Spring dependencies
+                if (node.imports) {
+                    for (const imp of node.imports) {
+                        if (imp.startsWith('org.springframework') || imp.startsWith('jakarta.') || imp.startsWith('javax.')) {
+                            dependencies.add(imp);
+                        }
+                    }
+                }
+            }
+        }
+
+        return {
+            mainClass,
+            configuration,
+            packageStructure,
+            dependencies: Array.from(dependencies)
         };
     }
 
