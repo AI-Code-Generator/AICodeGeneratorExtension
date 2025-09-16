@@ -46,7 +46,10 @@ export const bulkState = {
 export async function initializeEmbedder() {
     if (!embedder) {
         const { pipeline } = await import('@huggingface/transformers');
-        embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5');
+        embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5', {
+            dtype: 'fp32',
+            device: 'cpu'
+        });
     }
 }
 
@@ -282,7 +285,26 @@ export async function embedText(text: string): Promise<number[]> {
         throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
     }
 
-    const output = await embedder(text, {
+    // Add task prefix required by nomic-embed-text-v1.5
+    const prefixedText = `search_document: ${text}`;
+
+    const output = await embedder(prefixedText, {
+        pooling: "mean",
+        normalize: true
+    });
+
+    const embeddings = Array.from(output[0].data) as number[];
+    return embeddings;
+}
+
+// Embed a user query using the query-specific task prefix to match document embeddings
+export async function embedQuery(query: string): Promise<number[]> {
+    if (!embedder) {
+        throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
+    }
+
+    const prefixedText = `search_query: ${query}`;
+    const output = await embedder(prefixedText, {
         pooling: "mean",
         normalize: true
     });
@@ -551,7 +573,8 @@ export async function similaritySearch(text: string, limit: number = 8): Promise
 
     try {
         await initializeEmbedder();
-        const embeddedText = await embedText(text);
+        // Use query embedding prefix for search queries
+        const embeddedText = await embedQuery(text);
 
         const results = await state.table
             .vectorSearch(embeddedText)
