@@ -30,6 +30,8 @@ const LANCEDB_TABLE_NAME = 'code_chunks';
 const FILE_TRACKING_TABLE = 'file_tracking';
 let STORAGEPATH: any = null;
 let CURRENT_PROJECT_KEY: string | null = null;
+// Conservative char cap for embedder input (~8k tokens headroom)
+const MAX_EMBED_INPUT_CHARS = 4000;
 
 export const state = {
     db: null as lancedb.Connection | null,
@@ -286,7 +288,8 @@ export async function embedText(text: string): Promise<number[]> {
     }
 
     // Add task prefix required by nomic-embed-text-v1.5
-    const prefixedText = `search_document: ${text}`;
+    const safeText = text.length > MAX_EMBED_INPUT_CHARS ? text.slice(0, MAX_EMBED_INPUT_CHARS) : text;
+    const prefixedText = `search_document: ${safeText}`;
 
     const output = await embedder(prefixedText, {
         pooling: "mean",
@@ -303,7 +306,8 @@ export async function embedQuery(query: string): Promise<number[]> {
         throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
     }
 
-    const prefixedText = `search_query: ${query}`;
+    const safeQuery = query.length > MAX_EMBED_INPUT_CHARS ? query.slice(0, MAX_EMBED_INPUT_CHARS) : query;
+    const prefixedText = `search_query: ${safeQuery}`;
     const output = await embedder(prefixedText, {
         pooling: "mean",
         normalize: true

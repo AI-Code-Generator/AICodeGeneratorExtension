@@ -20,6 +20,8 @@ export interface CodeChunk {
 
 export class CodeParser {
     private static parsers: Map<string, Parser> = new Map();
+    // Conservative char cap to keep inputs within typical embedder limits (~8k tokens)
+    private static readonly MAX_CHARS_PER_CHUNK = 4000;
 
     private static initializeParser(fileExtension: string): Parser | null {
         const parser = new Parser();
@@ -232,11 +234,12 @@ export class CodeParser {
             }
         };
 
-        traverse(tree.rootNode);
+    traverse(tree.rootNode);
 
-        // Add any remaining unprocessed code at the end
-        addUnprocessedCode(lastProcessedIndex, content.length);
-        return chunks;
+    // Add any remaining unprocessed code at the end
+    addUnprocessedCode(lastProcessedIndex, content.length);
+    // Enforce max char size per chunk
+    return this.applyCharLimit(chunks);
     }
 
     private static extractJavaMetadata(chunk: CodeChunk, node: any, content: string, tree: any): void {
@@ -389,6 +392,78 @@ export class CodeParser {
             }
         }
 
-        return chunks;
-}
+        // Enforce max char size per chunk
+        return this.applyCharLimit(chunks);
+    }
+
+    // Split oversized chunks on newline boundaries (and mid-line if needed),
+    // preserving start/end lines and metadata.
+    private static applyCharLimit(chunks: CodeChunk[]): CodeChunk[] {
+        const result: CodeChunk[] = [];
+        for (const chunk of chunks) {
+            if (!chunk.content || chunk.content.length <= this.MAX_CHARS_PER_CHUNK) {
+                result.push(chunk);
+                continue;
+            }
+
+            const lines = chunk.content.split('\n');
+            let startLineAbs = chunk.startLine;
+            let i = 0;
+            while (i < lines.length) {
+                let accChars = 0;
+                const startIdx = i;
+                const pieceLines: string[] = [];
+
+                while (i < lines.length) {
+                    const line = lines[i];
+                    const extra = pieceLines.length > 0 ? 1 : 0; // account for newline between joined lines
+                    if (accChars + extra + line.length <= this.MAX_CHARS_PER_CHUNK) {
+                        accChars += extra + line.length;
+                        pieceLines.push(line);
+                        i++;
+                    } else {
+                        // If a single line is longer than the cap, split the line itself
+                        if (pieceLines.length === 0 && line.length > this.MAX_CHARS_PER_CHUNK) {
+                            const segment = line.slice(0, this.MAX_CHARS_PER_CHUNK);
+                            // push this segment as its own chunk with same start/end line
+                            result.push({
+                                content: segment,
+                                type: chunk.type,
+                                startLine: startLineAbs,
+                                endLine: startLineAbs,
+                                packageName: chunk.packageName,
+                                className: chunk.className,
+                                methodName: chunk.methodName,
+                                annotations: chunk.annotations,
+                                isSpringComponent: chunk.isSpringComponent
+                            });
+                            // mutate current line to remaining content and continue
+                            lines[i] = line.slice(this.MAX_CHARS_PER_CHUNK);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                if (pieceLines.length > 0) {
+                    const piece = pieceLines.join('\n');
+                    const pieceStart = startLineAbs;
+                    const pieceEnd = pieceStart + (i - startIdx) - 1;
+                    result.push({
+                        content: piece,
+                        type: chunk.type,
+                        startLine: pieceStart,
+                        endLine: Math.max(pieceStart, pieceEnd),
+                        packageName: chunk.packageName,
+                        className: chunk.className,
+                        methodName: chunk.methodName,
+                        annotations: chunk.annotations,
+                        isSpringComponent: chunk.isSpringComponent
+                    });
+                    startLineAbs = pieceEnd + 1;
+                }
+            }
+        }
+        return result;
+    }
 }
