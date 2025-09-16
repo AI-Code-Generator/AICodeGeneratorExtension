@@ -290,25 +290,60 @@ export class CodeParser {
     }
 
     private static fallbackChunking(content: string): CodeChunk[] {
-        const lines = content.split('\n');
-        const chunks: CodeChunk[] = [];
-        let currentChunk = '';
-        let startLine = 1;
+        if (!content) { return []; }
 
-        for (let i = 0; i < lines.length; i++) {
-            currentChunk += lines[i] + '\n';
-            if ((i + 1) % 50 === 0 || i === lines.length - 1) {
+        // Pre-compute all newline positions in one pass
+        const newlinePositions: number[] = [];
+        for (let i = 0; i < content.length; i++) {
+            if (content.charCodeAt(i) === 10) { // '\n'
+                newlinePositions.push(i);
+            }
+        }
+
+        const totalLines = newlinePositions.length + 1;
+        const linesPerChunk = totalLines > 1000 ? Math.ceil(totalLines / 20) : 50;
+        
+        const chunks: CodeChunk[] = [];
+        let currentLine = 1;
+        let chunkStartPos = 0;
+
+        // Now we can jump directly between newlines!
+        for (let i = 0; i < newlinePositions.length; i += linesPerChunk) {
+            const endLineIndex = Math.min(i + linesPerChunk - 1, newlinePositions.length - 1);
+            const chunkEndPos = i + linesPerChunk - 1 < newlinePositions.length 
+                ? newlinePositions[endLineIndex] + 1  // Include the newline
+                : content.length;                     // Last chunk goes to end
+
+            const chunkContent = content.slice(chunkStartPos, chunkEndPos).trim();
+            
+            if (chunkContent) {
+                const linesInChunk = endLineIndex - i + 1;
                 chunks.push({
-                    content: currentChunk.trim(),
+                    content: chunkContent,
                     type: 'fallback',
-                    startLine: startLine,
-                    endLine: i + 1
+                    startLine: currentLine,
+                    endLine: currentLine + linesInChunk - 1
                 });
-                currentChunk = '';
-                startLine = i + 2;
+                
+                currentLine += linesInChunk;
+            }
+
+            chunkStartPos = chunkEndPos;
+        }
+
+        // Handle final chunk if content doesn't end with newline
+        if (chunkStartPos < content.length) {
+            const chunkContent = content.slice(chunkStartPos).trim();
+            if (chunkContent) {
+                chunks.push({
+                    content: chunkContent,
+                    type: 'fallback',
+                    startLine: currentLine,
+                    endLine: currentLine
+                });
             }
         }
 
         return chunks;
-    }
+}
 }
