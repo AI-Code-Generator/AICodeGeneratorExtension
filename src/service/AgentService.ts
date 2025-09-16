@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { DiffManager } from './DiffManager';
-import { state, initializeEmbedder, embedText } from './FileIndexer';
+import { state, initializeEmbedder, embedText, embedQuery } from './FileIndexer';
 
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
@@ -491,7 +491,7 @@ class ToolBox {
 
         try {
             await initializeEmbedder();
-            const embedding = await embedText(query);
+            const embedding = await embedQuery(query);
             const results = await state.table.vectorSearch(embedding).limit(limit).toArray();
             return results.map(result => ({
                 filePath: result.filePath,
