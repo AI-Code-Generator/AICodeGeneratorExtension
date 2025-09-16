@@ -25,7 +25,9 @@ interface CodeChunkMetadata {
 }
 
 let embedder: any = null;
-const EMBEDDING_DIM = 768;
+// MiniLM (all-MiniLM-L6-v2) outputs 384-d embeddings
+const EMBEDDING_DIM = 384;
+// Use a dimensioned table name to avoid schema conflicts when switching models
 const LANCEDB_TABLE_NAME = 'code_chunks';
 const FILE_TRACKING_TABLE = 'file_tracking';
 let STORAGEPATH: any = null;
@@ -48,7 +50,8 @@ export const bulkState = {
 export async function initializeEmbedder() {
     if (!embedder) {
         const { pipeline } = await import('@huggingface/transformers');
-        embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5', {
+    // Switch to MiniLM (Transformers.js compatible model id)
+    embedder = await pipeline('feature-extraction', 'sentence-transformers/all-MiniLM-L6-v2', {
             dtype: 'fp32',
             device: 'cpu'
         });
@@ -287,11 +290,10 @@ export async function embedText(text: string): Promise<number[]> {
         throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
     }
 
-    // Add task prefix required by nomic-embed-text-v1.5
+    // Trim overly long inputs; MiniLM doesn't require a task prefix
     const safeText = text.length > MAX_EMBED_INPUT_CHARS ? text.slice(0, MAX_EMBED_INPUT_CHARS) : text;
-    const prefixedText = `search_document: ${safeText}`;
 
-    const output = await embedder(prefixedText, {
+    const output = await embedder(safeText, {
         pooling: "mean",
         normalize: true
     });
@@ -307,8 +309,8 @@ export async function embedQuery(query: string): Promise<number[]> {
     }
 
     const safeQuery = query.length > MAX_EMBED_INPUT_CHARS ? query.slice(0, MAX_EMBED_INPUT_CHARS) : query;
-    const prefixedText = `search_query: ${safeQuery}`;
-    const output = await embedder(prefixedText, {
+    
+    const output = await embedder(safeQuery, {
         pooling: "mean",
         normalize: true
     });
