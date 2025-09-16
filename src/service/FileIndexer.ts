@@ -129,10 +129,10 @@ const EXCLUDED_EXTENSIONS = new Set([
     '.zip', '.tar', '.gz', '.rar', '.7z'
 ]);
 
+// 'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
 // File names to exclude (regardless of extension)
 const EXCLUDED_FILENAMES = new Set([
     'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
-    'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
     'LICENSE', 'CHANGELOG', 'AUTHORS', 'CONTRIBUTORS',
     'Makefile', 'Rakefile', 'Gemfile', 'Procfile',
     '.DS_Store', 'Thumbs.db'
