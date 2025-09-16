@@ -297,7 +297,7 @@ export class CodeParser {
 
         for (let i = 0; i < lines.length; i++) {
             currentChunk += lines[i] + '\n';
-            if ((i + 1) % 3 === 0 || i === lines.length - 1) {
+            if ((i + 1) % 50 === 0 || i === lines.length - 1) {
                 chunks.push({
                     content: currentChunk.trim(),
                     type: 'fallback',
