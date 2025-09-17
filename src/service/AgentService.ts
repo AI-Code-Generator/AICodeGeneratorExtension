@@ -57,17 +57,20 @@ class ToolBox {
         }
 
         // Stop terminal if present
-        if (this.terminal && !this.terminal.exitStatus) {
-            try {
-                // Send Ctrl+C twice to gracefully terminate any running process
-                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
-                await new Promise((r) => setTimeout(r, 300));
-                this.terminal.sendText('\x03', false);
-                await new Promise((r) => setTimeout(r, 300));
-            } catch { /* ignore */ }
-            try { 
-                this.terminal.dispose(); 
-            } catch { /* ignore */ }
+        if (this.terminal) {
+            if (!this.terminal.exitStatus) {
+                try {
+                    // Send Ctrl+C twice to gracefully terminate any running process
+                    this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                    await new Promise((r) => setTimeout(r, 300));
+                    this.terminal.sendText('\x03', false);
+                    await new Promise((r) => setTimeout(r, 300));
+                } catch { /* ignore */ }
+                try {
+                    this.terminal.dispose();
+                } catch { /* ignore */ }
+            }
+            // In all cases, clear the stale reference so a fresh terminal can be created next time
             this.terminal = undefined;
         }
     }
@@ -380,9 +383,9 @@ class ToolBox {
         // First, ensure any running process is stopped
         await this.killRunningTerminalProcess();
         
-        // Create a new terminal or use existing one
-        const term = this.terminal || (this.terminal = vscode.window.createTerminal('AI Code Assistant'));
-        
+    // Create a new terminal or use existing one (recreate if previously closed)
+        const term = this.ensureTerminal();
+            
         // Make sure we're in the right directory
         if (this.workingDirectory) {
             await new Promise<void>(resolve => {
