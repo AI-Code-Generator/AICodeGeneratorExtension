@@ -57,17 +57,20 @@ class ToolBox {
         }
 
         // Stop terminal if present
-        if (this.terminal && !this.terminal.exitStatus) {
-            try {
-                // Send Ctrl+C twice to gracefully terminate any running process
-                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
-                await new Promise((r) => setTimeout(r, 300));
-                this.terminal.sendText('\x03', false);
-                await new Promise((r) => setTimeout(r, 300));
-            } catch { /* ignore */ }
-            try { 
-                this.terminal.dispose(); 
-            } catch { /* ignore */ }
+        if (this.terminal) {
+            if (!this.terminal.exitStatus) {
+                try {
+                    // Send Ctrl+C twice to gracefully terminate any running process
+                    this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                    await new Promise((r) => setTimeout(r, 300));
+                    this.terminal.sendText('\x03', false);
+                    await new Promise((r) => setTimeout(r, 300));
+                } catch { /* ignore */ }
+                try {
+                    this.terminal.dispose();
+                } catch { /* ignore */ }
+            }
+            // In all cases, clear the stale reference so a fresh terminal can be created next time
             this.terminal = undefined;
         }
     }
@@ -380,9 +383,9 @@ class ToolBox {
         // First, ensure any running process is stopped
         await this.killRunningTerminalProcess();
         
-        // Create a new terminal or use existing one
-        const term = this.terminal || (this.terminal = vscode.window.createTerminal('AI Code Assistant'));
-        
+    // Create a new terminal or use existing one (recreate if previously closed)
+        const term = this.ensureTerminal();
+            
         // Make sure we're in the right directory
         if (this.workingDirectory) {
             await new Promise<void>(resolve => {
@@ -549,8 +552,9 @@ export class AgentService {
     private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string) {
         // If this is the first eviction, show it directly as the previous thought summary without calling the endpoint.
         if (!this.summarizedArchive) {
-            this.summarizedArchive = evicted;
-            sendUpdate('[ThoughtSummary] Initialized Previous Thought Summary with first evicted thought.');
+            this.summarizedArchive = `[*] ${evicted}`;
+            // Quiet UI: log to console instead of UI
+            console.log('[ThoughtSummary] Initialized rolling summary with first evicted thought.');
             return;
         }
 
@@ -558,28 +562,13 @@ export class AgentService {
         if (this.pendingSummaryTimeout) {
             clearTimeout(this.pendingSummaryTimeout);
         }
-        const payloadSummaryBefore = this.summarizedArchive;
-        const toSummarize = `Existing Summary (keep concise):\n${payloadSummaryBefore}\n\nEvicted Thought:\n${evicted}`;
-        try {
-            const prompt = `You are a summarizer maintaining a rolling concise summary of an agent's prior reasoning. Update the EXISTING summary by integrating the Evicted Thought.\n- Keep the summary focused on key decisions, constraints, unresolved items, and next actions.\n- Do not include information about current recent thoughts.\n- Limit to ~12 bullets or short paragraphs.\n\n${toSummarize}`;
-            sendUpdate(`[ThoughtSummary] Updating rolling summary with new evicted thought (${evicted.length} chars).`);
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
-            if (!resp.ok) {
-                sendUpdate(`[ThoughtSummary] Summarization request failed status ${resp.status}`);
-                return;
-            }
-            const jr = await resp.json();
-            let text: string = jr.response || '';
-            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
-            if (match && match[1]) { text = match[1]; }
-            this.summarizedArchive = text.trim();
-            sendUpdate(`[ThoughtSummary] New summary length ${this.summarizedArchive.length}`);
-            // If the rolling summary itself grows too large, ask for a shorter version.
-            if (this.summarizedArchive.length > 2000) {
-                await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
-            }
-        } catch (e: any) {
-            sendUpdate(`[ThoughtSummary] Error ${e.message}`);
+        // Append the evicted thought directly without summarizing
+        const needsNewline = this.summarizedArchive.length > 0 && !this.summarizedArchive.endsWith('\n');
+        this.summarizedArchive += `${needsNewline ? '\n' : ''}[*] ${evicted}`;
+        console.log(`[ThoughtSummary] Appended evicted thought. Summary length ${this.summarizedArchive.length}`);
+        // If the rolling summary itself grows too large, ask for a shorter version.
+        if (this.summarizedArchive.length > 10000) {
+            await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
         }
     }
 
@@ -589,10 +578,10 @@ export class AgentService {
         try {
             this.summarizing = true;
             const prompt = `Shorten the following rolling summary to ~1200 characters while preserving all key decisions, constraints, unresolved items, and next actions. Use compact bullets or short paragraphs.\n\n${this.summarizedArchive}`;
-            sendUpdate('[ThoughtSummary] Shortening rolling summary (too long).');
+            console.log('[ThoughtSummary] Shortening rolling summary (too long).');
             const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
             if (!resp.ok) {
-                sendUpdate(`[ThoughtSummary] Shorten request failed status ${resp.status}`);
+                console.warn(`[ThoughtSummary] Shorten request failed status ${resp.status}`);
                 return;
             }
             const jr = await resp.json();
@@ -600,9 +589,9 @@ export class AgentService {
             const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
             if (match && match[1]) { text = match[1]; }
             this.summarizedArchive = text.trim();
-            sendUpdate(`[ThoughtSummary] Shortened summary length ${this.summarizedArchive.length}`);
+            console.log(`[ThoughtSummary] Shortened summary length ${this.summarizedArchive.length}`);
         } catch (e: any) {
-            sendUpdate(`[ThoughtSummary] Error while shortening: ${e.message}`);
+            console.warn(`[ThoughtSummary] Error while shortening: ${e.message}`);
         } finally {
             this.summarizing = false;
         }
@@ -611,10 +600,10 @@ export class AgentService {
     private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string) {
         try {
             const prompt = `Summarize the following agent thought into <= 400 characters, preserving concrete next actions, file targets, and decisions. Remove repetition.\n\n${rawThought}`;
-            sendUpdate(`[Thoughts] Summarizing the thought output`);
+            console.log(`[Thoughts] Summarizing the thought output`);
             const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
             if (!resp.ok) {
-                sendUpdate(`[Thoughts] Thought summarization failed with status ${resp.status}`);
+                console.warn(`[Thoughts] Thought summarization failed with status ${resp.status}`);
                 return;
             }
             const jr = await resp.json();
@@ -624,7 +613,7 @@ export class AgentService {
             const condensed = text.trim();
             return condensed;
         } catch (e: any) {
-            sendUpdate(`[Thoughts] Error summarizing long thought: ${e.message}`);
+            console.warn(`[Thoughts] Error summarizing long thought: ${e.message}`);
             return rawThought;
         }
     }
@@ -639,13 +628,13 @@ export class AgentService {
         // If same as the most recent stored thought, skip to avoid repetition noise
         const last = this.recentThoughts[this.recentThoughts.length - 1];
         if (last && this.normalizeThought(last) === norm) {
-            sendUpdate('[Thoughts] Skipping duplicate consecutive thought.');
+            // Quiet UI: skip duplicate without notifying UI
             return;
         }
         // If the thought is very long, temporarily truncate for display and kick off an async summarization
         // so the recent list gets a condensed version shortly after.
         let finalThought: any = norm;
-        const LONG_THOUGHT_THRESHOLD = 800;
+        const LONG_THOUGHT_THRESHOLD = 1000;
         const isLong = finalThought.length > LONG_THOUGHT_THRESHOLD;
         if (isLong) {
             finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl);
@@ -663,8 +652,8 @@ export class AgentService {
     }
 
     private buildThoughtSections() {
-        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
-        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
+        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n<recentModelThoughts>\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}\n</recentModelThoughts>` : 'Recent Model Thoughts: \n<recentModelThoughts>(none yet)</recentModelThoughts>';
+        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n<previousThoughtSummary>\n${this.summarizedArchive}\n</previousThoughtSummary>\n` : '';
         return { thoughtsSection, archiveSummarySection };
     }
 
@@ -673,9 +662,8 @@ export class AgentService {
     }
 
     public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void) {
-        sendUpdate(`[AgentService] Starting processRequest with serverUrl: ${serverUrl}`);
-        sendUpdate(`[AgentService] Working directory: ${this.toolbox.getWorkingDirectory() || 'Not set'}`);
-        sendUpdate(`[AgentService] Prompt length: ${prompt.length} characters`);
+        // Quiet UI: no initial debug to UI; log minimal info to console
+        console.log(`[AgentService] processRequest start. WD=${this.toolbox.getWorkingDirectory() || 'Not set'} promptLen=${prompt.length}`);
         this.shouldStop = false;
         let history: { action: string, result: any }[] = [];
         const maxSteps = 60;
@@ -685,20 +673,18 @@ export class AgentService {
         let isFirstStep = true;
         for (let i = 0; i < maxSteps; i++) {
             if (this.shouldStop) {
-                sendUpdate("Agent stopped by user.");
+                sendUpdate("❌ Stopped by user.");
                 return;
             }
             if(isFirstStep) {
                 this.recentThoughts = [];
                 this.summarizedArchive = '';
             }
-            sendUpdate(`## Step ${i + 1}`);
+            console.log(`[Agent] Step ${i + 1}`);
             const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
             await this.recordThought(thought, sendUpdate, serverUrl);
-            // Removed earlier manual duplicate push of thought.
-            sendUpdate(`Step ${i + 1} result - tool: ${tool}, args: ${JSON.stringify(args)}, thought: ${thought}`);
             if (this.shouldStop) {
-                sendUpdate("Agent stopped by user.");
+                sendUpdate("❌ Stopped by user.");
                 return;
             }
             if (isFirstStep) {
@@ -706,47 +692,45 @@ export class AgentService {
                 // After first step, switch to continuation instruction while retaining originalPrompt separately.
                 currentInstruction = "Continue with the next step based on the history to complete the original request.";
             }
-            if (thought) {
-                sendUpdate(`Thought: ${thought}`);
-            }
             if (tool === 'finish') {
-                sendUpdate(`**Agent finished: ${args[0]}**`);
+                sendUpdate(`✅ Done: ${args[0]}`);
                 return;
             }
             if (tool === 'retry_with_valid_json') {
-                const errorMsg = `Model generated invalid JSON. Adding error to history and retrying.`;
-                sendUpdate(errorMsg);
                 history.push({ action: `invalid_json_response`, result: args[0] });
                 continue; // retry loop
             }
             const availableTools = this.getToolDefinitions();
             const availableToolNames = availableTools.map(t => t.name);
-            sendUpdate(`Available tools: ${availableToolNames.join(', ')}`);
-            sendUpdate(`Checking tool: ${tool}`);
             if (!availableToolNames.includes(tool) && !(this.toolbox as any)[tool]) {
-                const errorMsg = `Error: Model tried to use an unknown tool: ${tool}. Available tools: ${availableToolNames.join(', ')}`;
-                sendUpdate(errorMsg);
+                const errorMsg = `Unknown tool: ${tool}`;
+                sendUpdate(`❌ ${errorMsg}`);
                 history.push({ action: `unknown_tool(${tool})`, result: errorMsg });
                 continue;
             }
-            sendUpdate(`Action: ${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`);
-            sendUpdate(`Executing tool: ${tool} with args: ${JSON.stringify(args)}`);
-            sendUpdate(`Toolbox method exists: ${typeof (this.toolbox as any)[tool]}`);
+
+            const { startMsg, doneMsg } = this.getToolMessages(tool, args, availableTools);
+            if (startMsg) {
+                sendUpdate(`⏳ ${startMsg}`);
+            }
             try {
                 // @ts-ignore
                 const result = await this.toolbox[tool](...args);
-                let resultString = JSON.stringify(result, null, 2);
-                sendUpdate(`Tool ${tool} executed successfully`);
-                sendUpdate(`Tool ${tool} result length: ${resultString.length}`);
+                const resultString = JSON.stringify(result, null, 2);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: resultString });
-                sendUpdate(`Result: ${resultString.substring(0, 500)}${resultString.length > 500 ? '...' : ''}`);
-                sendUpdate(`Tool ${tool} result preview: ${resultString.substring(0, 200)}`);
+                if (doneMsg) {
+                    sendUpdate(`✅ ${doneMsg}`);
+                }
             } catch (error: any) {
-                const errorMessage = `Error executing tool: ${error.message}`;
-                sendUpdate(`Tool execution error at step ${i + 1}: ${error.message}`);
-                sendUpdate(`Error stack: ${error.stack}`);
+                const errorMessage = `Error executing ${tool}: ${error.message}`;
+                if (doneMsg) {
+                    sendUpdate(`❌ ${doneMsg} — ${error.message}`);
+                } else {
+                    sendUpdate(`❌ ${errorMessage}`);
+                }
+                console.warn(`Tool execution error at step ${i + 1}: ${error.message}`);
+                console.warn(error.stack);
                 history.push({ action: `${tool}(${args.map((a: any) => JSON.stringify(a)).join(', ')})`, result: errorMessage });
-                sendUpdate(errorMessage);
             }
         }
         sendUpdate("Agent stopped after reaching max steps.");
@@ -775,8 +759,8 @@ export class AgentService {
     }
 
     private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
-        sendUpdate("Asking the model for the next step...");
-        sendUpdate(`Making request to: ${serverUrl}`);
+    console.log("[AgentService] Asking the model for the next step...");
+    console.log(`[AgentService] Making request to: ${serverUrl}`);
 
         const systemPrompt = `You are an expert AI programmer agent.
 Your goal is to complete the user's ORIGINAL request: "${originalPrompt}"
@@ -855,10 +839,31 @@ Example response:
         }
 
         const { thoughtsSection, archiveSummarySection } = this.buildThoughtSections();
-        const fullPrompt = `System Prompt: ${systemPrompt}\nOriginal User Request: ${originalPrompt}\nCurrent Instruction: ${currentInstruction}\n${archiveSummarySection}\n${thoughtsSection}\nHistory:\n${JSON.stringify(truncatedHistory)}`;
+        // Build an XML-delimited prompt for more reliable parsing
+        const fullPrompt = 
+`System Prompt:
+<systemPrompt>
+${systemPrompt}
+</systemPrompt>
 
-        sendUpdate(`Full prompt length: ${fullPrompt.length} characters`);
-        sendUpdate(`History entries: ${history.length}, truncated to: ${truncatedHistory.length}`);
+Original User Request:
+<originalUserRequest>
+${originalPrompt}
+</originalUserRequest>
+
+Current Instruction:
+<currentInstruction>
+${currentInstruction}
+</currentInstruction>
+
+${archiveSummarySection}\n${thoughtsSection}
+
+Tool Call History (most recent last):
+<toolCallHistory>
+${JSON.stringify(truncatedHistory)}
+</toolCallHistory>`;
+
+    console.log(`[AgentService] Full prompt length: ${fullPrompt.length}, history: ${history.length} -> ${truncatedHistory.length}`);
 
         try {
             this.currentAbortController = new AbortController();
@@ -891,11 +896,11 @@ Example response:
             }
 
             const jsonResponse = await response.json();
-            sendUpdate(`Response JSON keys: ${Object.keys(jsonResponse)}`);
+            console.log(`[AgentService] Response JSON keys: ${Object.keys(jsonResponse)}`);
 
             // Check if server returned an error
             if (jsonResponse.error) {
-                sendUpdate(`Server returned error: ${jsonResponse.error}`);
+                console.warn(`Server returned error: ${jsonResponse.error}`);
                 return {
                     thought: "Server returned an error.",
                     tool: 'finish',
@@ -904,12 +909,11 @@ Example response:
             }
 
             let modelResponseText = jsonResponse.response;
-            sendUpdate(`Model response length: ${modelResponseText ? modelResponseText.length : 0} characters`);
-            sendUpdate(`Model response preview: ${modelResponseText ? modelResponseText.substring(0, 500) : 'No response'}...`);
+            console.log(`[AgentService] Model response length: ${modelResponseText ? modelResponseText.length : 0}`);
 
             // Check if the response field is missing
             if (!modelResponseText) {
-                sendUpdate(`Server response structure: ${JSON.stringify(jsonResponse, null, 2)}`);
+                console.warn(`[AgentService] Empty/missing response. Full: ${JSON.stringify(jsonResponse, null, 2)}`);
                 return {
                     thought: "Server returned empty or missing response field.",
                     tool: 'finish',
@@ -920,13 +924,10 @@ Example response:
             // Check if the response is wrapped in markdown code blocks
             const jsonMatch = modelResponseText.match(/```(json)?\s*([\s\S]*?)\s*```/);
             if (jsonMatch && jsonMatch[2]) {
-                sendUpdate(`Found JSON in markdown, extracting...`);
+                console.log(`Found JSON in markdown, extracting...`);
                 modelResponseText = jsonMatch[2];
-                sendUpdate(`Extracted JSON from markdown: ${modelResponseText.substring(0, 500)}...`);
             }
-            
-            sendUpdate(`Parsing JSON response...`);
-            sendUpdate(`Raw JSON to parse: ${modelResponseText.substring(0, 500)}...`);
+            console.log(`Parsing JSON response...`);
             
             let modelOutput;
             try {
@@ -957,8 +958,8 @@ Example response:
                         // Look for the JSON object boundaries and extract just that
                         const jsonStart = modelResponseText.indexOf('{');
                         const jsonEnd = modelResponseText.lastIndexOf('}');
-                        sendUpdate(`JSON parsing failed after all attempts: ${firstError.message || firstError}`);
-                        sendUpdate(`Full raw response: ${modelResponseText}`);
+                        console.warn(`JSON parsing failed after attempts: ${firstError.message || firstError}`);
+                        console.warn(`Full raw response: ${modelResponseText}`);
                         if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
                             const extractedJson = modelResponseText.substring(jsonStart, jsonEnd + 1);
                             modelOutput = JSON.parse(extractedJson);
@@ -967,7 +968,7 @@ Example response:
                         }
                     } catch (thirdError: any) {
                         const errorMessage = `Failed to parse model response as JSON. The model returned malformed text. Error: ${firstError.message || firstError}. Full response: ${modelResponseText}`;
-                        sendUpdate(`[Agent Error] (JSON parsing error) ${errorMessage}`);
+                        console.warn(`[Agent Error] (JSON parsing error) ${errorMessage}`);
                         return {
                             thought: "The last response was not valid JSON. I must correct my output format and try again.",
                             tool: 'retry_with_valid_json',
@@ -976,13 +977,11 @@ Example response:
                     }
                 }
             }
-            
-            sendUpdate(`Parsed model output keys: ${Object.keys(modelOutput)}`);
-            sendUpdate(`Model output: ${JSON.stringify(modelOutput, null, 2)}`);
+            console.log(`Parsed model output keys: ${Object.keys(modelOutput)}`);
             
             // Validate model output structure
             if (!modelOutput.tool_call) {
-                sendUpdate(`Model output missing tool_call field`);
+                console.warn(`Model output missing tool_call field`);
                 return {
                     thought: modelOutput.thought || "Model response missing tool_call",
                     tool: 'finish',
@@ -991,7 +990,7 @@ Example response:
             }
             
             if (!modelOutput.tool_call.name) {
-                sendUpdate(`Model output missing tool_call.name field`);
+                console.warn(`Model output missing tool_call.name field`);
                 return {
                     thought: modelOutput.thought || "Model response missing tool name",
                     tool: 'finish',
@@ -1001,8 +1000,7 @@ Example response:
             
             const toolName = modelOutput.tool_call.name;
             let args = modelOutput.tool_call.args;
-            
-            sendUpdate(`Tool name: ${toolName}, args type: ${typeof args}`);
+            console.log(`Tool name: ${toolName}, args type: ${typeof args}`);
 
             // Convert args from object to array based on tool definition
             if (!Array.isArray(args) && typeof args === 'object' && args !== null) {
@@ -1021,18 +1019,18 @@ Example response:
                         }
                         return value;
                     });
-                    sendUpdate(`Converted object args to array: ${JSON.stringify(args)}`);
+                    console.log(`Converted object args to array: ${JSON.stringify(args)}`);
                 } else {
                     // If no tool definition found or no args defined, convert object values to array
                     args = Object.values(args);
-                    sendUpdate(`Converted object values to array: ${JSON.stringify(args)}`);
+                    console.log(`Converted object values to array: ${JSON.stringify(args)}`);
                 }
             } else if (!Array.isArray(args)) {
                 args = [];
-                sendUpdate(`No args provided, using empty array`);
+                console.log(`No args provided, using empty array`);
             }
 
-            sendUpdate(`Final result - tool: ${toolName}, args: ${JSON.stringify(args)}, thought: ${modelOutput.thought}`);
+            console.log(`Final result - tool: ${toolName}, args: ${JSON.stringify(args)}, thought length: ${modelOutput.thought?.length || 0}`);
 
             return {
                 thought: modelOutput.thought,
@@ -1042,10 +1040,10 @@ Example response:
 
         } catch (error: any) {
             this.currentAbortController = undefined;
-            sendUpdate(`Error in getNextActionFromModel: ${error.message}`);
+            console.warn(`Error in getNextActionFromModel: ${error.message}`);
             
             if (error.name === 'AbortError') {
-                sendUpdate(`Request was aborted`);
+                console.log(`Request was aborted`);
                 return {
                     thought: "Request was stopped by user.",
                     tool: 'finish',
@@ -1053,7 +1051,7 @@ Example response:
                 };
             }
             
-            sendUpdate(`Network or parsing error: ${error.message}`);
+            console.warn(`Network or parsing error: ${error.message}`);
             return {
                 thought: "There was an error calling the model.",
                 tool: 'finish',
@@ -1061,6 +1059,62 @@ Example response:
             };
         } finally {
             this.currentAbortController = undefined;
+        }
+    }
+
+    // Map tool name/args to brief user-facing messages
+    private getToolMessages(toolName: string, args: any[], toolDefs: Array<{name: string, args?: Array<{name: string}>}>): { startMsg: string, doneMsg: string } {
+        const def = toolDefs.find(t => t.name === toolName);
+        let argMap: Record<string, any> = {};
+        if (def && Array.isArray(def.args)) {
+            argMap = def.args.reduce((acc, defArg, idx) => {
+                acc[defArg.name] = args[idx];
+                return acc;
+            }, {} as Record<string, any>);
+        }
+        const truncate = (s: any, n = 60) => (typeof s === 'string' ? (s.length > n ? s.slice(0, n) + '…' : s) : s);
+        switch (toolName) {
+            case 'read_file': {
+                const fp = argMap.filePath ?? args[0];
+                return { startMsg: `Reading file ${fp}`, doneMsg: `Read file ${fp}` };
+            }
+            case 'read_file_chunk': {
+                const fp = argMap.filePath ?? args[0];
+                const chunk = argMap.chunkNumber ?? args[1] ?? 1;
+                return { startMsg: `Reading chunk ${chunk} of ${fp}`, doneMsg: `Read chunk ${chunk} of ${fp}` };
+            }
+            case 'search_files': {
+                const p = argMap.pattern ?? args[0];
+                return { startMsg: `Searching files "${truncate(p)}"`, doneMsg: `Searched files` };
+            }
+            case 'list_files': {
+                const off = argMap.offset ?? args[0];
+                const lim = argMap.limit ?? args[1];
+                return { startMsg: `Listing files (offset ${off}, limit ${lim})`, doneMsg: `Listed files` };
+            }
+            case 'search_text': {
+                const k = argMap.keyword ?? args[0];
+                return { startMsg: `Searching text "${truncate(k)}"`, doneMsg: `Searched text` };
+            }
+            case 'search_in_file': {
+                const fp = argMap.filePath ?? args[0];
+                const k = argMap.keyword ?? args[1];
+                return { startMsg: `Searching "${truncate(k)}" in ${fp}`, doneMsg: `Searched in ${fp}` };
+            }
+            case 'apply_file_change': {
+                const fp = argMap.filePath ?? args[0];
+                return { startMsg: `Applying change to ${fp}`, doneMsg: `Applied change to ${fp}` };
+            }
+            case 'run_terminal_command': {
+                const cmd = args[0];
+                return { startMsg: `Running command: ${truncate(cmd)}`, doneMsg: `Ran command` };
+            }
+            case 'similar_search': {
+                const q = argMap.query ?? args[0];
+                return { startMsg: `Semantic search "${truncate(q)}"`, doneMsg: `Semantic search done` };
+            }
+            default:
+                return { startMsg: `Running ${toolName}`, doneMsg: `${toolName} done` };
         }
     }
 }
