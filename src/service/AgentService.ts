@@ -559,29 +559,13 @@ export class AgentService {
         if (this.pendingSummaryTimeout) {
             clearTimeout(this.pendingSummaryTimeout);
         }
-        const payloadSummaryBefore = this.summarizedArchive;
-        const toSummarize = `Existing Summary (keep concise):\n${payloadSummaryBefore}\n\nEvicted Thought:\n${evicted}`;
-        try {
-            const prompt = `You are a summarizer maintaining a rolling concise summary of an agent's prior reasoning. Update the EXISTING summary by integrating the Evicted Thought.\n- Keep the summary focused on key decisions, constraints, unresolved items, and next actions.\n- Do not include information about current recent thoughts.\n- Limit to ~12 bullets or short paragraphs.\n\n${toSummarize}`;
-            // Quiet UI: console log only
-            console.log(`[ThoughtSummary] Updating rolling summary with new evicted thought (${evicted.length} chars).`);
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
-            if (!resp.ok) {
-                console.warn(`[ThoughtSummary] Summarization request failed status ${resp.status}`);
-                return;
-            }
-            const jr = await resp.json();
-            let text: string = jr.response || '';
-            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
-            if (match && match[1]) { text = match[1]; }
-            this.summarizedArchive = text.trim();
-            console.log(`[ThoughtSummary] New summary length ${this.summarizedArchive.length}`);
-            // If the rolling summary itself grows too large, ask for a shorter version.
-            if (this.summarizedArchive.length > 2000) {
-                await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
-            }
-        } catch (e: any) {
-            console.warn(`[ThoughtSummary] Error ${e.message}`);
+        // Append the evicted thought directly without summarizing
+        const needsNewline = this.summarizedArchive.length > 0 && !this.summarizedArchive.endsWith('\n');
+        this.summarizedArchive += `${needsNewline ? '\n' : ''}${evicted}`;
+        console.log(`[ThoughtSummary] Appended evicted thought. Summary length ${this.summarizedArchive.length}`);
+        // If the rolling summary itself grows too large, ask for a shorter version.
+        if (this.summarizedArchive.length > 10000) {
+            await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
         }
     }
 
@@ -647,7 +631,7 @@ export class AgentService {
         // If the thought is very long, temporarily truncate for display and kick off an async summarization
         // so the recent list gets a condensed version shortly after.
         let finalThought: any = norm;
-        const LONG_THOUGHT_THRESHOLD = 800;
+        const LONG_THOUGHT_THRESHOLD = 1000;
         const isLong = finalThought.length > LONG_THOUGHT_THRESHOLD;
         if (isLong) {
             finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl);
