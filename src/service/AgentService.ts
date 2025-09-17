@@ -552,7 +552,7 @@ export class AgentService {
     private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string) {
         // If this is the first eviction, show it directly as the previous thought summary without calling the endpoint.
         if (!this.summarizedArchive) {
-            this.summarizedArchive = evicted;
+            this.summarizedArchive = `[*] ${evicted}`;
             // Quiet UI: log to console instead of UI
             console.log('[ThoughtSummary] Initialized rolling summary with first evicted thought.');
             return;
@@ -564,7 +564,7 @@ export class AgentService {
         }
         // Append the evicted thought directly without summarizing
         const needsNewline = this.summarizedArchive.length > 0 && !this.summarizedArchive.endsWith('\n');
-        this.summarizedArchive += `${needsNewline ? '\n' : ''}${evicted}`;
+        this.summarizedArchive += `${needsNewline ? '\n' : ''}[*] ${evicted}`;
         console.log(`[ThoughtSummary] Appended evicted thought. Summary length ${this.summarizedArchive.length}`);
         // If the rolling summary itself grows too large, ask for a shorter version.
         if (this.summarizedArchive.length > 10000) {
@@ -652,8 +652,8 @@ export class AgentService {
     }
 
     private buildThoughtSections() {
-        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}` : 'Recent Model Thoughts: (none yet)';
-        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n${this.summarizedArchive}` : '';
+        const thoughtsSection = this.recentThoughts.length ? `Recent Model Thoughts (most recent last):\n<recentModelThoughts>\n${this.recentThoughts.map((t,i)=>`[${i+1}] ${t}`).join('\n')}\n</recentModelThoughts>` : 'Recent Model Thoughts: \n<recentModelThoughts>(none yet)</recentModelThoughts>';
+        const archiveSummarySection = this.summarizedArchive ? `Previous Thought Summary:\n<previousThoughtSummary>\n${this.summarizedArchive}\n</previousThoughtSummary>\n` : '';
         return { thoughtsSection, archiveSummarySection };
     }
 
@@ -839,7 +839,29 @@ Example response:
         }
 
         const { thoughtsSection, archiveSummarySection } = this.buildThoughtSections();
-        const fullPrompt = `System Prompt: ${systemPrompt}\nOriginal User Request: ${originalPrompt}\nCurrent Instruction: ${currentInstruction}\n${archiveSummarySection}\n${thoughtsSection}\nHistory:\n${JSON.stringify(truncatedHistory)}`;
+        // Build an XML-delimited prompt for more reliable parsing
+        const fullPrompt = 
+`System Prompt:
+<systemPrompt>
+${systemPrompt}
+</systemPrompt>
+
+Original User Request:
+<originalUserRequest>
+${originalPrompt}
+</originalUserRequest>
+
+Current Instruction:
+<currentInstruction>
+${currentInstruction}
+</currentInstruction>
+
+${archiveSummarySection}\n${thoughtsSection}
+
+Tool Call History (most recent last):
+<toolCallHistory>
+${JSON.stringify(truncatedHistory)}
+</toolCallHistory>`;
 
     console.log(`[AgentService] Full prompt length: ${fullPrompt.length}, history: ${history.length} -> ${truncatedHistory.length}`);
 
