@@ -125,6 +125,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    // Dynamically choose how many similar chunks to retrieve based on project size
+    private computeSimilarityLimit(totalFiles: number): number {
+        if (totalFiles <= 0) { return 8; }
+        if (totalFiles <= 20) { return 8; }       // tiny project
+        if (totalFiles <= 50) { return 20; }       // small
+        if (totalFiles <= 100) { return 30; }     // medium-small
+        if (totalFiles <= 300) { return 40; }     // medium
+        if (totalFiles <= 600) { return 50; }     // medium-large
+        if (totalFiles <= 1000) { return 60; }    // large
+        if (totalFiles <= 2000) { return 70; }    // very large
+        return 80; // cap to avoid overloading request size
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         context: vscode.WebviewViewResolveContext,
@@ -322,8 +335,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             enhancedContext
                         );
 
-                        // Now perform similarity search with enhanced query
-                        const similarityResults = await similaritySearch(enhancedQuery);
+                        // Decide similarity retrieval limit adaptively based on project size
+                        const totalFiles = workspaceContext.filenames?.length || 0;
+                        const adaptiveLimit = this.computeSimilarityLimit(totalFiles);
+
+                        const similarityResults = await similaritySearch(enhancedQuery, adaptiveLimit);
 
                         // Transform similarity results to a compact metadata + content structure for server
                         const similarity = (similarityResults || []).map(r => ({
