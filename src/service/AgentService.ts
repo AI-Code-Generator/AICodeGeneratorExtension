@@ -823,7 +823,8 @@ CRITICAL INSTRUCTIONS:
 
 IMPORTANT: Use tools efficiently to explore codebase:
 - search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
-- list_files(offset, limit) for paginated browsing when exploring structure
+- list_files(offset, limit) for paginated browsing when exploring structure 
+- To list more files, you MUST increment the 'offset' parameter in 'list_files'. DO NOT just increase the 'limit'.
 - list_files(0, 100) gets first 100 files, list_files(100, 100) gets next 100
 - The response includes hasMore flag to indicate if there are more files
 
@@ -857,6 +858,9 @@ Example response:
 
         const MODEL_TOTAL_CONTEXT_CHARS = 500000; // Approx. 125k tokens
         const HISTORY_CHAR_BUDGET = MODEL_TOTAL_CONTEXT_CHARS - systemPrompt.length - originalPrompt.length;
+        let ENTRY_BUDGET = HISTORY_CHAR_BUDGET;
+        const FAIR_ENTRY_BUDGET = (HISTORY_CHAR_BUDGET / history.length) * 2;
+
         let currentChars = 0;
         const truncatedHistory = [];
 
@@ -866,8 +870,8 @@ Example response:
 
             // Truncate very long individual results to prevent any single entry from dominating.
             let result = entry.result;
-            if (typeof result === 'string' && result.length > 2000) {
-                result = result.substring(0, 2000) + '... [TRUNCATED - content too long]';
+            if (typeof result === 'string' && (result.length > ENTRY_BUDGET || result.length > FAIR_ENTRY_BUDGET)) {
+                result = result.substring(0, ENTRY_BUDGET) + '... [TRUNCATED - content too long]';
             }
 
             const sanitizedEntry = { action: entry.action, result: result };
@@ -882,6 +886,7 @@ Example response:
             // Add the entry to the beginning of our new array to maintain the correct order.
             truncatedHistory.unshift(sanitizedEntry);
             currentChars += entryString.length;
+            ENTRY_BUDGET -= currentChars;
         }
 
         const { thoughtsSection, archiveSummarySection } = this.buildThoughtSections();
