@@ -762,10 +762,11 @@ export class AgentService {
     console.log("[AgentService] Asking the model for the next step...");
     console.log(`[AgentService] Making request to: ${serverUrl}`);
 
-        const systemPrompt = `You are an expert AI programmer agent.
-Your goal is to complete the user's ORIGINAL request: "${originalPrompt}"
+        const showInstruction = currentInstruction.trim() !== originalPrompt.trim();
+        const currentInstructionSection = showInstruction ? currentInstruction: "This is your first iteration.";
 
-Current Step Instruction: "${currentInstruction}"
+        const systemPrompt = `You are an expert AI programmer agent.
+Your goal is to complete the user's ORIGINAL request.
 
 CRITICAL INSTRUCTIONS:
 1. You operate autonomously - make file changes immediately without asking permission
@@ -853,7 +854,7 @@ ${originalPrompt}
 
 Current Instruction:
 <currentInstruction>
-${currentInstruction}
+${currentInstructionSection}
 </currentInstruction>
 
 ${archiveSummarySection}\n${thoughtsSection}
