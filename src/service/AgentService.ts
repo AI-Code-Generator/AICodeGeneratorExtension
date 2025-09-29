@@ -618,6 +618,43 @@ export class AgentService {
         }
     }
 
+    private async summarizeOriginalPrompt(prompt: string, serverUrl: string): Promise<string> {
+        // Define the character limit for the summary and for the fallback truncation.
+        const SUMMARY_MAX_LENGTH = 50000;
+        
+        // Create a fallback response in case the summarization fails.
+        const fallbackResponse = prompt.substring(0, SUMMARY_MAX_LENGTH) + 
+                                "\n\n... [Original prompt was too long and summarization failed. The prompt has been truncated.] ...";
+        
+        if (prompt.length > 1000000) { return fallbackResponse; }
+
+        try {
+            const summarizationInstruction = `Summarize the following user request into a clear and concise objective for an AI agent. Focus on the primary goal, key constraints, and specific files or functions mentioned. The summary should be a direct command. Maximum ${SUMMARY_MAX_LENGTH} characters.\n\nOriginal Request:\n${prompt}`;
+            
+            console.log(`[AgentService] Summarizing original prompt.`);
+            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: summarizationInstruction, user_ID: '0001' }) });
+
+            if (!resp.ok) {
+                console.warn(`[AgentService] Prompt summarization failed with status ${resp.status}. Returning truncated prompt.`);
+                return fallbackResponse; // Return truncated prompt on failure
+            }
+
+            const jr = await resp.json();
+            let text: string = jr.response || '';
+            const match = text.match(/```(?:markdown|text)?\n([\s\S]*?)```/);
+            if (match && match[1]) { text = match[1]; }
+
+            const condensed = text.trim();
+            
+            // If the model returns an empty summary, also use the truncated fallback.
+            return condensed.length > 0 ? condensed : fallbackResponse;
+
+        } catch (e: any) {
+            console.warn(`[AgentService] Error summarizing original prompt: ${e.message}. Returning truncated prompt.`);
+            return fallbackResponse; // Return truncated prompt on error
+        }
+    }
+
     private normalizeThought(t: string): string {
         return t.replace(/\s+/g, ' ').trim();
     }
@@ -668,8 +705,15 @@ export class AgentService {
         let history: { action: string, result: any }[] = [];
         const maxSteps = 60;
         // Preserve the original user request for all subsequent iterations.
-        const originalPrompt = prompt;
-        let currentInstruction = prompt; // Instruction for the model (first step uses full prompt)
+        let originalPrompt = prompt;
+        
+        const PROMPT_LENGTH_THRESHOLD = 100000;
+        if (originalPrompt.length > PROMPT_LENGTH_THRESHOLD) {
+            originalPrompt = await this.summarizeOriginalPrompt(originalPrompt, serverUrl);
+        }
+
+        let currentInstruction = originalPrompt; // Instruction for the model (first step uses full prompt)
+        
         let isFirstStep = true;
         for (let i = 0; i < maxSteps; i++) {
             if (this.shouldStop) {
@@ -811,7 +855,8 @@ Example response:
     }
 }`;
 
-        const HISTORY_CHAR_BUDGET = 8000; 
+        const MODEL_TOTAL_CONTEXT_CHARS = 500000; // Approx. 125k tokens
+        const HISTORY_CHAR_BUDGET = MODEL_TOTAL_CONTEXT_CHARS - systemPrompt.length - originalPrompt.length;
         let currentChars = 0;
         const truncatedHistory = [];
 
