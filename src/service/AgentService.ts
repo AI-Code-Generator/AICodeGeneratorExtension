@@ -383,7 +383,7 @@ class ToolBox {
         // First, ensure any running process is stopped
         await this.killRunningTerminalProcess();
         
-    // Create a new terminal or use existing one (recreate if previously closed)
+        // Create a new terminal or use existing one (recreate if previously closed)
         const term = this.ensureTerminal();
             
         // Make sure we're in the right directory
@@ -399,29 +399,59 @@ class ToolBox {
         return new Promise(async (resolve) => {
             let resolved = false;
             
-            // Function to try shell integration
+            // --- MODIFIED SECTION START ---
+
+            // Function to try shell integration (Primary, more robust method)
             const tryShellIntegration = async () => {
                 if (term.shellIntegration && !resolved) {
                     try {
-                        // Execute command using shell integration
                         const execution = term.shellIntegration.executeCommand(command);
-                        
-                        // Capture output using the proper API
                         let output = '';
-                        const stream = execution.read();
-                        
-                        // Read output stream
-                        for await (const data of stream) {
-                            output += data;
-                        }
-                        
-                        if (!resolved) {
+                        let inactivityTimeout: NodeJS.Timeout;
+
+                        // Listener for when the command *truly* finishes, giving us the exit code
+                        const endListener = vscode.window.onDidEndTerminalShellExecution(event => {
+                            if (event.execution === execution) {
+                                if (resolved) return; // Already resolved by inactivity timer
+                                resolved = true;
+
+                                clearTimeout(inactivityTimeout);
+                                endListener.dispose();
+
+                                resolve({
+                                    stdout: output,
+                                    stderr: event.exitCode !== 0 ? `Command failed with exit code: ${event.exitCode}` : ''
+                                });
+                            }
+                        });
+
+                        // If output stops for a while, we assume it's a long-running process
+                        const resolveAsInactive = () => {
+                            if (resolved) return;
                             resolved = true;
+                            
+                            endListener.dispose(); // We are no longer waiting for the end
+
                             resolve({
-                                stdout: output,
-                                stderr: ''
+                                stdout: output + "\n\n[INFO] Command appears to be a long-running process. Captured initial output and detached.",
+                                stderr: ""
                             });
+                        };
+                        
+                        // Start an 8-second inactivity timer.
+                        inactivityTimeout = setTimeout(resolveAsInactive, 8000);
+
+                        const stream = execution.read();
+                        // Read the output stream
+                        for await (const data of stream) {
+                            if (resolved) break; // Stop reading if we already resolved
+                            output += data;
+                            // Reset the timer every time new output arrives
+                            clearTimeout(inactivityTimeout);
+                            inactivityTimeout = setTimeout(resolveAsInactive, 8000);
                         }
+                        
+                        // If the stream ends, the endListener will handle the final resolution.
                         return true;
                     } catch (error) {
                         console.warn('Shell integration failed:', error);
@@ -440,10 +470,9 @@ class ToolBox {
             const integrationWaitTimeout = setTimeout(async () => {
                 if (!resolved && !(await tryShellIntegration())) {
                     // Fallback: Use sendText and monitor for command completion
-                    let output = '';
+                    let output = ''; // Note: output capture is not reliable in this fallback
                     let commandCompleted = false;
                     
-                    // Listen for shell execution end events
                     const executionListener = vscode.window.onDidEndTerminalShellExecution((event) => {
                         if (event.terminal === term && !commandCompleted) {
                             commandCompleted = true;
@@ -459,20 +488,19 @@ class ToolBox {
                         }
                     });
                     
-                    // Send the command to terminal
                     term.sendText(command);
                     
-                    // Fallback timeout in case we can't detect completion
+                    // Increased timeout to 10 minutes for long-running commands like 'npm install'
                     setTimeout(() => {
                         if (!resolved && !commandCompleted) {
                             executionListener.dispose();
                             resolved = true;
                             resolve({
-                                stdout: `Command "${command}" executed in terminal. Unable to capture output automatically.`,
-                                stderr: ''
+                                stdout: `Command "${command}" executed, but completion signal was not detected after 10 minutes.`,
+                                stderr: 'Operation timed out.'
                             });
                         }
-                    }, 10000); // 10 second timeout
+                    }, 600000); // 10 minute timeout
                 }
             }, 3000);
 
@@ -484,9 +512,11 @@ class ToolBox {
                     await tryShellIntegration();
                 }
             });
+
+            // --- MODIFIED SECTION END ---
         });
     }
-
+    
     public async similar_search(query: string, limit: number = 8): Promise<object[]> {
         if (!state.table) {
             return [{ error: 'Database not initialized' }];
