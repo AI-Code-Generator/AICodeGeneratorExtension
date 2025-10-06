@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import * as lancedb from '@lancedb/lancedb';
 import { CodeParser } from './Parser';
 import * as crypto from 'crypto';
+import { EXCLUDED_DIRS } from './constants';
 
 interface FileTrackingData {
     filePath: string;
@@ -314,7 +315,7 @@ export async function embedQuery(query: string): Promise<number[]> {
     return embeddings;
 }
 
-export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = ['node_modules', '.git', 'dist', 'build']): Promise<string[]> {
+export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = EXCLUDED_DIRS): Promise<string[]> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         return [];
@@ -338,8 +339,7 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
     
     try {
         // Skip excluded directories
-        const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
-        if (isInExcludedDir(filePath, excludeDirs)) {
+        if (isInExcludedDir(filePath, EXCLUDED_DIRS)) {
             return false;
         }
 
@@ -405,8 +405,7 @@ export async function deleteSingleFile(uri: vscode.Uri, storageUri: vscode.Uri):
     const filePath = uri.fsPath;
 
     // Skip excluded directories
-    const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
-    if (isInExcludedDir(filePath, excludeDirs)) {
+    if (isInExcludedDir(filePath, EXCLUDED_DIRS)) {
         return;
     }
 

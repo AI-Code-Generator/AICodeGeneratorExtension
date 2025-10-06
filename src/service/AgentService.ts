@@ -4,6 +4,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedText, embedQuery } from './FileIndexer';
+import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
 
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
@@ -90,22 +91,28 @@ class ToolBox {
                 try {
                     const files = fs.readdirSync(dirPath);
                     
-                    files.forEach((file: string) => {
+                    for (const file of files) {
+                        // Skip excluded directories - check before processing
+                        if (EXCLUDED_DIRS.includes(file)) {
+                            continue;
+                        }
+                        
                         const fullPath = path.join(dirPath, file);
                         
-                        // Skip common directories we don't want to index
-                        if (['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'].includes(file)) {
-                            return;
+                        try {
+                            const stat = fs.statSync(fullPath);
+                            if (stat.isDirectory()) {
+                                getAllFiles(fullPath, arrayOfFiles);
+                            } else {
+                                // Return relative path from working directory
+                                const relativePath = path.relative(this.workingDirectory, fullPath);
+                                arrayOfFiles.push(relativePath);
+                            }
+                        } catch (statError) {
+                            // Skip files that can't be accessed (permissions, broken symlinks, etc.)
+                            continue;
                         }
-                        
-                        if (fs.statSync(fullPath).isDirectory()) {
-                            getAllFiles(fullPath, arrayOfFiles);
-                        } else {
-                            // Return relative path from working directory
-                            const relativePath = path.relative(this.workingDirectory, fullPath);
-                            arrayOfFiles.push(relativePath);
-                        }
-                    });
+                    }
                 } catch (error) {
                     console.error(`Error reading directory ${dirPath}:`, error);
                 }
@@ -115,8 +122,8 @@ class ToolBox {
             
             allFiles = getAllFiles(this.workingDirectory);
         } else {
-            // Find all files, ignoring .git, node_modules, and other common exclusions
-            const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
+            // Find all files, ignoring dependency folders and other common exclusions
+            const files = await vscode.workspace.findFiles('**/*', EXCLUDED_GLOB_PATTERN);
             allFiles = files.map(file => vscode.workspace.asRelativePath(file));
         }
 
@@ -144,25 +151,31 @@ class ToolBox {
                 try {
                     const files = fs.readdirSync(dirPath);
                     
-                    files.forEach((file: string) => {
+                    for (const file of files) {
+                        // Skip excluded directories - check before processing
+                        if (EXCLUDED_DIRS.includes(file)) {
+                            continue;
+                        }
+                        
                         const fullPath = path.join(dirPath, file);
                         
-                        // Skip common directories we don't want to index
-                        if (['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'].includes(file)) {
-                            return;
-                        }
-                        
-                        if (fs.statSync(fullPath).isDirectory()) {
-                            searchFiles(fullPath, pattern, arrayOfFiles);
-                        } else {
-                            const relativePath = path.relative(this.workingDirectory, fullPath);
-                            // Simple pattern matching - contains the pattern or matches file extension
-                            if (relativePath.toLowerCase().includes(pattern.toLowerCase()) || 
-                                relativePath.endsWith(pattern)) {
-                                arrayOfFiles.push(relativePath);
+                        try {
+                            const stat = fs.statSync(fullPath);
+                            if (stat.isDirectory()) {
+                                searchFiles(fullPath, pattern, arrayOfFiles);
+                            } else {
+                                const relativePath = path.relative(this.workingDirectory, fullPath);
+                                // Simple pattern matching - contains the pattern or matches file extension
+                                if (relativePath.toLowerCase().includes(pattern.toLowerCase()) || 
+                                    relativePath.endsWith(pattern)) {
+                                    arrayOfFiles.push(relativePath);
+                                }
                             }
+                        } catch (statError) {
+                            // Skip files that can't be accessed
+                            continue;
                         }
-                    });
+                    }
                 } catch (error) {
                     console.error(`Error reading directory ${dirPath}:`, error);
                 }
@@ -173,7 +186,7 @@ class ToolBox {
             return searchFiles(this.workingDirectory, pattern).slice(0, 50); // Limit to 50 results
         } else {
             // Find files using vscode
-            const files = await vscode.workspace.findFiles(`**/*${pattern}*`, '{.git,node_modules,**/__pycache__,.vscode}/**');
+            const files = await vscode.workspace.findFiles(`**/*${pattern}*`, EXCLUDED_GLOB_PATTERN);
             return files.map(file => vscode.workspace.asRelativePath(file)).slice(0, 50);
         }
     }
@@ -209,8 +222,6 @@ class ToolBox {
             }
         };
 
-        const EXCLUDES = ['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'];
-
         if (this.workingDirectory) {
             const fsSync = require('fs');
             const pathMod = require('path');
@@ -218,18 +229,23 @@ class ToolBox {
             const gatherFiles = (dirPath: string, acc: string[] = []) => {
                 try {
                     for (const entry of fsSync.readdirSync(dirPath)) {
-                        if (EXCLUDES.includes(entry)) {
+                        if (EXCLUDED_DIRS.includes(entry)) {
                             continue;
                         }
                         const full = pathMod.join(dirPath, entry);
-                        const stat = fsSync.statSync(full);
-                        if (stat.isDirectory()) {
-                            gatherFiles(full, acc);
-                        } else {
-                            acc.push(full);
-                            if (acc.length >= maxFiles) {
-                                return acc;
+                        try {
+                            const stat = fsSync.statSync(full);
+                            if (stat.isDirectory()) {
+                                gatherFiles(full, acc);
+                            } else {
+                                acc.push(full);
+                                if (acc.length >= maxFiles) {
+                                    return acc;
+                                }
                             }
+                        } catch (_) {
+                            // Skip files that can't be accessed
+                            continue;
                         }
                     }
                 } catch (_) { /* ignore */ }
@@ -251,7 +267,7 @@ class ToolBox {
             }
         } else {
             // VS Code API path
-            const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
+            const files = await vscode.workspace.findFiles('**/*', EXCLUDED_GLOB_PATTERN);
             let count = 0;
             for (const uri of files) {
                 if (count >= maxFiles) {
