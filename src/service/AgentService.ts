@@ -33,15 +33,18 @@ class ToolBox {
         const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!this.terminal || this.terminal.exitStatus) {
             this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
+            // Show terminal immediately to initialize shell integration faster
+            this.terminal.show(false);
+            console.log('[Terminal] Created new terminal, waiting for shell integration to initialize...');
         } else {
             // If cwd changed after terminal creation, send hidden cd command
             if (cwd) {
                 // Use a hidden cd command that doesn't show in terminal
                 this.terminal.sendText(`cd "${cwd.replace(/"/g, '\\"')}" > /dev/null 2>&1`);
             }
+            // Show terminal but don't steal focus
+            this.terminal.show(false);
         }
-        // Show terminal but don't steal focus, and it will open in a split view
-        this.terminal.show(false);
         return this.terminal;
     }
 
@@ -385,6 +388,23 @@ class ToolBox {
         
         // Create a new terminal or use existing one (recreate if previously closed)
         const term = this.ensureTerminal();
+        
+        // If terminal was just created, give it more time to initialize shell integration
+        if (!term.shellIntegration) {
+            console.log('[Terminal] Waiting for shell integration to initialize (new terminal)...');
+            // Wait up to 3 seconds, checking every 200ms
+            for (let i = 0; i < 15; i++) {
+                await new Promise(resolve => setTimeout(resolve, 200));
+                if (term.shellIntegration) {
+                    console.log(`[Terminal] Shell integration initialized after ${(i + 1) * 200}ms`);
+                    break;
+                }
+            }
+            
+            if (!term.shellIntegration) {
+                console.warn('[Terminal] Shell integration still not available after 3 seconds');
+            }
+        }
             
         // Make sure we're in the right directory
         if (this.workingDirectory) {
@@ -505,16 +525,26 @@ class ToolBox {
                     return;
                 }
                 
-                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length);
+                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length, 'streamReadingActive:', streamReadingActive);
                 lastShellExecutionEvent = event;
                 
-                // If we have a matching execution, resolve immediately
+                // Helper function to resolve with delay to allow stream to catch up
+                const resolveWithDelay = (delay: number = 0) => {
+                    setTimeout(() => {
+                        console.log('[Terminal] Resolving after delay. Final output length:', output.length);
+                        doResolve(
+                            output || `Command "${command}" completed.`,
+                            event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
+                        );
+                    }, delay);
+                };
+                
+                // If we have a matching execution
                 if (currentExecution && event.execution === currentExecution) {
-                    console.log('[Terminal] Exact execution match - resolving');
-                    doResolve(
-                        output,
-                        event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
-                    );
+                    console.log('[Terminal] Exact execution match - waiting for stream to finish');
+                    // If stream is still reading, give it time to finish (500ms should be enough)
+                    // If stream ended, resolve immediately
+                    resolveWithDelay(streamReadingActive ? 500 : 0);
                     return;
                 }
                 
@@ -522,20 +552,15 @@ class ToolBox {
                 // and now ANY execution ended on our terminal, it's likely our command
                 if (commandSent && shellIntegrationLost) {
                     console.log('[Terminal] Detected command completion after shell integration loss');
-                    doResolve(
-                        output || `Command "${command}" completed.`,
-                        event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
-                    );
+                    resolveWithDelay(streamReadingActive ? 500 : 0);
                     return;
                 }
                 
                 // Fallback: if command was sent (even if stream is still reading - handles Ctrl+C)
                 if (commandSent) {
                     console.log('[Terminal] Command was sent and execution ended - treating as completion');
-                    doResolve(
-                        output || `Command "${command}" completed.`,
-                        event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
-                    );
+                    // Give stream time to finish reading if it's still active
+                    resolveWithDelay(streamReadingActive ? 500 : 0);
                 }
             });
             disposables.push(endListener);
@@ -592,12 +617,15 @@ class ToolBox {
                                     break;
                                 }
                                 output += data;
-                                console.log('[Terminal] Output chunk received:', data.length, 'chars');
+                                console.log('[Terminal] Output chunk received:', data.length, 'chars, total:', output.length);
                                 resetInactivityTimer();
                             }
-                            console.log('[Terminal] Output stream ended normally');
+                            console.log('[Terminal] Output stream ended normally. Total output:', output.length, 'chars');
                             streamEnded = true;
                             streamReadingActive = false;
+                            
+                            // Give a tiny bit more time for any final output to arrive
+                            await new Promise(resolve => setTimeout(resolve, 100));
                             
                             // After stream ends, start inactivity timer
                             // If command actually finished, onDidEndTerminalShellExecution will fire
@@ -627,9 +655,9 @@ class ToolBox {
                 }
             }
 
-            // Wait for shell integration to become available (up to 5 seconds)
+            // Wait for shell integration to become available (up to 15 seconds for newly created terminals)
             let waitAttempts = 0;
-            const maxWaitAttempts = 50; // 50 * 100ms = 5 seconds
+            const maxWaitAttempts = 150; // 150 * 100ms = 15 seconds (longer wait for new terminals)
             
             const waitInterval = setInterval(async () => {
                 waitAttempts++;
@@ -641,31 +669,28 @@ class ToolBox {
                 
                 if (term.shellIntegration && !commandSent) {
                     clearInterval(waitInterval);
+                    console.log('[Terminal] Shell integration became available after', waitAttempts * 100, 'ms');
                     if (await attachToShellIntegration()) {
                         return; // Successfully started
                     }
                 }
                 
+                // Log progress every 2 seconds
+                if (waitAttempts % 20 === 0) {
+                    console.log(`[Terminal] Still waiting for shell integration... (${waitAttempts * 100}ms elapsed)`);
+                }
+                
                 // Timeout waiting for shell integration
                 if (waitAttempts >= maxWaitAttempts) {
                     clearInterval(waitInterval);
-                    console.warn('[Terminal] Shell integration not available, using fallback');
+                    console.error('[Terminal] Shell integration not available after 15 seconds');
+                    console.error('[Terminal] This is unusual - shell integration should be available in a properly configured terminal');
                     
-                    // Fallback: just send the command and monitor for completion
-                    term.sendText(command);
-                    commandSent = true;
-                    shellIntegrationLost = true; // Treat as if we lost integration
-                    resetInactivityTimer();
-                    
-                    // Set a maximum timeout
-                    setTimeout(() => {
-                        if (!resolved) {
-                            doResolve(
-                                output || `Command "${command}" sent to terminal. Shell integration unavailable for reliable output capture.`,
-                                'Warning: Could not capture output reliably'
-                            );
-                        }
-                    }, 600000); // 10 minute absolute maximum
+                    // Give up and return error
+                    doResolve(
+                        `Error: Shell integration not available after 15 seconds. This terminal may not support shell integration. Please check your terminal configuration or try closing and reopening VS Code.`,
+                        'Warning: Cannot execute commands without shell integration'
+                    );
                 }
             }, 100);
         });
