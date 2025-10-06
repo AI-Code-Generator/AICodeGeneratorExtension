@@ -519,13 +519,60 @@ class ToolBox {
                 }, MAX_INACTIVITY_TIME);
             };
 
+            // Listen for execution START events to capture subsequent commands in compound commands
+            const startListener = vscode.window.onDidStartTerminalShellExecution(event => {
+                if (event.terminal !== term || resolved) {
+                    return;
+                }
+                
+                const startedCommand = (event.execution as any)?.commandLine?.value || '';
+                console.log('[Terminal] Shell execution STARTED:', startedCommand, 'commandSent:', commandSent);
+                
+                // If we've sent a command and a new execution starts that's different from our original,
+                // this might be the second part of a compound command. Attach to its stream!
+                if (commandSent && startedCommand && startedCommand !== command) {
+                    console.log('[Terminal] Detected subsequent execution in compound command, attaching to stream...');
+                    
+                    const newStream = event.execution.read();
+                    streamReadingActive = true;
+                    
+                    (async () => {
+                        try {
+                            for await (const data of newStream) {
+                                if (resolved) {
+                                    break;
+                                }
+                                output += data;
+                                console.log('[Terminal] Output chunk from subsequent execution:', data.length, 'chars, total:', output.length);
+                                resetInactivityTimer();
+                            }
+                            console.log('[Terminal] Subsequent execution stream ended. Total output:', output.length, 'chars');
+                            streamEnded = true;
+                            streamReadingActive = false;
+                            
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                            resetInactivityTimer();
+                        } catch (error) {
+                            console.error('[Terminal] Error reading subsequent execution stream:', error);
+                            streamEnded = true;
+                            streamReadingActive = false;
+                            resetInactivityTimer();
+                        }
+                    })();
+                }
+            });
+            disposables.push(startListener);
+
             // Listen for ANY shell execution end event from our terminal
             const endListener = vscode.window.onDidEndTerminalShellExecution(event => {
                 if (event.terminal !== term) {
                     return;
                 }
                 
-                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length, 'streamReadingActive:', streamReadingActive);
+                // Get the command that finished (if available)
+                const finishedCommand = (event.execution as any)?.commandLine?.value || '';
+                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'command:', finishedCommand, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length, 'streamReadingActive:', streamReadingActive);
+                console.log('[Terminal] Event execution matches current?', event.execution === currentExecution);
                 lastShellExecutionEvent = event;
                 
                 // Helper function to resolve with delay to allow stream to catch up
@@ -539,28 +586,53 @@ class ToolBox {
                     }, delay);
                 };
                 
-                // If we have a matching execution
+                // CRITICAL: Check for partial command completion FIRST (before exact match)
+                // For compound commands (e.g., "cd folder && npm start"), shell integration reports
+                // separate executions. Ignore the "cd" part if we haven't received output yet.
+                const isPartialCommand = finishedCommand.length > 0 && 
+                                       command.includes(finishedCommand) && 
+                                       finishedCommand !== command &&
+                                       output.length === 0 &&
+                                       event.exitCode === 0; // Only ignore successful partial commands
+                
+                if (isPartialCommand && commandSent) {
+                    console.log('[Terminal] Ignoring partial command completion:', finishedCommand);
+                    return; // Don't resolve yet - wait for the actual command
+                }
+                
+                // If we have a matching execution, resolve
                 if (currentExecution && event.execution === currentExecution) {
-                    console.log('[Terminal] Exact execution match - waiting for stream to finish');
-                    // If stream is still reading, give it time to finish (500ms should be enough)
-                    // If stream ended, resolve immediately
+                    console.log('[Terminal] Exact execution match - resolving');
                     resolveWithDelay(streamReadingActive ? 500 : 0);
                     return;
                 }
                 
                 // If we sent a command but lost shell integration (terminal refresh scenario)
-                // and now ANY execution ended on our terminal, it's likely our command
                 if (commandSent && shellIntegrationLost) {
                     console.log('[Terminal] Detected command completion after shell integration loss');
                     resolveWithDelay(streamReadingActive ? 500 : 0);
                     return;
                 }
                 
-                // Fallback: if command was sent (even if stream is still reading - handles Ctrl+C)
+                // For compound commands where execution objects don't match:
+                // If we have output OR the stream has ended, this is likely our command completing
+                if (commandSent && (output.length > 0 || streamEnded)) {
+                    console.log('[Terminal] Command sent + (have output OR stream ended), treating as completion');
+                    resolveWithDelay(streamReadingActive ? 1000 : 500); // Longer delay for compound commands
+                    return;
+                }
+                
+                // If we're waiting for a command and stream is still reading, don't resolve yet
+                // This handles the case where cd completes but npm is still starting
+                if (commandSent && streamReadingActive) {
+                    console.log('[Terminal] Stream still active, waiting for output or completion...');
+                    return; // Keep waiting
+                }
+                
+                // Last fallback: any execution from our terminal when command was sent
                 if (commandSent) {
-                    console.log('[Terminal] Command was sent and execution ended - treating as completion');
-                    // Give stream time to finish reading if it's still active
-                    resolveWithDelay(streamReadingActive ? 500 : 0);
+                    console.log('[Terminal] Command was sent and execution ended (fallback)');
+                    resolveWithDelay(500);
                 }
             });
             disposables.push(endListener);
@@ -602,7 +674,9 @@ class ToolBox {
                 try {
                     currentExecution = term.shellIntegration.executeCommand(command);
                     commandSent = true;
+                    const executionCommand = (currentExecution as any)?.commandLine?.value || 'unknown';
                     console.log('[Terminal] Executing command with shell integration:', command);
+                    console.log('[Terminal] Execution object command:', executionCommand);
                     
                     resetInactivityTimer();
 
