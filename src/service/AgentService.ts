@@ -456,12 +456,13 @@ class ToolBox {
             
             // Adaptive timeout based on command type
             const MAX_INACTIVITY_TIME = cmdType === 'install' ? 10000 : // 10 seconds for install
-                                       cmdType === 'long-running' ? 8000 : // 8 seconds for servers
+                                       cmdType === 'long-running' ? 300000 : // 5 minutes for servers (keep monitoring)
                                        30000; // 30 seconds for normal commands
             
             let inactivityTimeout: NodeJS.Timeout | null = null;
             let streamEnded = false;
             let streamReadingActive = false;
+            let processDetachedMessage = false;
 
             // Reset inactivity timer
             const resetInactivityTimer = () => {
@@ -472,13 +473,15 @@ class ToolBox {
                 inactivityTimeout = setTimeout(() => {
                     console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length);
                     
-                    // For long-running commands, treat as "started successfully"
-                    if (cmdType === 'long-running' && output.length > 0) {
-                        doResolve(
-                            output + "\n\n[INFO] Long-running process started. Detached from monitoring.",
-                            ""
-                        );
-                    } else if (streamEnded || shellIntegrationLost) {
+                    // For long-running commands that are still running (stream hasn't ended)
+                    // Keep monitoring but don't resolve yet - wait for actual termination
+                    if (cmdType === 'long-running' && !streamEnded && !shellIntegrationLost) {
+                        console.log('[Terminal] Long-running process still active, continuing to monitor...');
+                        // Don't resolve - keep waiting for actual termination (Ctrl+C, exit, etc.)
+                        return;
+                    }
+                    
+                    if (streamEnded || shellIntegrationLost) {
                         // Stream ended or shell integration lost - command likely finished
                         doResolve(
                             output || `Command "${command}" completed.`,
@@ -502,11 +505,12 @@ class ToolBox {
                     return;
                 }
                 
-                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent);
+                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length);
                 lastShellExecutionEvent = event;
                 
                 // If we have a matching execution, resolve immediately
                 if (currentExecution && event.execution === currentExecution) {
+                    console.log('[Terminal] Exact execution match - resolving');
                     doResolve(
                         output,
                         event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
@@ -525,9 +529,9 @@ class ToolBox {
                     return;
                 }
                 
-                // Fallback: if command was sent and we're waiting for completion
-                if (commandSent && !streamReadingActive) {
-                    console.log('[Terminal] Fallback: treating this as our command completion');
+                // Fallback: if command was sent (even if stream is still reading - handles Ctrl+C)
+                if (commandSent) {
+                    console.log('[Terminal] Command was sent and execution ended - treating as completion');
                     doResolve(
                         output || `Command "${command}" completed.`,
                         event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
