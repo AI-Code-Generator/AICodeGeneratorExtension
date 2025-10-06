@@ -476,7 +476,7 @@ class ToolBox {
             
             // Adaptive timeout based on command type
             const MAX_INACTIVITY_TIME = cmdType === 'install' ? 10000 : // 10 seconds for install
-                                       cmdType === 'long-running' ? 300000 : // 5 minutes for servers (keep monitoring)
+                                       cmdType === 'long-running' ? 30000 : // 30 seconds for servers (then return output)
                                        30000; // 30 seconds for normal commands
             
             let inactivityTimeout: NodeJS.Timeout | null = null;
@@ -491,13 +491,16 @@ class ToolBox {
                 }
                 
                 inactivityTimeout = setTimeout(() => {
-                    console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length);
+                    console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length, 'cmdType:', cmdType);
                     
-                    // For long-running commands that are still running (stream hasn't ended)
-                    // Keep monitoring but don't resolve yet - wait for actual termination
-                    if (cmdType === 'long-running' && !streamEnded && !shellIntegrationLost) {
-                        console.log('[Terminal] Long-running process still active, continuing to monitor...');
-                        // Don't resolve - keep waiting for actual termination (Ctrl+C, exit, etc.)
+                    // For long-running commands: if we have output, return it with a detached message
+                    // The process continues running in the background, but we return what we captured
+                    if (cmdType === 'long-running' && output.length > 0) {
+                        console.log('[Terminal] Long-running process timeout - returning captured output (process continues in background)');
+                        doResolve(
+                            output + `\n\n[INFO] Long-running process started successfully. Process continues in background. Output captured: ${output.length} characters.`,
+                            ''
+                        );
                         return;
                     }
                     
