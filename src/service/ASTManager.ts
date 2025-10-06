@@ -159,6 +159,28 @@ export class ASTManager {
             return;
         }
 
+        // Skip excluded directories
+        const excludeDirs = [
+            'node_modules', '.git', 'dist', 'build', 'out',
+            'target', 'bin', '.gradle', '.mvn', 'gradle/wrapper'
+        ];
+        const normalizedPath = filePath.replace(/\\/g, '/');
+        if (excludeDirs.some(dir => normalizedPath.includes(`/${dir}/`) || normalizedPath.includes(`\\${dir}\\`))) {
+            return;
+        }
+
+        // Check if path is actually a file (not a directory)
+        try {
+            const fs = require('fs');
+            const stat = await fs.promises.stat(filePath);
+            if (stat.isDirectory()) {
+                return;
+            }
+        } catch (error) {
+            // If file doesn't exist or can't be accessed, skip it
+            return;
+        }
+
         try {
             const document = await vscode.workspace.openTextDocument(fileUri);
             const content = document.getText();
