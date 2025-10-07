@@ -447,6 +447,21 @@ class ToolBox {
                 disposables.length = 0;
             };
             
+            // Function to strip ANSI escape codes and control characters
+            const stripAnsiCodes = (text: string): string => {
+                return text
+                    // Remove ANSI escape sequences (colors, cursor movement, etc.)
+                    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+                    // Remove other escape sequences
+                    .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
+                    // Remove control characters except newline, carriage return, and tab
+                    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+                    // Clean up excessive whitespace while preserving structure
+                    .replace(/\r\n/g, '\n')  // Normalize line endings
+                    .replace(/\r/g, '\n')     // Convert remaining \r to \n
+                    .replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
+            };
+            
             // Final resolve function
             const doResolve = (stdout: string, stderr: string) => {
                 if (resolved) {
@@ -454,8 +469,13 @@ class ToolBox {
                 }
                 resolved = true;
                 cleanup();
-                console.log('[Terminal] Resolving with output length:', stdout.length);
-                resolve({ stdout, stderr });
+                
+                // Strip ANSI codes before sending to AI
+                const cleanStdout = stripAnsiCodes(stdout);
+                const cleanStderr = stripAnsiCodes(stderr);
+                
+                console.log('[Terminal] Resolving with output length:', cleanStdout.length, '(original:', stdout.length, ')');
+                resolve({ stdout: cleanStdout, stderr: cleanStderr });
             };
 
             // Detect if command is likely to be long-running (servers, watchers, etc.)
