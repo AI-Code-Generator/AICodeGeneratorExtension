@@ -150,7 +150,7 @@ const CODE_EXTENSIONS = new Set([
     '.c', '.cpp', '.h', '.hpp',
     '.cs', '.php', '.swift',
     '.html', '.css', '.scss', '.sass', '.less',
-    '.sql', '.graphql', '.gql'
+    '.sql', '.graphql', '.gql', '.txt', '.md'
 ]);
 
 function shouldIndexFile(filePath: string): boolean {
@@ -185,7 +185,7 @@ function shouldIndexFile(filePath: string): boolean {
         return codeKeywords.some(keyword => fileName.toLowerCase().includes(keyword));
     }
     
-    return false;
+    return true;
 }
 
 export async function readFilesRecursive(directory: string, excludeList: string[] = []): Promise<string[]> {
@@ -198,6 +198,7 @@ export async function readFilesRecursive(directory: string, excludeList: string[
             const fullPath = path.join(directory, file.name);
 
             if (excludeList.includes(file.name)) {
+                console.log(`Skipping excluded directory: ${fullPath}`);
                 continue;
             }
 
