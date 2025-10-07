@@ -13,6 +13,8 @@ class ToolBox {
     private workingDirectory: string = '';
     private terminal?: vscode.Terminal;
     private captureTimeout?: NodeJS.Timeout;
+    private terminalCommandCount: number = 0;
+    private readonly MAX_COMMANDS_PER_TERMINAL = 5; // Refresh terminal after 5 commands
 
     constructor() {
         this.diffManager = DiffManager.getInstance();
@@ -32,16 +34,28 @@ class ToolBox {
 
     private ensureTerminal(): vscode.Terminal {
         const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!this.terminal || this.terminal.exitStatus) {
-            // Only create a new terminal if we don't have one or it was closed
+        
+        // Check if we should refresh the terminal (too many commands executed)
+        const shouldRefresh = this.terminalCommandCount >= this.MAX_COMMANDS_PER_TERMINAL;
+        
+        if (!this.terminal || this.terminal.exitStatus || shouldRefresh) {
+            // Dispose old terminal if refreshing
+            if (shouldRefresh && this.terminal && !this.terminal.exitStatus) {
+                console.log(`[Terminal] Refreshing terminal after ${this.terminalCommandCount} commands`);
+                try {
+                    this.terminal.dispose();
+                } catch { /* ignore */ }
+                this.terminalCommandCount = 0; // Reset counter
+            }
+            
+            // Create a new terminal
             this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
             // Show terminal immediately to initialize shell integration faster
             this.terminal.show(false);
             console.log('[Terminal] Created new terminal, waiting for shell integration to initialize...');
         } else {
-            // Reusing existing terminal - don't send any cd commands here
-            // The run_terminal_command method will handle directory changes
-            console.log('[Terminal] Reusing existing terminal');
+            // Reusing existing terminal
+            console.log(`[Terminal] Reusing existing terminal (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL} commands)`);
             this.terminal.show(false);
         }
         return this.terminal;
@@ -482,6 +496,10 @@ class ToolBox {
                 }
                 resolved = true;
                 cleanup();
+                
+                // Increment command counter for terminal refresh tracking
+                this.terminalCommandCount++;
+                console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
                 
                 // Strip ANSI codes before sending to AI
                 const cleanStdout = stripAnsiCodes(stdout);
@@ -1146,7 +1164,7 @@ export class AgentService {
 
         // Include current working directory information
         const workingDirInfo = this.toolbox.getWorkingDirectory() 
-            ? `\n\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations will use paths relative to this directory\n`
+            ? `\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations will use paths relative to this directory\n`
             : '';
 
         const systemPrompt = `You are an expert AI programmer agent.
