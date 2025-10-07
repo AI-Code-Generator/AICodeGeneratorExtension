@@ -4,6 +4,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedText, embedQuery } from './FileIndexer';
+import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
 
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
@@ -12,6 +13,8 @@ class ToolBox {
     private workingDirectory: string = '';
     private terminal?: vscode.Terminal;
     private captureTimeout?: NodeJS.Timeout;
+    private terminalCommandCount: number = 0;
+    private readonly MAX_COMMANDS_PER_TERMINAL = 5; // Refresh terminal after 5 commands
 
     constructor() {
         this.diffManager = DiffManager.getInstance();
@@ -31,18 +34,28 @@ class ToolBox {
 
     private ensureTerminal(): vscode.Terminal {
         const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!this.terminal || this.terminal.exitStatus) {
+        
+        // Check if we should refresh the terminal (too many commands executed)
+        const shouldRefresh = this.terminalCommandCount >= this.MAX_COMMANDS_PER_TERMINAL;
+        
+        if (!this.terminal || this.terminal.exitStatus || shouldRefresh) {
+            // Dispose old terminal if refreshing
+            if (shouldRefresh && this.terminal && !this.terminal.exitStatus) {
+                console.log(`[Terminal] Refreshing terminal after ${this.terminalCommandCount} commands`);
+                try {
+                    this.terminal.dispose();
+                } catch { /* ignore */ }
+                this.terminalCommandCount = 0; // Reset counter
+            }
+            
+            // Create a new terminal
             this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
             // Show terminal immediately to initialize shell integration faster
             this.terminal.show(false);
             console.log('[Terminal] Created new terminal, waiting for shell integration to initialize...');
         } else {
-            // If cwd changed after terminal creation, send hidden cd command
-            if (cwd) {
-                // Use a hidden cd command that doesn't show in terminal
-                this.terminal.sendText(`cd "${cwd.replace(/"/g, '\\"')}" > /dev/null 2>&1`);
-            }
-            // Show terminal but don't steal focus
+            // Reusing existing terminal
+            console.log(`[Terminal] Reusing existing terminal (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL} commands)`);
             this.terminal.show(false);
         }
         return this.terminal;
@@ -59,23 +72,19 @@ class ToolBox {
             this.captureTimeout = undefined;
         }
 
-        // Stop terminal if present
-        if (this.terminal) {
-            if (!this.terminal.exitStatus) {
-                try {
-                    // Send Ctrl+C twice to gracefully terminate any running process
-                    this.terminal.sendText('\x03', false);  // Ctrl+C without newline
-                    await new Promise((r) => setTimeout(r, 300));
-                    this.terminal.sendText('\x03', false);
-                    await new Promise((r) => setTimeout(r, 300));
-                } catch { /* ignore */ }
-                try {
-                    this.terminal.dispose();
-                } catch { /* ignore */ }
-            }
-            // In all cases, clear the stale reference so a fresh terminal can be created next time
-            this.terminal = undefined;
+        // Only send Ctrl+C if terminal exists and is not closed
+        // DON'T dispose the terminal - we want to reuse it!
+        if (this.terminal && !this.terminal.exitStatus) {
+            try {
+                // Send Ctrl+C twice to gracefully terminate any running process
+                console.log('[Terminal] Sending Ctrl+C to stop any running process...');
+                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                await new Promise((r) => setTimeout(r, 300));
+                this.terminal.sendText('\x03', false);
+                await new Promise((r) => setTimeout(r, 300));
+            } catch { /* ignore */ }
         }
+        // Keep the terminal alive for reuse!
     }
 
     public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
@@ -90,22 +99,28 @@ class ToolBox {
                 try {
                     const files = fs.readdirSync(dirPath);
                     
-                    files.forEach((file: string) => {
+                    for (const file of files) {
+                        // Skip excluded directories - check before processing
+                        if (EXCLUDED_DIRS.includes(file)) {
+                            continue;
+                        }
+                        
                         const fullPath = path.join(dirPath, file);
                         
-                        // Skip common directories we don't want to index
-                        if (['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'].includes(file)) {
-                            return;
+                        try {
+                            const stat = fs.statSync(fullPath);
+                            if (stat.isDirectory()) {
+                                getAllFiles(fullPath, arrayOfFiles);
+                            } else {
+                                // Return relative path from working directory
+                                const relativePath = path.relative(this.workingDirectory, fullPath);
+                                arrayOfFiles.push(relativePath);
+                            }
+                        } catch (statError) {
+                            // Skip files that can't be accessed (permissions, broken symlinks, etc.)
+                            continue;
                         }
-                        
-                        if (fs.statSync(fullPath).isDirectory()) {
-                            getAllFiles(fullPath, arrayOfFiles);
-                        } else {
-                            // Return relative path from working directory
-                            const relativePath = path.relative(this.workingDirectory, fullPath);
-                            arrayOfFiles.push(relativePath);
-                        }
-                    });
+                    }
                 } catch (error) {
                     console.error(`Error reading directory ${dirPath}:`, error);
                 }
@@ -115,8 +130,8 @@ class ToolBox {
             
             allFiles = getAllFiles(this.workingDirectory);
         } else {
-            // Find all files, ignoring .git, node_modules, and other common exclusions
-            const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
+            // Find all files, ignoring dependency folders and other common exclusions
+            const files = await vscode.workspace.findFiles('**/*', EXCLUDED_GLOB_PATTERN);
             allFiles = files.map(file => vscode.workspace.asRelativePath(file));
         }
 
@@ -144,25 +159,31 @@ class ToolBox {
                 try {
                     const files = fs.readdirSync(dirPath);
                     
-                    files.forEach((file: string) => {
+                    for (const file of files) {
+                        // Skip excluded directories - check before processing
+                        if (EXCLUDED_DIRS.includes(file)) {
+                            continue;
+                        }
+                        
                         const fullPath = path.join(dirPath, file);
                         
-                        // Skip common directories we don't want to index
-                        if (['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'].includes(file)) {
-                            return;
-                        }
-                        
-                        if (fs.statSync(fullPath).isDirectory()) {
-                            searchFiles(fullPath, pattern, arrayOfFiles);
-                        } else {
-                            const relativePath = path.relative(this.workingDirectory, fullPath);
-                            // Simple pattern matching - contains the pattern or matches file extension
-                            if (relativePath.toLowerCase().includes(pattern.toLowerCase()) || 
-                                relativePath.endsWith(pattern)) {
-                                arrayOfFiles.push(relativePath);
+                        try {
+                            const stat = fs.statSync(fullPath);
+                            if (stat.isDirectory()) {
+                                searchFiles(fullPath, pattern, arrayOfFiles);
+                            } else {
+                                const relativePath = path.relative(this.workingDirectory, fullPath);
+                                // Simple pattern matching - contains the pattern or matches file extension
+                                if (relativePath.toLowerCase().includes(pattern.toLowerCase()) || 
+                                    relativePath.endsWith(pattern)) {
+                                    arrayOfFiles.push(relativePath);
+                                }
                             }
+                        } catch (statError) {
+                            // Skip files that can't be accessed
+                            continue;
                         }
-                    });
+                    }
                 } catch (error) {
                     console.error(`Error reading directory ${dirPath}:`, error);
                 }
@@ -173,7 +194,7 @@ class ToolBox {
             return searchFiles(this.workingDirectory, pattern).slice(0, 50); // Limit to 50 results
         } else {
             // Find files using vscode
-            const files = await vscode.workspace.findFiles(`**/*${pattern}*`, '{.git,node_modules,**/__pycache__,.vscode}/**');
+            const files = await vscode.workspace.findFiles(`**/*${pattern}*`, EXCLUDED_GLOB_PATTERN);
             return files.map(file => vscode.workspace.asRelativePath(file)).slice(0, 50);
         }
     }
@@ -209,8 +230,6 @@ class ToolBox {
             }
         };
 
-        const EXCLUDES = ['.git', 'node_modules', '__pycache__', '.vscode', '.pytest_cache', 'venv', '.env'];
-
         if (this.workingDirectory) {
             const fsSync = require('fs');
             const pathMod = require('path');
@@ -218,18 +237,23 @@ class ToolBox {
             const gatherFiles = (dirPath: string, acc: string[] = []) => {
                 try {
                     for (const entry of fsSync.readdirSync(dirPath)) {
-                        if (EXCLUDES.includes(entry)) {
+                        if (EXCLUDED_DIRS.includes(entry)) {
                             continue;
                         }
                         const full = pathMod.join(dirPath, entry);
-                        const stat = fsSync.statSync(full);
-                        if (stat.isDirectory()) {
-                            gatherFiles(full, acc);
-                        } else {
-                            acc.push(full);
-                            if (acc.length >= maxFiles) {
-                                return acc;
+                        try {
+                            const stat = fsSync.statSync(full);
+                            if (stat.isDirectory()) {
+                                gatherFiles(full, acc);
+                            } else {
+                                acc.push(full);
+                                if (acc.length >= maxFiles) {
+                                    return acc;
+                                }
                             }
+                        } catch (_) {
+                            // Skip files that can't be accessed
+                            continue;
                         }
                     }
                 } catch (_) { /* ignore */ }
@@ -251,7 +275,7 @@ class ToolBox {
             }
         } else {
             // VS Code API path
-            const files = await vscode.workspace.findFiles('**/*', '{.git,node_modules,**/__pycache__,.vscode}/**');
+            const files = await vscode.workspace.findFiles('**/*', EXCLUDED_GLOB_PATTERN);
             let count = 0;
             for (const uri of files) {
                 if (count >= maxFiles) {
@@ -361,7 +385,12 @@ class ToolBox {
     }
 
     public async apply_file_change(filePath: string, newContent: string): Promise<string> {
-        return await this.diffManager.applyChangeWithDiff(filePath, newContent);
+        // Convert relative path to absolute path using workingDirectory
+        const absolutePath = this.getAbsolutePath(filePath);
+        console.log('[apply_file_change] Converting path:', filePath, '→', absolutePath);
+        
+        // Pass both absolute path (for file operations) and relative path (for display)
+        return await this.diffManager.applyChangeWithDiff(absolutePath, newContent);
     }
 
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
@@ -383,13 +412,31 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // First, ensure any running process is stopped
+        // Track cd commands to update working directory
+        // This ensures we know where we are for compound commands and after terminal refreshes
+        const cdMatch = command.match(/^\s*cd\s+(.+?)(?:\s*&&|$)/);
+        if (cdMatch) {
+            let targetDir = cdMatch[1].trim();
+            // Remove quotes if present
+            targetDir = targetDir.replace(/^["']|["']$/g, '');
+            
+            // Resolve relative paths
+            if (!path.isAbsolute(targetDir)) {
+                const currentDir = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+                targetDir = path.resolve(currentDir, targetDir);
+            }
+            
+            console.log('[Terminal] Detected cd command, updating working directory to:', targetDir);
+            this.workingDirectory = targetDir;
+        }
+
+        // Stop any running process (but don't dispose terminal)
         await this.killRunningTerminalProcess();
         
-        // Create a new terminal or use existing one (recreate if previously closed)
+        // Reuse existing terminal or create new one if needed
         const term = this.ensureTerminal();
         
-        // If terminal was just created, give it more time to initialize shell integration
+        // If terminal was just created, give it time to initialize shell integration
         if (!term.shellIntegration) {
             console.log('[Terminal] Waiting for shell integration to initialize (new terminal)...');
             // Wait up to 3 seconds, checking every 200ms
@@ -405,14 +452,10 @@ class ToolBox {
                 console.warn('[Terminal] Shell integration still not available after 3 seconds');
             }
         }
-            
-        // Make sure we're in the right directory
-        if (this.workingDirectory) {
-            await new Promise<void>(resolve => {
-                term.sendText(`cd "${this.workingDirectory.replace(/"/g, '\\"')}"`, true);
-                setTimeout(resolve, 100);
-            });
-        }
+        
+        // DON'T automatically cd before every command - let commands execute naturally
+        // The terminal will stay in whatever directory the last command left it in
+        // Only the cd tracking above will update our workingDirectory variable
         
         term.show(true); // Show terminal with focus
 
@@ -431,6 +474,21 @@ class ToolBox {
                 disposables.length = 0;
             };
             
+            // Function to strip ANSI escape codes and control characters
+            const stripAnsiCodes = (text: string): string => {
+                return text
+                    // Remove ANSI escape sequences (colors, cursor movement, etc.)
+                    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+                    // Remove other escape sequences
+                    .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
+                    // Remove control characters except newline, carriage return, and tab
+                    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+                    // Clean up excessive whitespace while preserving structure
+                    .replace(/\r\n/g, '\n')  // Normalize line endings
+                    .replace(/\r/g, '\n')     // Convert remaining \r to \n
+                    .replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
+            };
+            
             // Final resolve function
             const doResolve = (stdout: string, stderr: string) => {
                 if (resolved) {
@@ -438,8 +496,17 @@ class ToolBox {
                 }
                 resolved = true;
                 cleanup();
-                console.log('[Terminal] Resolving with output length:', stdout.length);
-                resolve({ stdout, stderr });
+                
+                // Increment command counter for terminal refresh tracking
+                this.terminalCommandCount++;
+                console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
+                
+                // Strip ANSI codes before sending to AI
+                const cleanStdout = stripAnsiCodes(stdout);
+                const cleanStderr = stripAnsiCodes(stderr);
+                
+                console.log('[Terminal] Resolving with output length:', cleanStdout.length, '(original:', stdout.length, ')');
+                resolve({ stdout: cleanStdout, stderr: cleanStderr });
             };
 
             // Detect if command is likely to be long-running (servers, watchers, etc.)
@@ -476,7 +543,7 @@ class ToolBox {
             
             // Adaptive timeout based on command type
             const MAX_INACTIVITY_TIME = cmdType === 'install' ? 10000 : // 10 seconds for install
-                                       cmdType === 'long-running' ? 300000 : // 5 minutes for servers (keep monitoring)
+                                       cmdType === 'long-running' ? 30000 : // 30 seconds for servers (then return output)
                                        30000; // 30 seconds for normal commands
             
             let inactivityTimeout: NodeJS.Timeout | null = null;
@@ -491,13 +558,16 @@ class ToolBox {
                 }
                 
                 inactivityTimeout = setTimeout(() => {
-                    console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length);
+                    console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length, 'cmdType:', cmdType);
                     
-                    // For long-running commands that are still running (stream hasn't ended)
-                    // Keep monitoring but don't resolve yet - wait for actual termination
-                    if (cmdType === 'long-running' && !streamEnded && !shellIntegrationLost) {
-                        console.log('[Terminal] Long-running process still active, continuing to monitor...');
-                        // Don't resolve - keep waiting for actual termination (Ctrl+C, exit, etc.)
+                    // For long-running commands: if we have output, return it with a detached message
+                    // The process continues running in the background, but we return what we captured
+                    if (cmdType === 'long-running' && output.length > 0) {
+                        console.log('[Terminal] Long-running process timeout - returning captured output (process continues in background)');
+                        doResolve(
+                            output + `\n\n[INFO] Long-running process started successfully. Process continues in background. Output captured: ${output.length} characters.`,
+                            ''
+                        );
                         return;
                     }
                     
@@ -1079,7 +1149,7 @@ export class AgentService {
             { name: 'search_in_file', description: 'Search for a specific keyword within a single file (given relative path). This is the most efficient way to find relevant code in long files. Returns the matching lines with surrounding context.', args: [{ name: 'filePath', type: 'string' }, { name: 'keyword', type: 'string' }] },
             { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
-            { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
+            { name: 'run_terminal_command', description: 'Run a shell command in the workspace. Asks for user permission first. Returns stdout and stderr. IMPORTANT: When you run "cd <directory>" command, the working directory is automatically updated for ALL subsequent file operations (read_file, apply_file_change, list_files, etc.). This means after "cd my-app", file paths like "src/App.js" will resolve to "my-app/src/App.js".', args: [{ name: 'command', type: 'string' }] },
             { name: 'similar_search', description: 'Perform semantic similarity search on the indexed codebase to find relevant code snippets. Useful for understanding code patterns or finding similar implementations. Returns list of matching chunks with metadata and similarity score.', args: [{ name: 'query', type: 'string' }, { name: 'limit', type: 'number' }] },
             { name: 'finish', description: 'Finishes the task with a message.', args: [{ name: 'message', type: 'string' }] }
         ];
@@ -1092,9 +1162,14 @@ export class AgentService {
         const showInstruction = currentInstruction.trim() !== originalPrompt.trim();
         const currentInstructionSection = showInstruction ? currentInstruction: "This is your first iteration.";
 
+        // Include current working directory information
+        const workingDirInfo = this.toolbox.getWorkingDirectory() 
+            ? `\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations will use paths relative to this directory\n`
+            : '';
+
         const systemPrompt = `You are an expert AI programmer agent.
 Your goal is to complete the user's ORIGINAL request.
-
+${workingDirInfo}
 CRITICAL INSTRUCTIONS:
 1. You operate autonomously - make file changes immediately without asking permission
 2. apply_file_change tool applies changes instantly to files

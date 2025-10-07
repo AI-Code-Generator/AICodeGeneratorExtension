@@ -4,6 +4,7 @@ import Parser from 'tree-sitter';
 import TreeSitterJavaScript from 'tree-sitter-javascript';
 import TreeSitterTypeScript from 'tree-sitter-typescript';
 import TreeSitterJava from 'tree-sitter-java';
+import { EXCLUDED_DIRS } from './constants';
 
 export interface SpringAnnotation {
     name: string; // e.g., "Component", "RestController", "Service"
@@ -137,13 +138,11 @@ export class ASTManager {
             return;
         }
 
-        const excludeDirs = [
-            'node_modules', '.git', 'dist', 'build', 'out',
-            'target', 'bin', '.gradle', '.mvn', 'gradle/wrapper'
-        ];
         const pattern = "**/*.{ts,tsx,js,jsx,java}";
         
-        const files = await vscode.workspace.findFiles(pattern, `{${excludeDirs.map(dir => `**/${dir}/**`).join(',')}}`);
+        // Create glob pattern from EXCLUDED_DIRS
+        const excludePattern = `{${EXCLUDED_DIRS.map(dir => `**/${dir}/**`).join(',')}}`;
+        const files = await vscode.workspace.findFiles(pattern, excludePattern);
         
         for (const file of files) {
             await this.updateFileAST(file);
@@ -160,12 +159,8 @@ export class ASTManager {
         }
 
         // Skip excluded directories
-        const excludeDirs = [
-            'node_modules', '.git', 'dist', 'build', 'out',
-            'target', 'bin', '.gradle', '.mvn', 'gradle/wrapper'
-        ];
         const normalizedPath = filePath.replace(/\\/g, '/');
-        if (excludeDirs.some(dir => normalizedPath.includes(`/${dir}/`) || normalizedPath.includes(`\\${dir}\\`))) {
+        if (EXCLUDED_DIRS.some(dir => normalizedPath.includes(`/${dir}/`) || normalizedPath.includes(`\\${dir}\\`))) {
             return;
         }
 
