@@ -83,6 +83,12 @@ export class DiffManager {
     public async applyChangeWithDiff(filePath: string, newContent: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
         
+        // Normalize to workspace-relative path for storage and UI
+        // This ensures decorations match regardless of whether we receive absolute or relative path
+        const workspaceRelativePath = vscode.workspace.asRelativePath(absolutePath);
+        
+        console.log('[DiffManager] Path normalization:', filePath, '→ absolute:', absolutePath, '→ relative:', workspaceRelativePath);
+        
         // Read current content
         let originalContent: string;
         try {
@@ -92,15 +98,15 @@ export class DiffManager {
             originalContent = '';
         }
 
-        // Generate diff
-        const changes = this.generateDiffChanges(originalContent, newContent, filePath);
+        // Generate diff (use workspace-relative path for storage)
+        const changes = this.generateDiffChanges(originalContent, newContent, workspaceRelativePath);
         
         if (changes.length === 0) {
             return 'No changes detected';
         }
 
-        // Store pending changes
-        this.pendingChanges.set(filePath, changes);
+        // Store pending changes with workspace-relative path as key
+        this.pendingChanges.set(workspaceRelativePath, changes);
 
         // Apply changes to file immediately
         await fs.writeFile(absolutePath, newContent, 'utf-8');
