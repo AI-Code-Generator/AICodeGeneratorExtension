@@ -33,17 +33,15 @@ class ToolBox {
     private ensureTerminal(): vscode.Terminal {
         const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!this.terminal || this.terminal.exitStatus) {
+            // Only create a new terminal if we don't have one or it was closed
             this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
             // Show terminal immediately to initialize shell integration faster
             this.terminal.show(false);
             console.log('[Terminal] Created new terminal, waiting for shell integration to initialize...');
         } else {
-            // If cwd changed after terminal creation, send hidden cd command
-            if (cwd) {
-                // Use a hidden cd command that doesn't show in terminal
-                this.terminal.sendText(`cd "${cwd.replace(/"/g, '\\"')}" > /dev/null 2>&1`);
-            }
-            // Show terminal but don't steal focus
+            // Reusing existing terminal - don't send any cd commands here
+            // The run_terminal_command method will handle directory changes
+            console.log('[Terminal] Reusing existing terminal');
             this.terminal.show(false);
         }
         return this.terminal;
@@ -60,23 +58,19 @@ class ToolBox {
             this.captureTimeout = undefined;
         }
 
-        // Stop terminal if present
-        if (this.terminal) {
-            if (!this.terminal.exitStatus) {
-                try {
-                    // Send Ctrl+C twice to gracefully terminate any running process
-                    this.terminal.sendText('\x03', false);  // Ctrl+C without newline
-                    await new Promise((r) => setTimeout(r, 300));
-                    this.terminal.sendText('\x03', false);
-                    await new Promise((r) => setTimeout(r, 300));
-                } catch { /* ignore */ }
-                try {
-                    this.terminal.dispose();
-                } catch { /* ignore */ }
-            }
-            // In all cases, clear the stale reference so a fresh terminal can be created next time
-            this.terminal = undefined;
+        // Only send Ctrl+C if terminal exists and is not closed
+        // DON'T dispose the terminal - we want to reuse it!
+        if (this.terminal && !this.terminal.exitStatus) {
+            try {
+                // Send Ctrl+C twice to gracefully terminate any running process
+                console.log('[Terminal] Sending Ctrl+C to stop any running process...');
+                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                await new Promise((r) => setTimeout(r, 300));
+                this.terminal.sendText('\x03', false);
+                await new Promise((r) => setTimeout(r, 300));
+            } catch { /* ignore */ }
         }
+        // Keep the terminal alive for reuse!
     }
 
     public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
@@ -377,7 +371,12 @@ class ToolBox {
     }
 
     public async apply_file_change(filePath: string, newContent: string): Promise<string> {
-        return await this.diffManager.applyChangeWithDiff(filePath, newContent);
+        // Convert relative path to absolute path using workingDirectory
+        const absolutePath = this.getAbsolutePath(filePath);
+        console.log('[apply_file_change] Converting path:', filePath, '→', absolutePath);
+        
+        // Pass both absolute path (for file operations) and relative path (for display)
+        return await this.diffManager.applyChangeWithDiff(absolutePath, newContent);
     }
 
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
@@ -399,13 +398,31 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // First, ensure any running process is stopped
+        // Track cd commands to update working directory
+        // This ensures we know where we are for compound commands and after terminal refreshes
+        const cdMatch = command.match(/^\s*cd\s+(.+?)(?:\s*&&|$)/);
+        if (cdMatch) {
+            let targetDir = cdMatch[1].trim();
+            // Remove quotes if present
+            targetDir = targetDir.replace(/^["']|["']$/g, '');
+            
+            // Resolve relative paths
+            if (!path.isAbsolute(targetDir)) {
+                const currentDir = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+                targetDir = path.resolve(currentDir, targetDir);
+            }
+            
+            console.log('[Terminal] Detected cd command, updating working directory to:', targetDir);
+            this.workingDirectory = targetDir;
+        }
+
+        // Stop any running process (but don't dispose terminal)
         await this.killRunningTerminalProcess();
         
-        // Create a new terminal or use existing one (recreate if previously closed)
+        // Reuse existing terminal or create new one if needed
         const term = this.ensureTerminal();
         
-        // If terminal was just created, give it more time to initialize shell integration
+        // If terminal was just created, give it time to initialize shell integration
         if (!term.shellIntegration) {
             console.log('[Terminal] Waiting for shell integration to initialize (new terminal)...');
             // Wait up to 3 seconds, checking every 200ms
@@ -421,14 +438,10 @@ class ToolBox {
                 console.warn('[Terminal] Shell integration still not available after 3 seconds');
             }
         }
-            
-        // Make sure we're in the right directory
-        if (this.workingDirectory) {
-            await new Promise<void>(resolve => {
-                term.sendText(`cd "${this.workingDirectory.replace(/"/g, '\\"')}"`, true);
-                setTimeout(resolve, 100);
-            });
-        }
+        
+        // DON'T automatically cd before every command - let commands execute naturally
+        // The terminal will stay in whatever directory the last command left it in
+        // Only the cd tracking above will update our workingDirectory variable
         
         term.show(true); // Show terminal with focus
 
@@ -1118,7 +1131,7 @@ export class AgentService {
             { name: 'search_in_file', description: 'Search for a specific keyword within a single file (given relative path). This is the most efficient way to find relevant code in long files. Returns the matching lines with surrounding context.', args: [{ name: 'filePath', type: 'string' }, { name: 'keyword', type: 'string' }] },
             { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
-            { name: 'run_terminal_command', description: 'Run a shell command in the workspace root. Asks for user permission first. Returns stdout and stderr.', args: [{ name: 'command', type: 'string' }] },
+            { name: 'run_terminal_command', description: 'Run a shell command in the workspace. Asks for user permission first. Returns stdout and stderr. IMPORTANT: When you run "cd <directory>" command, the working directory is automatically updated for ALL subsequent file operations (read_file, apply_file_change, list_files, etc.). This means after "cd my-app", file paths like "src/App.js" will resolve to "my-app/src/App.js".', args: [{ name: 'command', type: 'string' }] },
             { name: 'similar_search', description: 'Perform semantic similarity search on the indexed codebase to find relevant code snippets. Useful for understanding code patterns or finding similar implementations. Returns list of matching chunks with metadata and similarity score.', args: [{ name: 'query', type: 'string' }, { name: 'limit', type: 'number' }] },
             { name: 'finish', description: 'Finishes the task with a message.', args: [{ name: 'message', type: 'string' }] }
         ];
@@ -1131,9 +1144,14 @@ export class AgentService {
         const showInstruction = currentInstruction.trim() !== originalPrompt.trim();
         const currentInstructionSection = showInstruction ? currentInstruction: "This is your first iteration.";
 
+        // Include current working directory information
+        const workingDirInfo = this.toolbox.getWorkingDirectory() 
+            ? `\n\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations will use paths relative to this directory\n`
+            : '';
+
         const systemPrompt = `You are an expert AI programmer agent.
 Your goal is to complete the user's ORIGINAL request.
-
+${workingDirInfo}
 CRITICAL INSTRUCTIONS:
 1. You operate autonomously - make file changes immediately without asking permission
 2. apply_file_change tool applies changes instantly to files
