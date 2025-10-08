@@ -4,6 +4,7 @@ import { similaritySearch } from './service/FileIndexer';
 import { ContextGatherer } from './service/ContextGatherer';
 import { AgentService } from './service/AgentService';
 import { DiffManager } from './service/DiffManager';
+import { ThreadManager, Thread, ThreadMetadata } from './service/ThreadManager';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -17,11 +18,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private currentAbortController?: AbortController;
     private isProcessing: boolean = false;
     private currentMode: 'ask' | 'agent' = 'ask'; // Track current mode
-    private askHistory: Array<{id: string, type: 'user' | 'assistant', message: string}> = [];
-    private agentHistory: Array<{id: string, type: 'user' | 'assistant', message: string}> = [];
+    private threadManager: ThreadManager;
+    private currentThread: Thread | null = null;
     private currentAgentResponseIndex: number = -1; // Track current streaming response
     private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
     private pendingTerminalCommandResolve?: (value: boolean) => void; // For terminal command confirmations
+
+    // Legacy history for migration
+    private askHistory: Array<{id: string, type: 'user' | 'assistant', message: string}> = [];
+    private agentHistory: Array<{id: string, type: 'user' | 'assistant', message: string}> = [];
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -35,12 +40,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._agentUrl = `${baseUrl}/agent`;
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService();
+        this.threadManager = ThreadManager.getInstance(_context, baseUrl);
         
         // Set up terminal command callback
         this.agentService.setTerminalCommandCallback(this.handleTerminalCommandConfirmation.bind(this));
         
-        // Load persisted history
-        this.loadHistory();
+        // Initialize threads (migrate old history if needed)
+        this.initializeThreads();
     }
 
     private generateId(prefix: string): string {
@@ -53,6 +59,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // fall back silently
         }
         return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2,10)}`;
+    }
+
+    private async initializeThreads() {
+        try {
+            // Check if old history exists and needs migration
+            const oldAskHistory = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('askHistory');
+            const oldAgentHistory = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('agentHistory');
+            
+            if (oldAskHistory && oldAskHistory.length > 0 || oldAgentHistory && oldAgentHistory.length > 0) {
+                // Migrate old history
+                const askHistoryWithIds = (oldAskHistory || []).map(h => ({
+                    id: this.generateId('old_ask'),
+                    type: h.type,
+                    message: h.message
+                }));
+                const agentHistoryWithIds = (oldAgentHistory || []).map(h => ({
+                    id: this.generateId('old_agent'),
+                    type: h.type,
+                    message: h.message
+                }));
+                
+                await this.threadManager.migrateOldHistory(askHistoryWithIds, agentHistoryWithIds);
+                
+                // Clear old history from storage
+                await this._context.globalState.update('askHistory', undefined);
+                await this._context.globalState.update('agentHistory', undefined);
+                
+                console.log('Migrated old history to threads');
+            }
+
+            // Load or create initial thread
+            const lastThreadId = this._context.globalState.get<string>('currentThreadId');
+            if (lastThreadId) {
+                this.currentThread = await this.threadManager.getThread(lastThreadId);
+            }
+            
+            // If no thread exists, create a new one
+            if (!this.currentThread) {
+                this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+            }
+        } catch (error) {
+            console.error('Failed to initialize threads:', error);
+            // Create a new thread as fallback
+            this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+        }
     }
 
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
@@ -166,7 +217,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     type: 'updateMode',
                     mode: this.currentMode
                 });
-                this.sendHistoryToWebview();
+                await this.sendCurrentThreadToWebview();
+                await this.sendThreadListToWebview();
+                return;
+            }
+
+            if (data.type === 'newThread') {
+                await this.createNewThread();
+                return;
+            }
+
+            if (data.type === 'switchThread') {
+                await this.switchThread(data.threadId);
+                return;
+            }
+
+            if (data.type === 'deleteThread') {
+                await this.deleteThread(data.threadId);
+                return;
+            }
+
+            if (data.type === 'loadThreadList') {
+                await this.sendThreadListToWebview();
                 return;
             }
 
@@ -186,14 +258,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             if (data.type === 'changeMode') {
+                const oldMode = this.currentMode;
                 this.currentMode = data.mode;
+                
+                // If mode changed, switch to a thread of the new mode or create one
+                if (oldMode !== this.currentMode) {
+                    const threads = await this.threadManager.getThreads(
+                        this.currentMode,
+                        this.threadManager.getCurrentProjectPath()
+                    );
+                    
+                    if (threads.length > 0) {
+                        // Switch to the most recent thread of this mode
+                        await this.switchThread(threads[0].id);
+                    } else {
+                        // Create a new thread for this mode
+                        this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+                        await this.sendCurrentThreadToWebview();
+                    }
+                    
+                    await this.sendThreadListToWebview();
+                }
+                
                 this._view?.webview.postMessage({
                     type: 'updateMode',
                     mode: this.currentMode
                 });
-                this.sendHistoryToWebview();
-                // Save mode change
-                this.saveHistory();
                 return;
             }
 
@@ -215,15 +305,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 this.isProcessing = true;
                 this.updateProcessingState();
                 
-                // Add user message to agent history
-                const agentUserId = this.generateId('ag_u');
-                this.addToHistory('agent', 'user', data.message, agentUserId);
+                // Add user message to current thread
+                const userMsgId = await this.addMessageToCurrentThread('user', data.message);
                 
                 // Display the user message first
                 this._view?.webview.postMessage({
                     type: 'addMessage',
                     message: data.message,
-                    sender: 'user'
+                    sender: 'user',
+                    id: userMsgId
                 });
                 
                 // Hide bulk actions when starting new agent task
@@ -233,7 +323,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 });
                 
                 let agentResponse = '';
+                let assistantMsgId: string | null = null;
                 let isFirstUpdate = true;
+                
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
                     agentResponse += update + '\n';
                     
@@ -242,13 +334,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         this._view?.webview.postMessage({
                             type: 'addMessage',
                             message: agentResponse.trim(),
-                            sender: 'assistant',
-                            id: this.agentHistory[this.agentHistory.length-1].id
+                            sender: 'assistant'
                         });
-                        
-                        // Add initial assistant message to history immediately
-                        this.addToHistory('agent', 'assistant', agentResponse.trim(), this.generateId('ag_a'));
-                        this.currentAgentResponseIndex = this.agentHistory.length - 1;
                         isFirstUpdate = false;
                     } else {
                         // Update the existing assistant message bubble with full content
@@ -257,20 +344,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             message: agentResponse.trim(),
                             sender: 'assistant'
                         });
-                        
-                        // Update the agent response in history
-                        if (this.currentAgentResponseIndex >= 0) {
-                            this.agentHistory[this.currentAgentResponseIndex].message = agentResponse.trim();
-                            this.debouncedSaveHistory();
-                        }
                     }
-                }).finally(() => {
-                    // Ensure final agent response is saved to history
-                    if (this.currentAgentResponseIndex >= 0) {
-                        this.agentHistory[this.currentAgentResponseIndex].message = agentResponse.trim();
-                        this.saveHistory();
+                }).finally(async () => {
+                    // Save final agent response to thread
+                    if (agentResponse.trim()) {
+                        await this.addMessageToCurrentThread('assistant', agentResponse.trim());
                     }
-                    this.currentAgentResponseIndex = -1;
                     
                     this.isProcessing = false;
                     this.updateProcessingState();
@@ -352,12 +431,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         }));
 
                         // Determine if this is the first message of a new ask conversation
-                        // We must check BEFORE pushing to history so the server can reset correctly.
-                        const isNewAskTask = this.askHistory.length === 0;
+                        const currentMessages = this.currentThread?.messages || [];
+                        const isNewAskTask = currentMessages.length === 0;
 
-                        // Generate ID and add user message to ask history
-                        const userMessageId = this.generateId('u');
-                        this.addToHistory('ask', 'user', data.message, userMessageId);
+                        // Add user message to current thread
+                        const userMessageId = await this.addMessageToCurrentThread('user', data.message);
 
                         // Send progress message
                         this._view?.webview.postMessage({
@@ -399,9 +477,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const jsonResponse: any = await response.json();
 
                         if (!jsonResponse.error) {
-                            // Add AI response to ask history
-                            const respId = this.generateId('a');
-                            this.addToHistory('ask', 'assistant', jsonResponse.response, respId);
+                            // Add AI response to current thread
+                            const respId = await this.addMessageToCurrentThread('assistant', jsonResponse.response);
                             
                             // Send response back to webview
                             this._view?.webview.postMessage({
@@ -417,24 +494,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         let errorMessage = '';
                         if (error.name === 'AbortError') {
                             errorMessage = 'Request was stopped by user.';
-                            this._view?.webview.postMessage({
-                                type: 'addMessage',
-                                message: errorMessage,
-                                sender: 'assistant',
-                                id: this.generateId('abort')
-                            });
                         } else {
                             vscode.window.showErrorMessage(`Error: ${error}`);
                             errorMessage = 'Sorry, there was an error processing your request.';
-                            this._view?.webview.postMessage({
-                                type: 'addMessage',
-                                message: errorMessage,
-                                sender: 'assistant'
-                            });
                         }
-                        // Add error message to history
-                        const errId = this.generateId('e');
-                        this.addToHistory('ask', 'assistant', errorMessage, errId);
+                        
+                        // Add error message to thread
+                        const errId = await this.addMessageToCurrentThread('assistant', errorMessage);
+                        
                         this._view?.webview.postMessage({
                             type: 'addMessage',
                             message: errorMessage,
@@ -449,33 +516,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
             }
             if (data.type === 'deleteMessage') {
-                const { id } = data;
-                // Only allow deletion in ask mode for now
-                const list = this.askHistory;
-                const idx = list.findIndex(m => m.id === id);
-                if (idx !== -1) {
-                    const removedIds: string[] = [];
-                    const removed = list[idx];
-                    removedIds.push(removed.id);
-                    // If next message is assistant reply, remove it too
-                    if (idx + 1 < list.length && list[idx + 1].type === 'assistant') {
-                        removedIds.push(list[idx + 1].id);
-                        list.splice(idx, 2);
-                    } else {
-                        list.splice(idx, 1);
-                    }
-                    this.saveHistory();
-                    if (removed.type === 'user' && this._deleteMessageUrl) {
-                        try {
-                            fetch(this._deleteMessageUrl, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ user_ID: '0001', message_id: id, cascade: true })
-                            }).catch(()=>{});
-                        } catch(e) {}
-                    }
-                    this._view?.webview.postMessage({ type: 'messageDeleted', ids: removedIds });
-                }
+                // For now, thread message deletion is handled by deleting entire thread
+                // Individual message deletion within threads not yet implemented
+                // You can implement this by filtering messages from the thread and re-saving
+                vscode.window.showInformationMessage('Individual message deletion not supported. Use "Clear Messages" to clear the entire conversation.');
                 return;
             }
         });
@@ -499,75 +543,157 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private addToHistory(mode: 'ask' | 'agent', type: 'user' | 'assistant', message: string, id: string) {
-        const historyArray = mode === 'ask' ? this.askHistory : this.agentHistory;
-        historyArray.push({ id, type, message });
-        // Save history to extension storage
-        this.saveHistory();
+    private async addMessageToCurrentThread(type: 'user' | 'assistant', content: string): Promise<string> {
+        if (!this.currentThread) {
+            // Create a new thread if none exists
+            this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+        }
+
+        await this.threadManager.addMessageToThread(this.currentThread.id, type, content);
+        
+        // Reload the thread to get the updated messages
+        this.currentThread = await this.threadManager.getThread(this.currentThread.id);
+        
+        // Return the ID of the last message added
+        if (this.currentThread && this.currentThread.messages.length > 0) {
+            return this.currentThread.messages[this.currentThread.messages.length - 1].id;
+        }
+        
+        return this.generateId('msg');
     }
 
-    private getCurrentHistory(): Array<{id: string, type: 'user' | 'assistant', message: string}> {
-        return this.currentMode === 'ask' ? this.askHistory : this.agentHistory;
+    private async createNewThread() {
+        try {
+            this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+            
+            // Clear the webview
+            this._view?.webview.postMessage({ type: 'clearMessages' });
+            
+            // Send the new thread list
+            await this.sendThreadListToWebview();
+            
+            vscode.window.showInformationMessage('New conversation thread created');
+        } catch (error) {
+            console.error('Failed to create new thread:', error);
+            vscode.window.showErrorMessage('Failed to create new thread');
+        }
     }
 
-    private sendHistoryToWebview() {
-        const history = this.getCurrentHistory();
+    private async switchThread(threadId: string) {
+        try {
+            const thread = await this.threadManager.getThread(threadId);
+            if (!thread) {
+                vscode.window.showErrorMessage('Thread not found');
+                return;
+            }
+
+            this.currentThread = thread;
+            this.threadManager.setCurrentThreadId(threadId);
+            
+            // Send thread messages to webview
+            await this.sendCurrentThreadToWebview();
+            
+        } catch (error) {
+            console.error('Failed to switch thread:', error);
+            vscode.window.showErrorMessage('Failed to switch thread');
+        }
+    }
+
+    private async deleteThread(threadId: string) {
+        try {
+            await this.threadManager.deleteThread(threadId);
+            
+            // If we deleted the current thread, create a new one
+            if (this.currentThread && this.currentThread.id === threadId) {
+                this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+                await this.sendCurrentThreadToWebview();
+            }
+            
+            // Update thread list
+            await this.sendThreadListToWebview();
+            
+            vscode.window.showInformationMessage('Thread deleted');
+        } catch (error) {
+            console.error('Failed to delete thread:', error);
+            vscode.window.showErrorMessage('Failed to delete thread');
+        }
+    }
+
+    private async sendCurrentThreadToWebview() {
+        if (!this.currentThread) {
+            this._view?.webview.postMessage({
+                type: 'loadHistory',
+                history: [],
+                threadTitle: 'New Conversation'
+            });
+            return;
+        }
+
+        const history = this.currentThread.messages.map(msg => ({
+            id: msg.id,
+            type: msg.type,
+            message: msg.content
+        }));
+
         this._view?.webview.postMessage({
             type: 'loadHistory',
-            history: history
+            history: history,
+            threadTitle: this.currentThread.title || 'Conversation'
         });
     }
 
-    private async loadHistory() {
+    private async sendThreadListToWebview() {
         try {
-            const askHistoryData = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('askHistory');
-            const agentHistoryData = this._context.globalState.get<Array<{type: 'user' | 'assistant', message: string}>>('agentHistory');
-            const savedMode = this._context.globalState.get<'ask' | 'agent'>('currentMode');
-            
-            if (askHistoryData) {
-                this.askHistory = askHistoryData.map((h) => ({ id: this.generateId('old_ask'), ...h }));
-            }
-            if (agentHistoryData) {
-                this.agentHistory = agentHistoryData.map((h) => ({ id: this.generateId('old_agent'), ...h }));
-            }
-            if (savedMode) {
-                this.currentMode = savedMode;
-            }
+            const threads = await this.threadManager.getThreads(
+                this.currentMode,
+                this.threadManager.getCurrentProjectPath()
+            );
+
+            this._view?.webview.postMessage({
+                type: 'threadList',
+                threads: threads,
+                currentThreadId: this.currentThread?.id || null
+            });
         } catch (error) {
-            console.error('Failed to load chat history:', error);
+            console.error('Failed to send thread list:', error);
         }
     }
 
-    private async saveHistory() {
-        try {
-            await this._context.globalState.update('askHistory', this.askHistory);
-            await this._context.globalState.update('agentHistory', this.agentHistory);
-            await this._context.globalState.update('currentMode', this.currentMode);
-        } catch (error) {
-            console.error('Failed to save chat history:', error);
-        }
+    private addToHistory(mode: 'ask' | 'agent', type: 'user' | 'assistant', message: string, id: string) {
+        // Legacy method - now handled by ThreadManager
+        // Keep for backwards compatibility during migration
+        const historyArray = mode === 'ask' ? this.askHistory : this.agentHistory;
+        historyArray.push({ id, type, message });
     }
 
-    private debouncedSaveHistory() {
-        // Clear existing timeout
-        if (this.saveHistoryTimeout) {
-            clearTimeout(this.saveHistoryTimeout);
+    private getCurrentHistory(): Array<{id: string, type: 'user' | 'assistant', message: string}> {
+        // Legacy method - now returns current thread messages
+        if (!this.currentThread) {
+            return [];
+        }
+        return this.currentThread.messages.map(msg => ({
+            id: msg.id,
+            type: msg.type,
+            message: msg.content
+        }));
+    }
+
+    private sendHistoryToWebview() {
+        // Legacy method - now uses sendCurrentThreadToWebview
+        this.sendCurrentThreadToWebview();
+    }
+
+    private async clearMessages() {
+        if (!this.currentThread) {
+            return;
         }
         
-        // Set new timeout to save after 500ms of inactivity
-        this.saveHistoryTimeout = setTimeout(() => {
-            this.saveHistory();
-        }, 500);
-    }
-
-    private async clearMessages() {        
-        if (this.currentMode === 'ask') {
-            this.askHistory = [];
-        } else {
-            this.agentHistory = [];
-        }
-        this.saveHistory();
+        // Delete the current thread and create a new one
+        await this.threadManager.deleteThread(this.currentThread.id);
+        this.currentThread = await this.threadManager.createNewThread(this.currentMode);
+        
         this._view?.webview.postMessage({ type: 'clearMessages' });
+        await this.sendThreadListToWebview();
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
@@ -929,18 +1055,182 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .deny-command-button:hover {
             opacity: 0.8;
         }
+        /* Thread History View */
+        .thread-history-view {
+            display: none;
+            height: 100vh;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        .thread-history-view.active {
+            display: block;
+        }
+        .thread-history-header {
+            margin-bottom: 20px;
+        }
+        .thread-history-header h2 {
+            margin: 0 0 10px 0;
+            color: var(--vscode-foreground);
+        }
+        .thread-history-actions {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .new-thread-button {
+            padding: 10px 20px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .new-thread-button:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .thread-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .thread-item {
+            padding: 15px;
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+        }
+        .thread-item:hover {
+            background: var(--vscode-list-hoverBackground);
+            border-color: var(--vscode-focusBorder);
+        }
+        .thread-item-title {
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 6px;
+            color: var(--vscode-foreground);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .thread-item-meta {
+            font-size: 12px;
+            color: var(--vscode-descriptionForeground);
+            display: flex;
+            gap: 15px;
+        }
+        .thread-item-delete {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: transparent;
+            border: none;
+            color: var(--vscode-descriptionForeground);
+            cursor: pointer;
+            font-size: 18px;
+            opacity: 0;
+            transition: opacity 0.2s;
+            width: 24px;
+            height: 24px;
+            border-radius: 3px;
+        }
+        .thread-item:hover .thread-item-delete {
+            opacity: 1;
+        }
+        .thread-item-delete:hover {
+            background: var(--vscode-inputValidation-errorBackground);
+            color: var(--vscode-errorForeground);
+        }
+        .empty-threads {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .empty-threads-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        /* Chat View */
+        .chat-view {
+            display: none;
+            height: 100vh;
+        }
+        .chat-view.active {
+            display: flex;
+            flex-direction: column;
+        }
+        .chat-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: var(--vscode-editor-background);
+            border-bottom: 1px solid var(--vscode-input-border);
+        }
+        .back-button {
+            padding: 6px 12px;
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .back-button:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
+        .chat-header-title {
+            flex: 1;
+            font-size: 14px;
+            color: var(--vscode-foreground);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
     </style>
 </head>
 <body>
-    <div class="mode-selector">
-        <div class="mode-buttons">
-            <button id="askButton" class="mode-button active">Ask</button>
-            <button id="agentButton" class="mode-button">Agent</button>
+    <!-- Thread History View -->
+    <div id="threadHistoryView" class="thread-history-view active">
+        <div class="thread-history-header">
+            <h2>Conversation History</h2>
+            <div class="mode-selector">
+                <div class="mode-buttons">
+                    <button id="askButtonHistory" class="mode-button active">Ask</button>
+                    <button id="agentButtonHistory" class="mode-button">Agent</button>
+                </div>
+            </div>
         </div>
-        <button id="clearButton" class="clear-button" title="Clear all messages">🗑️ Clear</button>
+        <div class="thread-history-actions">
+            <button id="newThreadButton" class="new-thread-button">+ New Conversation</button>
+        </div>
+        <div id="threadList" class="thread-list">
+            <div class="empty-threads">
+                <div class="empty-threads-icon">💬</div>
+                <p>No conversations yet</p>
+                <p style="font-size: 12px;">Start a new conversation to begin</p>
+            </div>
+        </div>
     </div>
-    <div id="chatMessages"></div>
-    <div id="bulkActions" class="bulk-actions">
+
+    <!-- Chat View -->
+    <div id="chatView" class="chat-view">
+        <div class="chat-header">
+            <button id="backButton" class="back-button">← Back</button>
+            <div class="chat-header-title" id="chatHeaderTitle">Conversation</div>
+            <div class="mode-selector">
+                <div class="mode-buttons">
+                    <button id="askButton" class="mode-button active">Ask</button>
+                    <button id="agentButton" class="mode-button">Agent</button>
+                </div>
+            </div>
+            <button id="clearButton" class="clear-button" title="Clear this conversation">🗑️ Clear</button>
+        </div>
+        <div id="chatMessages"></div>
+        <div id="bulkActions" class="bulk-actions">
         <h4>Agent Task Completed - Review Changes</h4>
         <div class="bulk-actions-buttons">
             <button id="acceptAllButton" class="bulk-action-button accept-all-button">✓ Accept All Changes</button>
@@ -957,6 +1247,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <button id="sendButton">Send</button>
         <button id="stopButton">Stop</button>
     </div>
+</div>
 
     <script>
         const vscode = acquireVsCodeApi();
@@ -967,13 +1258,128 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const loading = document.getElementById('loading');
         const askButton = document.getElementById('askButton');
         const agentButton = document.getElementById('agentButton');
+        const askButtonHistory = document.getElementById('askButtonHistory');
+        const agentButtonHistory = document.getElementById('agentButtonHistory');
         const clearButton = document.getElementById('clearButton');
         const bulkActions = document.getElementById('bulkActions');
         const acceptAllButton = document.getElementById('acceptAllButton');
         const rejectAllButton = document.getElementById('rejectAllButton');
+        const backButton = document.getElementById('backButton');
+        const newThreadButton = document.getElementById('newThreadButton');
+        const threadHistoryView = document.getElementById('threadHistoryView');
+        const chatView = document.getElementById('chatView');
+        const threadList = document.getElementById('threadList');
+        const chatHeaderTitle = document.getElementById('chatHeaderTitle');
+        
         let currentMode = 'ask';
         let isProcessing = false;
+        let currentThreadId = null;
+        let threads = [];
 
+        // View Management
+        function showThreadHistory() {
+            threadHistoryView.classList.add('active');
+            chatView.classList.remove('active');
+            vscode.postMessage({ type: 'loadThreadList' });
+        }
+
+        function showChat() {
+            threadHistoryView.classList.remove('active');
+            chatView.classList.add('active');
+        }
+
+        // Thread List Management
+        function renderThreadList(threadData, currentThread) {
+            threads = threadData || [];
+            currentThreadId = currentThread;
+            
+            if (threads.length === 0) {
+                threadList.innerHTML = \`
+                    <div class="empty-threads">
+                        <div class="empty-threads-icon">💬</div>
+                        <p>No conversations yet</p>
+                        <p style="font-size: 12px;">Start a new conversation to begin</p>
+                    </div>
+                \`;
+                return;
+            }
+
+            threadList.innerHTML = '';
+            threads.forEach(thread => {
+                const threadItem = document.createElement('div');
+                threadItem.className = 'thread-item';
+                
+                const title = document.createElement('div');
+                title.className = 'thread-item-title';
+                title.textContent = thread.title || 'Untitled Conversation';
+                
+                const meta = document.createElement('div');
+                meta.className = 'thread-item-meta';
+                meta.innerHTML = \`
+                    <span>\${formatTimestamp(thread.updatedAt)}</span>
+                    <span>\${thread.messageCount || 0} messages</span>
+                \`;
+                
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'thread-item-delete';
+                deleteBtn.textContent = '×';
+                deleteBtn.title = 'Delete thread';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (confirm('Delete this conversation?')) {
+                        vscode.postMessage({ 
+                            type: 'deleteThread', 
+                            threadId: thread.id 
+                        });
+                    }
+                };
+                
+                threadItem.appendChild(title);
+                threadItem.appendChild(meta);
+                threadItem.appendChild(deleteBtn);
+                
+                threadItem.onclick = () => {
+                    vscode.postMessage({ 
+                        type: 'switchThread', 
+                        threadId: thread.id 
+                    });
+                    chatHeaderTitle.textContent = thread.title || 'Conversation';
+                    showChat();
+                };
+                
+                threadList.appendChild(threadItem);
+            });
+        }
+
+        function formatTimestamp(timestamp) {
+            const now = Date.now();
+            const diff = now - timestamp;
+            const minutes = Math.floor(diff / 60000);
+            const hours = Math.floor(diff / 3600000);
+            const days = Math.floor(diff / 86400000);
+            
+            if (minutes < 1) return 'Just now';
+            if (minutes < 60) return \`\${minutes} min ago\`;
+            if (hours < 24) return \`\${hours} hour\${hours > 1 ? 's' : ''} ago\`;
+            if (days === 1) return 'Yesterday';
+            if (days < 7) return \`\${days} days ago\`;
+            
+            const date = new Date(timestamp);
+            return date.toLocaleDateString();
+        }
+
+        // Button Event Listeners
+        backButton.addEventListener('click', () => {
+            showThreadHistory();
+        });
+
+        newThreadButton.addEventListener('click', () => {
+            vscode.postMessage({ type: 'newThread' });
+            chatHeaderTitle.textContent = 'New Conversation';
+            showChat();
+        });
+
+        // Mode buttons in chat view
         askButton.addEventListener('click', () => {
             if (currentMode !== 'ask') {
                 vscode.postMessage({
@@ -989,6 +1395,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     type: 'changeMode',
                     mode: 'agent'
                 });
+            }
+        });
+
+        // Mode buttons in history view
+        askButtonHistory.addEventListener('click', () => {
+            if (currentMode !== 'ask') {
+                currentMode = 'ask';
+                askButtonHistory.classList.add('active');
+                agentButtonHistory.classList.remove('active');
+                vscode.postMessage({ type: 'loadThreadList' });
+            }
+        });
+
+        agentButtonHistory.addEventListener('click', () => {
+            if (currentMode !== 'agent') {
+                currentMode = 'agent';
+                agentButtonHistory.classList.add('active');
+                askButtonHistory.classList.remove('active');
+                vscode.postMessage({ type: 'loadThreadList' });
             }
         });
 
@@ -1521,7 +1946,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         chatMessages.scrollTop = chatMessages.scrollHeight;
                     }
                     break;
+                case 'threadList':
+                    renderThreadList(message.threads, message.currentThreadId);
+                    break;
                 case 'loadHistory':
+                    chatHeaderTitle.textContent = message.threadTitle || 'Conversation';
+                    showChat();
                     loadHistory(message.history);
                     break;
                 case 'clearMessages':
