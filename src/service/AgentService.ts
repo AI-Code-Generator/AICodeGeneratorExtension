@@ -29,6 +29,11 @@ class ToolBox {
     }
 
     public getWorkingDirectory(): string {
+        // Auto-initialize to workspace root if not set
+        if (!this.workingDirectory && vscode.workspace.workspaceFolders) {
+            this.workingDirectory = vscode.workspace.workspaceFolders[0].uri.fsPath;
+            console.log('[ToolBox] Auto-initialized working directory to:', this.workingDirectory);
+        }
         return this.workingDirectory;
     }
 
@@ -412,8 +417,8 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Track cd commands to update working directory
-        // This ensures we know where we are for compound commands and after terminal refreshes
+        // Detect cd commands (but don't update workingDirectory yet - do it after success)
+        let pendingCdTarget: string | null = null;
         const cdMatch = command.match(/^\s*cd\s+(.+?)(?:\s*&&|$)/);
         if (cdMatch) {
             let targetDir = cdMatch[1].trim();
@@ -426,8 +431,8 @@ class ToolBox {
                 targetDir = path.resolve(currentDir, targetDir);
             }
             
-            console.log('[Terminal] Detected cd command, updating working directory to:', targetDir);
-            this.workingDirectory = targetDir;
+            console.log('[Terminal] Detected cd command, will update working directory after execution to:', targetDir);
+            pendingCdTarget = targetDir; // Store for later update
         }
 
         // Stop any running process (but don't dispose terminal)
@@ -496,6 +501,12 @@ class ToolBox {
                 }
                 resolved = true;
                 cleanup();
+                
+                // Update working directory AFTER successful cd command execution
+                if (pendingCdTarget) {
+                    this.workingDirectory = pendingCdTarget;
+                    console.log('[Terminal] Updated working directory after cd command:', this.workingDirectory);
+                }
                 
                 // Increment command counter for terminal refresh tracking
                 this.terminalCommandCount++;
