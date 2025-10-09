@@ -203,7 +203,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             if (data.type === 'deleteThread') {
-                await this.deleteThread(data.threadId);
+                await this.confirmAndDeleteThread(data.threadId, data.threadTitle);
                 return;
             }
             if (data.type === 'deleteMessage') {
@@ -585,6 +585,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             console.error('Failed to delete thread:', error);
             vscode.window.showErrorMessage('Failed to delete thread');
         }
+    }
+
+    private async confirmAndDeleteThread(threadId: string, threadTitle?: string) {
+        const title = threadTitle?.trim() ? `"${threadTitle.trim()}"` : 'this conversation';
+        const selection = await vscode.window.showWarningMessage(
+            `Delete ${title}? This action cannot be undone.`,
+            { modal: true },
+            'Delete'
+        );
+
+        if (selection !== 'Delete') {
+            return;
+        }
+
+        await this.deleteThread(threadId);
     }
 
     private async sendCurrentThreadToWebview() {
@@ -1257,15 +1272,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 deleteBtn.className = 'thread-item-delete';
                 deleteBtn.textContent = '×';
                 deleteBtn.title = 'Delete thread';
-                deleteBtn.onclick = (e) => {
+                deleteBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    if (confirm('Delete this conversation?')) {
-                        vscode.postMessage({ 
-                            type: 'deleteThread', 
-                            threadId: thread.id 
-                        });
-                    }
-                };
+                    vscode.postMessage({ 
+                        type: 'deleteThread', 
+                        threadId: thread.id,
+                        threadTitle: thread.title || 'Conversation'
+                    });
+                });
                 
                 threadItem.appendChild(title);
                 threadItem.appendChild(meta);
