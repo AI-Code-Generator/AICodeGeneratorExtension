@@ -4,7 +4,6 @@ import * as vscode from 'vscode';
 export interface Thread {
     id: string;
     title: string;
-    mode: 'ask' | 'agent';
     projectPath: string;
     createdAt: number;
     updatedAt: number;
@@ -19,7 +18,6 @@ export interface Thread {
 export interface ThreadMetadata {
     id: string;
     title: string;
-    mode: 'ask' | 'agent';
     projectPath: string;
     createdAt: number;
     updatedAt: number;
@@ -88,7 +86,7 @@ export class ThreadManager {
         this.context.globalState.update('currentThreadId', threadId);
     }
 
-    public async createNewThread(mode: 'ask' | 'agent', initialMessage?: string): Promise<Thread> {
+    public async createNewThread(initialMessage?: string): Promise<Thread> {
         const threadId = this.generateThreadId();
         const projectPath = this.getCurrentProjectPath();
         const timestamp = Date.now();
@@ -96,7 +94,6 @@ export class ThreadManager {
         const thread: Thread = {
             id: threadId,
             title: initialMessage ? this.generateThreadTitle(initialMessage) : 'New Conversation',
-            mode: mode,
             projectPath: projectPath,
             createdAt: timestamp,
             updatedAt: timestamp,
@@ -150,12 +147,12 @@ export class ThreadManager {
         return await this.getThreadFromLocalStorage(threadId);
     }
 
-    public async getThreads(mode: 'ask' | 'agent', projectPath?: string): Promise<ThreadMetadata[]> {
+    public async getThreads(projectPath?: string): Promise<ThreadMetadata[]> {
         const currentProject = projectPath || this.getCurrentProjectPath();
         
         // Try to get from server first
         try {
-            const threads = await this.getThreadsFromServer(mode, currentProject);
+            const threads = await this.getThreadsFromServer(currentProject);
             if (threads && threads.length > 0) {
                 return threads;
             }
@@ -164,7 +161,7 @@ export class ThreadManager {
         }
 
         // Fallback to local storage
-        return await this.getThreadsFromLocalStorage(mode, currentProject);
+        return await this.getThreadsFromLocalStorage(currentProject);
     }
 
     public async addMessageToThread(threadId: string, type: 'user' | 'assistant', content: string): Promise<void> {
@@ -227,7 +224,6 @@ export class ThreadManager {
             body: JSON.stringify({
                 thread_id: thread.id,
                 title: thread.title,
-                mode: thread.mode,
                 project_path: thread.projectPath,
                 created_at: thread.createdAt,
                 updated_at: thread.updatedAt,
@@ -257,7 +253,6 @@ export class ThreadManager {
             return {
                 id: data.thread.thread_id,
                 title: data.thread.title,
-                mode: data.thread.mode,
                 projectPath: data.thread.project_path,
                 createdAt: data.thread.created_at,
                 updatedAt: data.thread.updated_at,
@@ -268,14 +263,13 @@ export class ThreadManager {
         return null;
     }
 
-    private async getThreadsFromServer(mode: 'ask' | 'agent', projectPath: string): Promise<ThreadMetadata[]> {
+    private async getThreadsFromServer(projectPath: string): Promise<ThreadMetadata[]> {
         const response = await fetch(`${this.baseUrl}/threads/list`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                mode: mode,
                 project_path: projectPath
             })
         });
@@ -289,7 +283,6 @@ export class ThreadManager {
             return data.threads.map((t: any) => ({
                 id: t.thread_id,
                 title: t.title,
-                mode: t.mode,
                 projectPath: t.project_path,
                 createdAt: t.created_at,
                 updatedAt: t.updated_at,
@@ -318,7 +311,7 @@ export class ThreadManager {
 
     // Local storage methods (backup)
     private async saveThreadToLocalStorage(thread: Thread): Promise<void> {
-        const threadsKey = `threads_${thread.mode}_${this.sanitizeProjectPath(thread.projectPath)}`;
+        const threadsKey = `threads_${this.sanitizeProjectPath(thread.projectPath)}`;
         const existingThreads = this.context.globalState.get<Thread[]>(threadsKey, []);
         
         const index = existingThreads.findIndex(t => t.id === thread.id);
@@ -332,29 +325,24 @@ export class ThreadManager {
     }
 
     private async getThreadFromLocalStorage(threadId: string): Promise<Thread | null> {
-        const modes: ('ask' | 'agent')[] = ['ask', 'agent'];
-        
-        for (const mode of modes) {
-            const threadsKey = `threads_${mode}_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
-            const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
-            const thread = threads.find(t => t.id === threadId);
-            if (thread) {
-                return thread;
-            }
+        const threadsKey = `threads_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
+        const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
+        const thread = threads.find(t => t.id === threadId);
+        if (thread) {
+            return thread;
         }
 
         return null;
     }
 
-    private async getThreadsFromLocalStorage(mode: 'ask' | 'agent', projectPath: string): Promise<ThreadMetadata[]> {
-        const threadsKey = `threads_${mode}_${this.sanitizeProjectPath(projectPath)}`;
+    private async getThreadsFromLocalStorage(projectPath: string): Promise<ThreadMetadata[]> {
+        const threadsKey = `threads_${this.sanitizeProjectPath(projectPath)}`;
         const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
         
         return threads
             .map(t => ({
                 id: t.id,
                 title: t.title,
-                mode: t.mode,
                 projectPath: t.projectPath,
                 createdAt: t.createdAt,
                 updatedAt: t.updatedAt,
@@ -364,65 +352,17 @@ export class ThreadManager {
     }
 
     private async deleteThreadFromLocalStorage(threadId: string): Promise<void> {
-        const modes: ('ask' | 'agent')[] = ['ask', 'agent'];
+        const threadsKey = `threads_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
+        const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
+        const filteredThreads = threads.filter(t => t.id !== threadId);
         
-        for (const mode of modes) {
-            const threadsKey = `threads_${mode}_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
-            const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
-            const filteredThreads = threads.filter(t => t.id !== threadId);
-            
-            if (filteredThreads.length !== threads.length) {
-                await this.context.globalState.update(threadsKey, filteredThreads);
-            }
+        if (filteredThreads.length !== threads.length) {
+            await this.context.globalState.update(threadsKey, filteredThreads);
         }
     }
 
     private sanitizeProjectPath(path: string): string {
         // Replace invalid characters for storage keys
         return path.replace(/[^a-zA-Z0-9]/g, '_');
-    }
-
-    // Migration method for existing history
-    public async migrateOldHistory(
-        askHistory: Array<{id: string, type: 'user' | 'assistant', message: string}>,
-        agentHistory: Array<{id: string, type: 'user' | 'assistant', message: string}>
-    ): Promise<void> {
-        const projectPath = this.getCurrentProjectPath();
-
-        // Migrate ask history
-        if (askHistory.length > 0) {
-            const askThread = await this.createNewThread('ask');
-            askThread.messages = askHistory.map((h, index) => ({
-                id: h.id,
-                type: h.type,
-                content: h.message,
-                timestamp: askThread.createdAt + index
-            }));
-            if (askThread.messages.length > 0) {
-                const firstUserMsg = askThread.messages.find(m => m.type === 'user');
-                if (firstUserMsg) {
-                    askThread.title = this.generateThreadTitle(firstUserMsg.content);
-                }
-            }
-            await this.saveThreadToLocalStorage(askThread);
-        }
-
-        // Migrate agent history
-        if (agentHistory.length > 0) {
-            const agentThread = await this.createNewThread('agent');
-            agentThread.messages = agentHistory.map((h, index) => ({
-                id: h.id,
-                type: h.type,
-                content: h.message,
-                timestamp: agentThread.createdAt + index
-            }));
-            if (agentThread.messages.length > 0) {
-                const firstUserMsg = agentThread.messages.find(m => m.type === 'user');
-                if (firstUserMsg) {
-                    agentThread.title = this.generateThreadTitle(firstUserMsg.content);
-                }
-            }
-            await this.saveThreadToLocalStorage(agentThread);
-        }
     }
 }
