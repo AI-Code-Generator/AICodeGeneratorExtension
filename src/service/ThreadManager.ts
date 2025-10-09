@@ -196,6 +196,26 @@ export class ThreadManager {
         await this.saveThreadToLocalStorage(thread);
     }
 
+    public async deleteMessages(threadId: string, messageIds: string[]): Promise<void> {
+        const thread = await this.getThread(threadId);
+        if (!thread) {
+            throw new Error(`Thread ${threadId} not found`);
+        }
+
+        thread.messages = thread.messages.filter(m => !messageIds.includes(m.id));
+        thread.updatedAt = Date.now();
+
+        // Save to server
+        try {
+            await this.deleteMessagesFromServer(threadId, messageIds);
+        } catch (error) {
+            console.error('Failed to delete messages from server:', error);
+        }
+
+        // Save to local storage as backup
+        await this.saveThreadToLocalStorage(thread);
+    }
+
     public async deleteThread(threadId: string): Promise<void> {
         // Delete from server
         try {
@@ -306,6 +326,23 @@ export class ThreadManager {
 
         if (!response.ok) {
             throw new Error(`Failed to delete thread: ${response.statusText}`);
+        }
+    }
+
+    private async deleteMessagesFromServer(threadId: string, messageIds: string[]): Promise<void> {
+        const response = await fetch(`${this.baseUrl}/threads/delete-message`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                thread_id: threadId,
+                message_ids: messageIds
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to delete messages: ${response.statusText}`);
         }
     }
 

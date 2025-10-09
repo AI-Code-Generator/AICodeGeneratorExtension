@@ -206,6 +206,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 await this.deleteThread(data.threadId);
                 return;
             }
+            if (data.type === 'deleteMessage') {
+                if (this.currentThread) {
+                    const messageId = data.id;
+                    const messages = this.currentThread.messages || [];
+                    const messageIndex = messages.findIndex(m => m.id === messageId);
+            
+                    if (messageIndex > -1) {
+                        const message = messages[messageIndex];
+                        const idsToDelete = [message.id];
+            
+                        // If the deleted message is a user message, also delete the next assistant message
+                        if (message.type === 'user' && messageIndex + 1 < messages.length) {
+                            const nextMessage = messages[messageIndex + 1];
+                            if (nextMessage.type === 'assistant') {
+                                idsToDelete.push(nextMessage.id);
+                            }
+                        }
+            
+                        await this.threadManager.deleteMessages(this.currentThread.id, idsToDelete);
+                        
+                        // Update the webview
+                        this._view?.webview.postMessage({ type: 'messageDeleted', ids: idsToDelete });
+                    }
+                }
+                return;
+            }
 
             if (data.type === 'loadThreadList') {
                 await this.sendThreadListToWebview();
@@ -463,13 +489,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         this.updateProcessingState();
                     }
                     break;
-            }
-            if (data.type === 'deleteMessage') {
-                // For now, thread message deletion is handled by deleting entire thread
-                // Individual message deletion within threads not yet implemented
-                // You can implement this by filtering messages from the thread and re-saving
-                vscode.window.showInformationMessage('Individual message deletion not supported. Use "Clear Messages" to clear the entire conversation.');
-                return;
             }
         });
     }
