@@ -405,10 +405,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             content: r.content
                         }));
 
-                        // Determine if this is the first message of a new ask conversation
-                        const currentMessages = this.currentThread?.messages || [];
-                        const isNewAskTask = currentMessages.length === 0;
-
                         // Add user message to current thread
                         const userMessageId = await this.addMessageToCurrentThread('user', data.message);
 
@@ -443,7 +439,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 query: query,
                                 context: contextStrings,
                                 user_ID: "0001",
-                                is_new_task: isNewAskTask,
+                                thread_id: this.currentThread?.id,
                                 message_id: userMessageId
                             }),
                             signal: this.currentAbortController.signal
