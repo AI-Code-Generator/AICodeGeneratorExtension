@@ -29,6 +29,11 @@ class ToolBox {
     }
 
     public getWorkingDirectory(): string {
+        // Auto-initialize to workspace root if not set
+        if (!this.workingDirectory && vscode.workspace.workspaceFolders) {
+            this.workingDirectory = vscode.workspace.workspaceFolders[0].uri.fsPath;
+            console.log('[ToolBox] Auto-initialized working directory to:', this.workingDirectory);
+        }
         return this.workingDirectory;
     }
 
@@ -412,24 +417,6 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Track cd commands to update working directory
-        // This ensures we know where we are for compound commands and after terminal refreshes
-        const cdMatch = command.match(/^\s*cd\s+(.+?)(?:\s*&&|$)/);
-        if (cdMatch) {
-            let targetDir = cdMatch[1].trim();
-            // Remove quotes if present
-            targetDir = targetDir.replace(/^["']|["']$/g, '');
-            
-            // Resolve relative paths
-            if (!path.isAbsolute(targetDir)) {
-                const currentDir = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
-                targetDir = path.resolve(currentDir, targetDir);
-            }
-            
-            console.log('[Terminal] Detected cd command, updating working directory to:', targetDir);
-            this.workingDirectory = targetDir;
-        }
-
         // Stop any running process (but don't dispose terminal)
         await this.killRunningTerminalProcess();
         
@@ -490,12 +477,33 @@ class ToolBox {
             };
             
             // Final resolve function
-            const doResolve = (stdout: string, stderr: string) => {
+            const doResolve = async (stdout: string, stderr: string) => {
                 if (resolved) {
                     return;
                 }
                 resolved = true;
                 cleanup();
+                
+                // Query terminal's current directory silently by checking shell integration cwd
+                try {
+                    if (term.shellIntegration) {
+                        // Wait a bit for shell integration to update after command
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                        
+                        // Try to get cwd from shell integration state
+                        // Shell integration tracks the cwd automatically
+                        const currentCwd = (term.shellIntegration as any).cwd;
+                        if (currentCwd) {
+                            const newDir = currentCwd.fsPath || currentCwd.toString();
+                            if (newDir && newDir !== this.workingDirectory) {
+                                console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
+                                this.workingDirectory = newDir;
+                            }
+                        }
+                    }
+                } catch (error) {
+                    // Silently ignore - this is a best-effort tracking
+                }
                 
                 // Increment command counter for terminal refresh tracking
                 this.terminalCommandCount++;
