@@ -1059,7 +1059,7 @@ export class AgentService {
         return { recentThoughts: this.recentThoughts.slice(), summarizedArchive: this.summarizedArchive };
     }
 
-    public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void) {
+    public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void, threadId: string | null) {
         // Quiet UI: no initial debug to UI; log minimal info to console
         console.log(`[AgentService] processRequest start. WD=${this.toolbox.getWorkingDirectory() || 'Not set'} promptLen=${prompt.length}`);
         this.shouldStop = false;
@@ -1086,7 +1086,7 @@ export class AgentService {
                 this.summarizedArchive = '';
             }
             console.log(`[Agent] Step ${i + 1}`);
-            const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl);
+            const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl, threadId);
             await this.recordThought(thought, sendUpdate, serverUrl);
             if (this.shouldStop) {
                 sendUpdate("❌ Stopped by user.");
@@ -1163,7 +1163,7 @@ export class AgentService {
         ];
     }
 
-    private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string): Promise<{ tool: string, args: any[], thought: string }> {
+    private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string, threadId: string | null): Promise<{ tool: string, args: any[], thought: string }> {
     console.log("[AgentService] Asking the model for the next step...");
     console.log(`[AgentService] Making request to: ${serverUrl}`);
 
@@ -1286,7 +1286,7 @@ ${JSON.stringify(truncatedHistory)}
             this.currentAbortController = new AbortController();
             
             console.log(`[AgentService] Making fetch request to: ${serverUrl}`);
-            console.log(`[AgentService] Request payload length: ${JSON.stringify({ query: fullPrompt, user_ID: "0001" }).length} characters`);
+            console.log(`[AgentService] Request payload length: ${JSON.stringify({ query: fullPrompt, user_ID: "0001", thread_id: threadId }).length} characters`);
             
             const response = await fetch(serverUrl, {
                 method: 'POST',
@@ -1295,7 +1295,8 @@ ${JSON.stringify(truncatedHistory)}
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,
-                    user_ID: "0001"
+                    user_ID: "0001",
+                    thread_id: threadId
                 }),
                 signal: this.currentAbortController.signal
             });

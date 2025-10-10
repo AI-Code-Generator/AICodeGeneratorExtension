@@ -298,7 +298,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 });
                 
                 let agentResponse = '';
-                let assistantMsgId: string | null = null;
                 let isFirstUpdate = true;
                 
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
@@ -320,7 +319,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             sender: 'assistant'
                         });
                     }
-                }).finally(async () => {
+                }, this.currentThread?.id ?? null).finally(async () => {
                     // Save final agent response to thread
                     if (agentResponse.trim()) {
                         await this.addMessageToCurrentThread('assistant', agentResponse.trim());
