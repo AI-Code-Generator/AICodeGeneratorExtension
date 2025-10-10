@@ -23,6 +23,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private currentAgentResponseIndex: number = -1; // Track current streaming response
     private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
     private pendingTerminalCommandResolve?: (value: boolean) => void; // For terminal command confirmations
+    private agentResponse: string = '';
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -297,17 +298,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     show: false
                 });
                 
-                let agentResponse = '';
+                this.agentResponse = '';
                 let isFirstUpdate = true;
                 
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
-                    agentResponse += update + '\n';
+                    this.agentResponse += update + '\n';
                     
                     if (isFirstUpdate) {
                         // Create the initial assistant message bubble
                         this._view?.webview.postMessage({
                             type: 'addMessage',
-                            message: agentResponse.trim(),
+                            message: this.agentResponse.trim(),
                             sender: 'assistant'
                         });
                         isFirstUpdate = false;
@@ -315,14 +316,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Update the existing assistant message bubble with full content
                         this._view?.webview.postMessage({
                             type: 'updateMessage',
-                            message: agentResponse.trim(),
+                            message: this.agentResponse.trim(),
                             sender: 'assistant'
                         });
                     }
                 }, this.currentThread?.id ?? null).finally(async () => {
                     // Save final agent response to thread
-                    if (agentResponse.trim()) {
-                        await this.addMessageToCurrentThread('assistant', agentResponse.trim());
+                    if (this.agentResponse.trim()) {
+                        await this.addMessageToCurrentThread('assistant', this.agentResponse.trim());
                     }
                     
                     this.isProcessing = false;
@@ -494,6 +495,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         if (this.agentService) {
             this.agentService.stop();
+        }
+        if (this.agentResponse.trim()) {
+            this.addMessageToCurrentThread('assistant', this.agentResponse.trim());
         }
         this.isProcessing = false;
         this.updateProcessingState();
