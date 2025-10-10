@@ -60,20 +60,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async initializeThreads() {
         try {
-            // Load or create initial thread
+            // Load last active thread
             const lastThreadId = this._context.globalState.get<string>('currentThreadId');
             if (lastThreadId) {
                 this.currentThread = await this.threadManager.getThread(lastThreadId);
             }
-            
-            // If no thread exists, create a new one
-            if (!this.currentThread) {
-                this.currentThread = await this.threadManager.createNewThread();
-            }
         } catch (error) {
             console.error('Failed to initialize threads:', error);
-            // Create a new thread as fallback
-            this.currentThread = await this.threadManager.createNewThread();
+            this.currentThread = null;
         }
     }
 
@@ -570,13 +564,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
             await this.threadManager.deleteThread(threadId);
             
-            // If we deleted the current thread, create a new one
             if (this.currentThread && this.currentThread.id === threadId) {
-                this.currentThread = await this.threadManager.createNewThread();
-                await this.sendCurrentThreadToWebview();
+                this.currentThread = null;
+                this._context.globalState.update('currentThreadId', undefined);
+                this._view?.webview.postMessage({ type: 'showThreadHistory' });
             }
             
-            // Update thread list
             await this.sendThreadListToWebview();
             
             vscode.window.showInformationMessage('Thread deleted');
@@ -604,9 +597,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async sendCurrentThreadToWebview() {
         if (!this.currentThread) {
             this._view?.webview.postMessage({
-                type: 'loadHistory',
-                history: [],
-                threadTitle: 'New Conversation'
+                type: 'showThreadHistory'
             });
             return;
         }
@@ -645,12 +636,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return;
         }
         
-        // Delete the current thread and create a new one
-        await this.threadManager.deleteThread(this.currentThread.id);
-        this.currentThread = await this.threadManager.createNewThread();
-        
-        this._view?.webview.postMessage({ type: 'clearMessages' });
-        await this.sendThreadListToWebview();
+        await this.deleteThread(this.currentThread.id);
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
@@ -1673,6 +1659,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.type) {
+                case 'showThreadHistory':
+                    showThreadHistory();
+                    break;
                 case 'updateProcessingState':
                     isProcessing = message.isProcessing;
                     updateButtonStates();
