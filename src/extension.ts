@@ -71,7 +71,10 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             'aiCodeAssist.chatView',
-            chatViewProvider
+            chatViewProvider,
+            {
+                webviewOptions: { retainContextWhenHidden: true }
+            }
         )
     );
 

@@ -23,6 +23,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private currentAgentResponseIndex: number = -1; // Track current streaming response
     private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
     private pendingTerminalCommandResolve?: (value: boolean) => void; // For terminal command confirmations
+    private agentResponse: string = '';
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -59,20 +60,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async initializeThreads() {
         try {
-            // Load or create initial thread
+            // Load last active thread
             const lastThreadId = this._context.globalState.get<string>('currentThreadId');
             if (lastThreadId) {
                 this.currentThread = await this.threadManager.getThread(lastThreadId);
             }
-            
-            // If no thread exists, create a new one
-            if (!this.currentThread) {
-                this.currentThread = await this.threadManager.createNewThread();
-            }
         } catch (error) {
             console.error('Failed to initialize threads:', error);
-            // Create a new thread as fallback
-            this.currentThread = await this.threadManager.createNewThread();
+            this.currentThread = null;
         }
     }
 
@@ -297,18 +292,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     show: false
                 });
                 
-                let agentResponse = '';
-                let assistantMsgId: string | null = null;
+                this.agentResponse = '';
                 let isFirstUpdate = true;
                 
                 this.agentService.processRequest(data.message, agentUrl, (update) => {
-                    agentResponse += update + '\n';
+                    this.agentResponse += update + '\n';
                     
                     if (isFirstUpdate) {
                         // Create the initial assistant message bubble
                         this._view?.webview.postMessage({
                             type: 'addMessage',
-                            message: agentResponse.trim(),
+                            message: this.agentResponse.trim(),
                             sender: 'assistant'
                         });
                         isFirstUpdate = false;
@@ -316,14 +310,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Update the existing assistant message bubble with full content
                         this._view?.webview.postMessage({
                             type: 'updateMessage',
-                            message: agentResponse.trim(),
+                            message: this.agentResponse.trim(),
                             sender: 'assistant'
                         });
                     }
-                }).finally(async () => {
-                    // Save final agent response to thread
-                    if (agentResponse.trim()) {
-                        await this.addMessageToCurrentThread('assistant', agentResponse.trim());
+                }, this.currentThread?.id ?? null).finally(async () => {
+                    // Get the thought history from the agent service
+                    const thoughtHistory = this.agentService.getThoughtsDebug();
+                    let finalResponse = this.agentResponse.trim();
+                
+                    if (thoughtHistory.summarizedArchive || thoughtHistory.recentThoughts.length > 0) {
+                        let historyMarkdown = "\n\n---\n### Agent's Thought Process\n";
+                
+                        if (thoughtHistory.summarizedArchive) {
+                            historyMarkdown += `**Previous Thought Summary:**\n\`\`\`\n${thoughtHistory.summarizedArchive}\n\`\`\`\n`;
+                        }
+                
+                        if (thoughtHistory.recentThoughts.length > 0) {
+                            historyMarkdown += `**Recent Thoughts:**\n`;
+                            thoughtHistory.recentThoughts.forEach((thought, index) => {
+                                historyMarkdown += `${index + 1}. ${thought}\n`;
+                            });
+                        }
+                        
+                        finalResponse += historyMarkdown;
+                    }
+                
+                    // Save final agent response (with thoughts) to thread
+                    if (finalResponse) {
+                        await this.addMessageToCurrentThread('assistant', finalResponse);
                     }
                     
                     this.isProcessing = false;
@@ -496,6 +511,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.agentService) {
             this.agentService.stop();
         }
+        if (this.agentResponse.trim()) {
+            this.addMessageToCurrentThread('assistant', this.agentResponse.trim());
+        }
         this.isProcessing = false;
         this.updateProcessingState();
     }
@@ -567,13 +585,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
             await this.threadManager.deleteThread(threadId);
             
-            // If we deleted the current thread, create a new one
             if (this.currentThread && this.currentThread.id === threadId) {
-                this.currentThread = await this.threadManager.createNewThread();
-                await this.sendCurrentThreadToWebview();
+                this.currentThread = null;
+                this._context.globalState.update('currentThreadId', undefined);
+                this._view?.webview.postMessage({ type: 'showThreadHistory' });
             }
             
-            // Update thread list
             await this.sendThreadListToWebview();
             
             vscode.window.showInformationMessage('Thread deleted');
@@ -601,9 +618,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async sendCurrentThreadToWebview() {
         if (!this.currentThread) {
             this._view?.webview.postMessage({
-                type: 'loadHistory',
-                history: [],
-                threadTitle: 'New Conversation'
+                type: 'showThreadHistory'
             });
             return;
         }
@@ -642,12 +657,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return;
         }
         
-        // Delete the current thread and create a new one
-        await this.threadManager.deleteThread(this.currentThread.id);
-        this.currentThread = await this.threadManager.createNewThread();
-        
-        this._view?.webview.postMessage({ type: 'clearMessages' });
-        await this.sendThreadListToWebview();
+        await this.deleteThread(this.currentThread.id);
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
@@ -1670,6 +1680,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.type) {
+                case 'showThreadHistory':
+                    showThreadHistory();
+                    break;
                 case 'updateProcessingState':
                     isProcessing = message.isProcessing;
                     updateButtonStates();
