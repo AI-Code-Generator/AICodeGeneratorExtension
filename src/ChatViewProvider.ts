@@ -315,9 +315,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         });
                     }
                 }, this.currentThread?.id ?? null).finally(async () => {
-                    // Save final agent response to thread
-                    if (this.agentResponse.trim()) {
-                        await this.addMessageToCurrentThread('assistant', this.agentResponse.trim());
+                    // Get the thought history from the agent service
+                    const thoughtHistory = this.agentService.getThoughtsDebug();
+                    let finalResponse = this.agentResponse.trim();
+                
+                    if (thoughtHistory.summarizedArchive || thoughtHistory.recentThoughts.length > 0) {
+                        let historyMarkdown = "\n\n---\n### Agent's Thought Process\n";
+                
+                        if (thoughtHistory.summarizedArchive) {
+                            historyMarkdown += `**Previous Thought Summary:**\n\`\`\`\n${thoughtHistory.summarizedArchive}\n\`\`\`\n`;
+                        }
+                
+                        if (thoughtHistory.recentThoughts.length > 0) {
+                            historyMarkdown += `**Recent Thoughts:**\n`;
+                            thoughtHistory.recentThoughts.forEach((thought, index) => {
+                                historyMarkdown += `${index + 1}. ${thought}\n`;
+                            });
+                        }
+                        
+                        finalResponse += historyMarkdown;
+                    }
+                
+                    // Save final agent response (with thoughts) to thread
+                    if (finalResponse) {
+                        await this.addMessageToCurrentThread('assistant', finalResponse);
                     }
                     
                     this.isProcessing = false;
