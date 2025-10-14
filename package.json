@@ -37,12 +37,13 @@
       }
     ]
   },
-  "scripts": {
-    "vscode:prepublish": "npm run compile",
+ "scripts": {
+    "vscode:prepublish": "npm run package",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "package": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --external:tree-sitter --external:tree-sitter-java --external:tree-sitter-javascript --external:tree-sitter-typescript --external:onnxruntime-node --external:@lancedb/lancedb --format=cjs --platform=node",
     "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src",
+    "lint": "eslint src --ext ts",
     "test": "vscode-test"
   },
   "devDependencies": {
@@ -53,18 +54,19 @@
     "@typescript-eslint/parser": "^8.22.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.4.1",
+    "esbuild": "^0.25.10",
     "eslint": "^9.19.0",
     "typescript": "^5.7.3"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.5.1",
-    "@lancedb/lancedb": "^0.19.1",
-    "apache-arrow": "^20.0.0",
-    "dotenv": "^16.4.7",
-    "node-fetch": "^3.3.2",
-    "tree-sitter": "^0.22.4",
-    "tree-sitter-java": "^0.23.5",
-    "tree-sitter-javascript": "^0.23.1",
-    "tree-sitter-typescript": "^0.23.2"
+  "@huggingface/transformers": "^3.5.1",
+  "@lancedb/lancedb": "^0.19.1",
+  "apache-arrow": "^18.0.0",
+  "dotenv": "^16.4.7",
+  "node-fetch": "^3.3.2",
+  "tree-sitter": "^0.21.1",
+  "tree-sitter-java": "^0.23.5",
+  "tree-sitter-javascript": "^0.23.1",
+  "tree-sitter-typescript": "^0.23.2"
   }
 }

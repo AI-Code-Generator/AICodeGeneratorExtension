@@ -307,9 +307,6 @@ export class ASTManager {
                 const keyChild = node.childForFieldName('name');
                 return keyChild ? content.slice(keyChild.startIndex, keyChild.endIndex) : undefined;
             
-            // Java constructs
-            case 'class_declaration':
-            case 'interface_declaration':
             case 'enum_declaration':
             case 'annotation_type_declaration':
                 const javaNameChild = node.childForFieldName('name');
