@@ -36,7 +36,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._deleteMessageUrl = `${baseUrl}/delete-message`;
         this._agentUrl = `${baseUrl}/agent`;
         this.contextGatherer = new ContextGatherer();
-        this.agentService = new AgentService();
+        this.agentService = new AgentService(_context);
         this.threadManager = ThreadManager.getInstance(_context, baseUrl);
         
         // Set up terminal command callback
@@ -408,7 +408,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const totalFiles = workspaceContext.filenames?.length || 0;
                         const adaptiveLimit = this.computeSimilarityLimit(totalFiles);
 
-                        const similarityResults = await similaritySearch(enhancedQuery, adaptiveLimit);
+                        const similarityResults = await similaritySearch(enhancedQuery, this._context, adaptiveLimit);
 
                         // Transform similarity results to a compact metadata + content structure for server
                         const similarity = (similarityResults || []).map(r => ({

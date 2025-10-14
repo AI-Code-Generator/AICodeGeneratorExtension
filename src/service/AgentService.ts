@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { DiffManager } from './DiffManager';
-import { state, initializeEmbedder, embedText, embedQuery } from './FileIndexer';
+import { state, initializeEmbedder, embedQuery } from './FileIndexer';
 import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
 
 // The ToolBox holds the set of functions the agent can execute.
@@ -15,9 +15,11 @@ class ToolBox {
     private captureTimeout?: NodeJS.Timeout;
     private terminalCommandCount: number = 0;
     private readonly MAX_COMMANDS_PER_TERMINAL = 5; // Refresh terminal after 5 commands
+    private context: vscode.ExtensionContext; // Store the extension context
 
-    constructor() {
+    constructor(context: vscode.ExtensionContext) { // Accept context in constructor
         this.diffManager = DiffManager.getInstance();
+        this.context = context; // Store it
     }
 
     public setTerminalCommandCallback(callback: (command: string) => Promise<boolean>) {
@@ -557,7 +559,6 @@ class ToolBox {
             let inactivityTimeout: NodeJS.Timeout | null = null;
             let streamEnded = false;
             let streamReadingActive = false;
-            let processDetachedMessage = false;
 
             // Reset inactivity timer
             const resetInactivityTimer = () => {
@@ -854,7 +855,7 @@ class ToolBox {
         }
 
         try {
-            await initializeEmbedder();
+            await initializeEmbedder(this.context);
             const embedding = await embedQuery(query);
             const results = await state.table.vectorSearch(embedding).limit(limit).toArray();
             return results.map(result => ({
@@ -865,8 +866,8 @@ class ToolBox {
                 content: result.content,
                 score: result._distance
             }));
-        } catch (error) {
-            return [{ error: error }];
+        } catch (error: any) {
+            return [{ error: error.message }];
         }
     }
 
@@ -888,7 +889,7 @@ class ToolBox {
 }
 
 export class AgentService {
-    private toolbox = new ToolBox();
+    private toolbox: ToolBox;
     private shouldStop = false;
     private currentAbortController?: AbortController;
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
@@ -898,7 +899,8 @@ export class AgentService {
     private readonly MAX_RECENT_THOUGHTS = 5;
     private pendingSummaryTimeout?: NodeJS.Timeout;
 
-    constructor() {
+    constructor(context: vscode.ExtensionContext) {
+        this.toolbox = new ToolBox(context);
     }
 
     public setTerminalCommandCallback(callback: (command: string) => Promise<boolean>) {

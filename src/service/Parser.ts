@@ -28,17 +28,17 @@ export class CodeParser {
         
         switch(fileExtension.toLowerCase()) {
             case '.ts':
-                parser.setLanguage(TreeSitterTypeScript.typescript as unknown as Parser.Language);
+                parser.setLanguage(TreeSitterTypeScript.typescript);
                 return parser;
             case '.tsx':
-                parser.setLanguage(TreeSitterTypeScript.tsx as unknown as Parser.Language);
+                parser.setLanguage(TreeSitterTypeScript.tsx);
                 return parser;
             case '.js':
             case '.jsx':
-                parser.setLanguage(TreeSitterJavaScript as unknown as Parser.Language);
+                parser.setLanguage(TreeSitterJavaScript);
                 return parser;
             case '.java':
-                parser.setLanguage(TreeSitterJava as unknown as Parser.Language);
+                parser.setLanguage(TreeSitterJava);
                 return parser;
             // case '.py':
             //     parser.setLanguage(TreeSitterPython);
@@ -47,7 +47,7 @@ export class CodeParser {
                 return null;
         }
         // if (fileExtension.toLowerCase() === '.js' || fileExtension.toLowerCase() === '.jsx') {
-        //     parser.setLanguage(TreeSitterJavaScript as unknown as Parser.Language);
+        //     parser.setLanguage(TreeSitterJavaScript);
         //     return parser;
         // }
         // return null; 

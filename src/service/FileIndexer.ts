@@ -48,14 +48,36 @@ export const bulkState = {
     batchSize: 100
 };
 
-export async function initializeEmbedder() {
-    if (!embedder) {
+export async function initializeEmbedder(context: vscode.ExtensionContext) {
+    if (embedder) {
+        return;
+    }
+
+    try {
+        // Construct the full, platform-independent path to your bundled model folder
+        const modelPath = vscode.Uri.joinPath(
+            context.extensionUri,
+            'resources',
+            'models',
+            'all-MiniLM-L6-v2'
+        ).fsPath;
+
         const { pipeline } = await import('@huggingface/transformers');
-    // Switch to MiniLM (Transformers.js compatible model id)
-    embedder = await pipeline('feature-extraction', 'sentence-transformers/all-MiniLM-L6-v2', {
+
+        // Tell the pipeline to load the model from your local folder
+        embedder = await pipeline('feature-extraction', modelPath, {
             dtype: 'fp32',
             device: 'cpu'
         });
+
+        console.log('Embedder initialized successfully from local bundled model.');
+
+    } catch (error) {
+        console.error('Failed to initialize local embedder:', error);
+        vscode.window.showErrorMessage(
+            'Failed to load the local AI model. Similarity search and other features may be disabled. Please try reinstalling the extension.'
+        );
+        embedder = null; // Prevent further attempts
     }
 }
 
@@ -188,7 +210,7 @@ function shouldIndexFile(filePath: string): boolean {
     return true;
 }
 
-export async function readFilesRecursive(directory: string, excludeList: string[] = []): Promise<string[]> {
+export async function readFilesRecursive(directory: string, context: vscode.ExtensionContext, excludeList: string[] = []): Promise<string[]> {
     let results: string[] = [];
 
     try {
@@ -203,7 +225,7 @@ export async function readFilesRecursive(directory: string, excludeList: string[
             }
 
             if (file.isDirectory()) {
-                const subFiles = await readFilesRecursive(fullPath, excludeList);
+                const subFiles = await readFilesRecursive(fullPath, context, excludeList);
                 results = results.concat(subFiles);
             } else if (shouldIndexFile(fullPath)) {
                 results.push(fullPath);
@@ -214,7 +236,7 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                 if (shouldProcess) {
                     const chunks = CodeParser.parseCode(content, fullPath);
 
-                    await initializeEmbedder();
+                    await initializeEmbedder(context);
 
                     if (state.table) {
                         await state.table.delete(`\`filePath\` = '${fullPath.replace(/'/g, "''")}'`);
@@ -316,7 +338,7 @@ export async function embedQuery(query: string): Promise<number[]> {
     return embeddings;
 }
 
-export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = EXCLUDED_DIRS): Promise<string[]> {
+export async function indexWorkspaceFiles(storageUri: vscode.Uri, context: vscode.ExtensionContext, excludeDirs = EXCLUDED_DIRS): Promise<string[]> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         return [];
@@ -327,7 +349,7 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
 
     const rootDirectory = workspaceFolders[0].uri.fsPath;
     const startTime = Date.now();
-    const files = await readFilesRecursive(rootDirectory, excludeDirs);
+    const files = await readFilesRecursive(rootDirectory, context, excludeDirs);
     await removeDeletedFiles(rootDirectory, files, excludeDirs);
     const endTime = Date.now();
 
@@ -335,7 +357,7 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
     return files;
 }
 
-export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Uri): Promise<boolean> {
+export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Uri, context: vscode.ExtensionContext): Promise<boolean> {
     const filePath = fileUri.fsPath;
     
     try {
@@ -366,7 +388,7 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
             const chunks = CodeParser.parseCode(content, filePath);
             console.log(`Processing changed file: ${filePath}`);
             
-            await initializeEmbedder();
+            await initializeEmbedder(context);
             
             if (state.table) {
                 await state.table.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
@@ -567,14 +589,13 @@ export interface SimilaritySearchResultMetadata {
     score: number;
 }
 
-export async function similaritySearch(text: string, limit: number = 8): Promise<SimilaritySearchResultMetadata[] | null> {
+export async function similaritySearch(text: string, context: vscode.ExtensionContext, limit: number = 8): Promise<SimilaritySearchResultMetadata[] | null> {
     if (!text || !state.table) {
         return null;
     }
 
     try {
-        await initializeEmbedder();
-        // Use query embedding prefix for search queries
+        await initializeEmbedder(context);
         const embeddedText = await embedQuery(text);
 
         const results = await state.table

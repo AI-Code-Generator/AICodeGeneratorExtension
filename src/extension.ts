@@ -26,8 +26,8 @@ export function activate(context: vscode.ExtensionContext) {
         output.appendLine(`Error initializing AST Manager: ${err}`);
     });
 
-    // Index workspace files when extension activates
-    indexWorkspaceFiles(context.globalStorageUri).then(files => {
+    // Index workspace files when extension activates, passing the context
+    indexWorkspaceFiles(context.globalStorageUri, context).then(files => {
         output.appendLine(`Indexed ${files.length} files in workspace`);
     }).catch(err => {
         output.appendLine('Error indexing workspace:');
@@ -39,7 +39,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Handle file changes
     fileWatcher.onDidChange(async (uri) => {
         try {
-            await indexSingleFile(uri, context.globalStorageUri);
+            await indexSingleFile(uri, context.globalStorageUri, context);
             output.appendLine(`Reindexed changed file: ${uri.fsPath}`);
         } catch (err) {
             output.appendLine(`Error reindexing file ${uri.fsPath}: ${err}`);
@@ -49,7 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Handle file creation
     fileWatcher.onDidCreate(async (uri) => {
         try {
-            await indexSingleFile(uri, context.globalStorageUri);
+            await indexSingleFile(uri, context.globalStorageUri, context);
             output.appendLine(`Indexed new file: ${uri.fsPath}`);
         } catch (err) {
             output.appendLine(`Error indexing new file ${uri.fsPath}: ${err}`);
