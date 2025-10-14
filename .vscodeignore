@@ -1,11 +1,18 @@
-.vscode/**
-.vscode-test/**
-src/**
-.gitignore
-.yarnrc
-vsc-extension-quickstart.md
-**/tsconfig.json
-**/eslint.config.mjs
-**/*.map
-**/*.ts
-**/.vscode-test.*
+# Ignore everything by default
+**/*
+
+# But DO include the following:
+!dist/extension.js
+!package.json
+!README.md
+!CHANGELOG.md
+!resources/**
+
+# Include required native dependencies
+!node_modules/onnxruntime-node/
+!node_modules/@lancedb/lancedb/
+!node_modules/apache-arrow/
+!node_modules/tree-sitter/
+!node_modules/tree-sitter-java/
+!node_modules/tree-sitter-javascript/
+!node_modules/tree-sitter-typescript/
