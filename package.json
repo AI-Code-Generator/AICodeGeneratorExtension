@@ -41,7 +41,7 @@
     "vscode:prepublish": "npm run package",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --external:tree-sitter --external:tree-sitter-java --external:tree-sitter-javascript --external:tree-sitter-typescript --external:onnxruntime-node --external:@lancedb/lancedb --format=cjs --platform=node",
+    "package": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --external:tree-sitter --external:tree-sitter-java --external:tree-sitter-javascript --external:tree-sitter-typescript --external:onnxruntime-node --external:@lancedb/lancedb --format=cjs --platform=node --minify",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "vscode-test"
