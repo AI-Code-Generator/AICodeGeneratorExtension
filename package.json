@@ -34,6 +34,11 @@
       {
         "command": "ai-code-assist.openChat",
         "title": "Open AI Chat"
+      },
+      {
+        "command": "aiCodeAssist.logout",
+        "title": "AI Assistant: Logout",
+        "category": "AICodeAssist"
       }
     ]
   },

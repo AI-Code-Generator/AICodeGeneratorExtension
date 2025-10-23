@@ -5,6 +5,7 @@ import { ContextGatherer } from './service/ContextGatherer';
 import { AgentService } from './service/AgentService';
 import { DiffManager } from './service/DiffManager';
 import { ThreadManager, Thread, ThreadMetadata } from './service/ThreadManager';
+import { AuthManager } from './service/AuthService'; // Import AuthManager
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -12,6 +13,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _embedUrl: string;
     private readonly _enhanceUrl: string;
     private readonly _agentUrl: string;
+    private readonly _authLoginUrl: string;
+    private readonly _authRegisterUrl: string;
     private readonly _deleteMessageUrl?: string; // optional; server must implement
     private contextGatherer: ContextGatherer;
     private agentService: AgentService;
@@ -24,26 +27,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private saveHistoryTimeout?: NodeJS.Timeout; // Debounce history saves
     private pendingTerminalCommandResolve?: (value: boolean) => void; // For terminal command confirmations
     private agentResponse: string = '';
+    private authManager: AuthManager; // Add AuthManager
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         baseUrl: string,
-        private readonly _context: vscode.ExtensionContext
+        private readonly _context: vscode.ExtensionContext,
+        authManager: AuthManager // Receive AuthManager
     ) {
         this._queryUrl = `${baseUrl}/ask-ai`;
         this._embedUrl = `${baseUrl}/embed`;
         this._enhanceUrl = `${baseUrl}/enhance-query`;
         this._deleteMessageUrl = `${baseUrl}/delete-message`;
         this._agentUrl = `${baseUrl}/agent`;
+        this._authLoginUrl = `${baseUrl}/auth/login`; // Auth endpoint
+        this._authRegisterUrl = `${baseUrl}/auth/register`; // Auth endpoint
+
+        this.authManager = authManager; // Store AuthManager
         this.contextGatherer = new ContextGatherer();
         this.agentService = new AgentService(_context);
-        this.threadManager = ThreadManager.getInstance(_context, baseUrl);
+        
+        // Pass AuthManager to ThreadManager
+        this.threadManager = ThreadManager.getInstance(_context, baseUrl, this.authManager);
         
         // Set up terminal command callback
         this.agentService.setTerminalCommandCallback(this.handleTerminalCommandConfirmation.bind(this));
         
-        // Initialize threads
-        this.initializeThreads();
+        // Initialize threads (will be deferred until user is logged in)
+        // this.initializeThreads(); // We'll do this after login check
     }
 
     private generateId(prefix: string): string {
@@ -59,18 +70,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async initializeThreads() {
+        // Check for auth first
+        const token = await this.authManager.getToken();
+        if (!token) {
+            this._view?.webview.postMessage({ type: 'showLogin' });
+            return;
+        }
+
         try {
             // Load last active thread
             const lastThreadId = this._context.globalState.get<string>('currentThreadId');
             if (lastThreadId) {
+                // This will fetch from server, protected by auth
                 this.currentThread = await this.threadManager.getThread(lastThreadId);
+                if (!this.currentThread) {
+                    // Thread wasn't found or didn't belong to this user
+                    this._context.globalState.update('currentThreadId', undefined);
+                }
             }
+            
+            // Send logged-in user ID (or email) to webview for display
+            const userId = this.authManager.getUserIdFromToken(token);
+            this._view?.webview.postMessage({ type: 'loginSuccess', userId: userId });
+
         } catch (error) {
             console.error('Failed to initialize threads:', error);
+            // If auth failed, show login
+            if ((error as Error).message.includes('Not authenticated')) {
+                 this._view?.webview.postMessage({ type: 'showLogin' });
+            }
             this.currentThread = null;
         }
     }
 
+    // ... (getCodeContext, embedCodeContext, enhanceQuery, computeSimilarityLimit remain the same) ...
     private getCodeContext(editor: vscode.TextEditor | undefined, surroundingLines: number = 5): string {
         if (!editor) {
             return '';
@@ -115,11 +148,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async enhanceQuery(originalQuery: string, enhancedContext: any): Promise<string> {
+        const token = await this.authManager.getToken();
+        if (!token) {
+            throw new Error('Not authenticated');
+        }
+
         try {
             const response = await fetch(this._enhanceUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}` // Add auth header
                 },
                 body: JSON.stringify({
                     question: originalQuery,
@@ -154,6 +193,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return 80; // cap to avoid overloading request size
     }
 
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         context: vscode.WebviewViewResolveContext,
@@ -175,8 +215,89 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Handle messages from the webview
         const agentUrl = this._agentUrl.valueOf();
         webviewView.webview.onDidReceiveMessage(async (data) => {
+            
+            // --- NEW AUTH HANDLERS ---
+            if (data.type === 'login') {
+                try {
+                    const formData = new URLSearchParams();
+                    formData.append('username', data.email);
+                    formData.append('password', data.password);
+
+                    const response = await fetch(this._authLoginUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: formData.toString()
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({ detail: 'Login failed' }));
+                        throw new Error(errorData.detail);
+                    }
+
+                    const result = await response.json();
+                    await this.authManager.setToken(result.access_token);
+                    
+                    // Re-initialize threads and state
+                    await this.initializeThreads();
+                    
+                    // Send threads and history
+                    await this.sendThreadListToWebview();
+                    await this.sendCurrentThreadToWebview();
+
+                } catch (error: any) {
+                    this._view?.webview.postMessage({ type: 'authError', message: error.message });
+                }
+                return;
+            }
+
+            if (data.type === 'register') {
+                 try {
+                    const formData = new URLSearchParams();
+                    formData.append('username', data.email);
+                    formData.append('password', data.password);
+
+                    const response = await fetch(this._authRegisterUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: formData.toString()
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({ detail: 'Registration failed' }));
+                        throw new Error(errorData.detail);
+                    }
+                    
+                    this._view?.webview.postMessage({ type: 'registrationSuccess' });
+
+                } catch (error: any) {
+                    this._view?.webview.postMessage({ type: 'authError', message: error.message });
+                }
+                return;
+            }
+            
+            if (data.type === 'logout') {
+                await this.authManager.clearToken();
+                this.currentThread = null;
+                this._view?.webview.postMessage({ type: 'showLogin' });
+                return;
+            }
+
             if (data.type === 'requestState') {
-                // Send current processing state, mode, and history to webview
+                // Check auth first
+                const token = await this.authManager.getToken();
+                if (!token) {
+                    this._view?.webview.postMessage({ type: 'showLogin' });
+                    return;
+                }
+                
+                // User is logged in, proceed
+                const userId = this.authManager.getUserIdFromToken(token);
+                this._view?.webview.postMessage({ type: 'loginSuccess', userId: userId });
+
                 this.updateProcessingState();
                 this._view?.webview.postMessage({
                     type: 'updateMode',
@@ -186,6 +307,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 await this.sendThreadListToWebview();
                 return;
             }
+
+            // --- END AUTH HANDLERS ---
+            
+            // All handlers below this point should be protected
+            const token = await this.authManager.getToken();
+            if (!token) {
+                this._view?.webview.postMessage({ type: 'showLogin' });
+                vscode.window.showErrorMessage('You must be logged in to perform this action.');
+                return;
+            }
+
 
             if (data.type === 'newThread') {
                 await this.createNewThread();
@@ -218,7 +350,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 idsToDelete.push(nextMessage.id);
                             }
                         }
-            
+                        
+                        // This call is now authenticated
                         await this.threadManager.deleteMessages(this.currentThread.id, idsToDelete);
                         
                         // Update the webview
@@ -258,7 +391,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             if (data.type === 'clearMessages') {
-                this.clearMessages();
+                this.clearMessages(); // This is an alias for deleteThread
                 return;
             }
 
@@ -295,26 +428,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 this.agentResponse = '';
                 let isFirstUpdate = true;
                 
-                this.agentService.processRequest(data.message, agentUrl, (update) => {
-                    this.agentResponse += update + '\n';
-                    
-                    if (isFirstUpdate) {
-                        // Create the initial assistant message bubble
-                        this._view?.webview.postMessage({
-                            type: 'addMessage',
-                            message: this.agentResponse.trim(),
-                            sender: 'assistant'
-                        });
-                        isFirstUpdate = false;
-                    } else {
-                        // Update the existing assistant message bubble with full content
-                        this._view?.webview.postMessage({
-                            type: 'updateMessage',
-                            message: this.agentResponse.trim(),
-                            sender: 'assistant'
-                        });
-                    }
-                }, this.currentThread?.id ?? null).finally(async () => {
+                // AgentService.processRequest now needs the auth token
+                this.agentService.processRequest(
+                    data.message, 
+                    agentUrl, 
+                    token, // Pass auth token
+                    (update) => {
+                        this.agentResponse += update + '\n';
+                        
+                        if (isFirstUpdate) {
+                            // Create the initial assistant message bubble
+                            this._view?.webview.postMessage({
+                                type: 'addMessage',
+                                message: this.agentResponse.trim(),
+                                sender: 'assistant'
+                            });
+                            isFirstUpdate = false;
+                        } else {
+                            // Update the existing assistant message bubble with full content
+                            this._view?.webview.postMessage({
+                                type: 'updateMessage',
+                                message: this.agentResponse.trim(),
+                                sender: 'assistant'
+                            });
+                        }
+                    }, 
+                    this.currentThread?.id ?? null
+                ).finally(async () => {
                     // Get the thought history from the agent service
                     const thoughtHistory = this.agentService.getThoughtsDebug();
                     let finalResponse = this.agentResponse.trim();
@@ -376,16 +516,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         // Get code context around cursor
                         const codeContext = this.getCodeContext(editor);
                         
-                        // Embed the code context
-                        // await this.embedCodeContext(codeContext, fileLanguage);
-
                         // Prepare the query with context
                         let query = `${data.message}\n\nLanguage: ${fileLanguage}`;
                         if (selectedCode.trim()) {
                             query += `\nSelected code:\n${selectedCode}`;
                         }
-
-                        // const similarity =  await similaritySearch(data.message);
 
                         // Gather workspace and file context using AST Manager
                         const workspaceContext = this.contextGatherer.gatherWorkspaceContext();
@@ -410,7 +545,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                         const similarityResults = await similaritySearch(enhancedQuery, this._context, adaptiveLimit);
 
-                        // Transform similarity results to a compact metadata + content structure for server
+                        // Transform similarity results
                         const similarity = (similarityResults || []).map(r => ({
                             filePath: r.filePath,
                             startLine: r.startLine,
@@ -431,10 +566,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             id: userMessageId
                         });
 
-                        // Server expects context: Optional[List[str]]; convert metadata objects to formatted strings
+                        // Server expects context: Optional[List[str]];
                         const contextStrings = similarity.map(s => {
                             const header = `<Chunk Info> ${s.filePath}: Line${s.startLine}-${s.endLine} [${s.type}] similarity score=${s.score.toFixed(3)}`;
-                            // Trim content to avoid huge payloads
                             const trimmed = s.content.length > 800 ? s.content.slice(0, 800) + '...<trimmed>' : s.content;
                             return header + "\n" + trimmed;
                         });
@@ -449,16 +583,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${token}` // Add auth header
                             },
                             body: JSON.stringify({ 
                                 query: query,
                                 context: contextStrings,
-                                user_ID: "0001",
+                                // user_ID is removed
                                 thread_id: this.currentThread?.id,
                                 message_id: userMessageId
                             }),
                             signal: this.currentAbortController.signal
                         });
+                        
+                        if (!response.ok) {
+                             if (response.status === 401) {
+                                throw new Error('Authentication failed. Please log out and log in again.');
+                            }
+                            const errorData = await response.json().catch(() => ({}));
+                            throw new Error(`Server request failed: ${response.statusText} - ${errorData.detail || ''}`);
+                        }
 
                         const jsonResponse: any = await response.json();
 
@@ -474,15 +617,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                                 id: respId
                             });
                         } else {
-                            throw new Error('Server request failed');
+                            throw new Error(`Server returned an error: ${jsonResponse.error}`);
                         }
                     } catch (error: any) {
                         let errorMessage = '';
                         if (error.name === 'AbortError') {
                             errorMessage = 'Request was stopped by user.';
                         } else {
-                            vscode.window.showErrorMessage(`Error: ${error}`);
-                            errorMessage = 'Sorry, there was an error processing your request.';
+                            vscode.window.showErrorMessage(`Error: ${error.message}`);
+                            errorMessage = `Sorry, there was an error processing your request: ${error.message}`;
                         }
                         
                         // Add error message to thread
@@ -494,6 +637,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             sender: 'assistant',
                             id: errId
                         });
+
+                        if (error.message.includes('Authentication failed')) {
+                            this.logout();
+                        }
                     } finally {
                         this.isProcessing = false;
                         this.currentAbortController = undefined;
@@ -502,6 +649,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
             }
         });
+    }
+
+    public logout() {
+        this.authManager.clearToken();
+        this.currentThread = null;
+        this._view?.webview.postMessage({ type: 'showLogin' });
     }
 
     private stopCurrentProcess() {
@@ -555,9 +708,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this.sendThreadListToWebview();
             
             vscode.window.showInformationMessage('New conversation thread created');
-        } catch (error) {
+        } catch (error: any) {
             console.error('Failed to create new thread:', error);
-            vscode.window.showErrorMessage('Failed to create new thread');
+            vscode.window.showErrorMessage(`Failed to create new thread: ${error.message}`);
         }
     }
 
@@ -575,9 +728,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // Send thread messages to webview
             await this.sendCurrentThreadToWebview();
             
-        } catch (error) {
+        } catch (error: any) {
             console.error('Failed to switch thread:', error);
-            vscode.window.showErrorMessage('Failed to switch thread');
+            vscode.window.showErrorMessage(`Failed to switch thread: ${error.message}`);
         }
     }
 
@@ -594,9 +747,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this.sendThreadListToWebview();
             
             vscode.window.showInformationMessage('Thread deleted');
-        } catch (error) {
+        } catch (error: any) {
             console.error('Failed to delete thread:', error);
-            vscode.window.showErrorMessage('Failed to delete thread');
+            vscode.window.showErrorMessage(`Failed to delete thread: ${error.message}`);
         }
     }
 
@@ -647,8 +800,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 threads: threads,
                 currentThreadId: this.currentThread?.id || null
             });
-        } catch (error) {
+        } catch (error: any) {
             console.error('Failed to send thread list:', error);
+            // Don't show error to user, just log it
         }
     }
 
@@ -661,6 +815,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
+        // Updated HTML with login/register UI
         return `
         <!DOCTYPE html>
 <html lang="en">
@@ -670,9 +825,95 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <style>
         body { 
             font-family: var(--vscode-font-family); 
-            padding: 10px; 
+            padding: 0; 
             margin: 0;
+            overflow: hidden;
+            height: 100vh;
         }
+        /* --- Login View --- */
+        .login-view {
+            display: none; /* Hidden by default */
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .login-view.active {
+            display: flex;
+        }
+        .auth-container {
+            width: 100%;
+            max-width: 320px;
+            padding: 20px;
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 6px;
+        }
+        .auth-container h2 {
+            text-align: center;
+            margin-top: 0;
+            margin-bottom: 20px;
+            color: var(--vscode-foreground);
+        }
+        .auth-form-group {
+            margin-bottom: 15px;
+        }
+        .auth-form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 13px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .auth-input {
+            width: 100%;
+            padding: 8px;
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            color: var(--vscode-input-foreground);
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .auth-button {
+            width: 100%;
+            padding: 10px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .auth-button:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .auth-switch-link {
+            margin-top: 15px;
+            text-align: center;
+            font-size: 13px;
+        }
+        .auth-switch-link a {
+            color: var(--vscode-textLink-foreground);
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .auth-switch-link a:hover {
+            text-decoration: underline;
+        }
+        .auth-error {
+            color: var(--vscode-errorForeground);
+            background: var(--vscode-inputValidation-errorBackground);
+            border: 1px solid var(--vscode-inputValidation-errorBorder);
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            margin-bottom: 15px;
+            display: none;
+            text-align: center;
+        }
+
+        /* --- Main App Views --- */
         .mode-selector {
             display: flex;
             gap: 10px;
@@ -686,7 +927,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             display: flex;
             gap: 10px;
         }
-        .clear-button {
+        .clear-button, .logout-button {
             padding: 6px 10px;
             border: 1px solid var(--vscode-errorForeground);
             background: transparent;
@@ -696,9 +937,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-size: 12px;
             transition: all 0.2s;
         }
-        .clear-button:hover {
+        .clear-button:hover, .logout-button:hover {
             background: var(--vscode-errorForeground);
             color: white;
+        }
+        .logout-button {
+             border-color: var(--vscode-descriptionForeground);
+             color: var(--vscode-descriptionForeground);
+             margin-left: 10px;
+        }
+        .logout-button:hover {
+            background: var(--vscode-descriptionForeground);
+            color: var(--vscode-editor-background);
         }
         .mode-button {
             padding: 8px 12px;
@@ -796,6 +1046,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             overflow-y: auto;
             padding: 10px;
             margin-bottom: 140px; /* Increased margin for bulk actions + input */
+            box-sizing: border-box;
         }
         .loading {
             display: none;
@@ -1025,6 +1276,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             height: 100vh;
             overflow-y: auto;
             padding: 20px;
+            box-sizing: border-box;
         }
         .thread-history-view.active {
             display: block;
@@ -1154,15 +1406,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        .chat-header-actions {
+            display: flex;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
-    <div id="threadHistoryView" class="thread-history-view active">
+
+    <div id="loginView" class="login-view active">
+        <div id="loginContainer" class="auth-container">
+            <h2>Login</h2>
+            <div id="loginError" class="auth-error"></div>
+            <form id="loginForm">
+                <div class="auth-form-group">
+                    <label for="loginEmail">Email</label>
+                    <input type="email" id="loginEmail" class="auth-input" required>
+                </div>
+                <div class="auth-form-group">
+                    <label for="loginPassword">Password</label>
+                    <input type="password" id="loginPassword" class="auth-input" required>
+                </div>
+                <button type="submit" id="loginButton" class="auth-button">Login</button>
+            </form>
+            <div class="auth-switch-link">
+                Don't have an account? <a id="showRegisterLink">Register</a>
+            </div>
+        </div>
+        
+        <div id="registerContainer" class="auth-container" style="display: none;">
+            <h2>Register</h2>
+            <div id="registerError" class="auth-error"></div>
+            <form id="registerForm">
+                <div class="auth-form-group">
+                    <label for="registerEmail">Email</label>
+                    <input type="email" id="registerEmail" class="auth-input" required>
+                </div>
+                <div class="auth-form-group">
+                    <label for="registerPassword">Password</label>
+                    <input type="password" id="registerPassword" class="auth-input" required>
+                </div>
+                <button type="submit" id="registerButton" class="auth-button">Register</button>
+            </form>
+            <div class="auth-switch-link">
+                Already have an account? <a id="showLoginLink">Login</a>
+            </div>
+        </div>
+    </div>
+
+    <div id="threadHistoryView" class="thread-history-view">
         <div class="thread-history-header">
             <h2>Conversation History</h2>
         </div>
         <div class="thread-history-actions">
             <button id="newThreadButton" class="new-thread-button">+ New Conversation</button>
+            <button id="logoutButtonHistory" class="logout-button">Logout</button>
         </div>
         <div id="threadList" class="thread-list">
             <div class="empty-threads">
@@ -1183,7 +1481,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     <button id="agentButton" class="mode-button">Agent</button>
                 </div>
             </div>
-            <button id="clearButton" class="clear-button" title="Clear this conversation">🗑️ Clear</button>
+            <div class="chat-header-actions">
+                <button id="clearButton" class="clear-button" title="Clear this conversation">🗑️ Clear</button>
+                <button id="logoutButtonChat" class="logout-button">Logout</button>
+            </div>
         </div>
         <div id="chatMessages"></div>
         <div id="bulkActions" class="bulk-actions">
@@ -1207,6 +1508,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     <script>
         const vscode = acquireVsCodeApi();
+        
+        // --- Auth Elements ---
+        const loginView = document.getElementById('loginView');
+        const loginContainer = document.getElementById('loginContainer');
+        const registerContainer = document.getElementById('registerContainer');
+        const loginForm = document.getElementById('loginForm');
+        const registerForm = document.getElementById('registerForm');
+        const loginEmail = document.getElementById('loginEmail');
+        const loginPassword = document.getElementById('loginPassword');
+        const registerEmail = document.getElementById('registerEmail');
+        const registerPassword = document.getElementById('registerPassword');
+        const showRegisterLink = document.getElementById('showRegisterLink');
+        const showLoginLink = document.getElementById('showLoginLink');
+        const loginError = document.getElementById('loginError');
+        const registerError = document.getElementById('registerError');
+
+        // --- Chat Elements ---
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
         const stopButton = document.getElementById('stopButton');
@@ -1224,20 +1542,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const chatView = document.getElementById('chatView');
         const threadList = document.getElementById('threadList');
         const chatHeaderTitle = document.getElementById('chatHeaderTitle');
+        const logoutButtonHistory = document.getElementById('logoutButtonHistory');
+        const logoutButtonChat = document.getElementById('logoutButtonChat');
         
         let currentMode = 'ask';
         let isProcessing = false;
         let currentThreadId = null;
         let threads = [];
 
-        // View Management
+        // --- Auth View Management ---
+        function showLoginView() {
+            loginView.classList.add('active');
+            threadHistoryView.classList.remove('active');
+            chatView.classList.remove('active');
+            loginContainer.style.display = 'block';
+            registerContainer.style.display = 'none';
+            loginError.style.display = 'none';
+            registerError.style.display = 'none';
+        }
+
+        function showRegisterView() {
+            loginView.classList.add('active');
+            threadHistoryView.classList.remove('active');
+            chatView.classList.remove('active');
+            loginContainer.style.display = 'none';
+            registerContainer.style.display = 'block';
+            loginError.style.display = 'none';
+            registerError.style.display = 'none';
+        }
+        
+        function showAuthError(view, message) {
+            const errorEl = view === 'login' ? loginError : registerError;
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+        }
+
+        // --- Chat View Management ---
         function showThreadHistory() {
+            loginView.classList.remove('active');
             threadHistoryView.classList.add('active');
             chatView.classList.remove('active');
             vscode.postMessage({ type: 'loadThreadList' });
         }
 
         function showChat() {
+            loginView.classList.remove('active');
             threadHistoryView.classList.remove('active');
             chatView.classList.add('active');
         }
@@ -1321,6 +1670,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return date.toLocaleDateString();
         }
 
+        // --- Event Listeners ---
+        
+        // Auth Listeners
+        showRegisterLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            showRegisterView();
+        });
+
+        showLoginLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            showLoginView();
+        });
+
+        loginForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const email = loginEmail.value;
+            const password = loginPassword.value;
+            loginError.style.display = 'none';
+            vscode.postMessage({ type: 'login', email, password });
+        });
+
+        registerForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const email = registerEmail.value;
+            const password = registerPassword.value;
+            registerError.style.display = 'none';
+            vscode.postMessage({ type: 'register', email, password });
+        });
+        
+        logoutButtonHistory.addEventListener('click', () => {
+             vscode.postMessage({ type: 'logout' });
+        });
+        logoutButtonChat.addEventListener('click', () => {
+             vscode.postMessage({ type: 'logout' });
+        });
+
+
         // Button Event Listeners
         backButton.addEventListener('click', () => {
             showThreadHistory();
@@ -1380,6 +1766,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }, 300);
         });
 
+        // ... (createCodeBlock, processMarkdown, processInlineMarkdown, showTerminalCommandConfirmation remain the same) ...
         // Create a code block with header and copy button
         function createCodeBlock(code, language) {
             const container = document.createElement('div');
@@ -1625,6 +2012,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
 
+
         function sendMessage() {
             const message = messageInput.value.trim();
             if (message && !isProcessing) {
@@ -1680,6 +2068,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.type) {
+                // --- Auth Messages ---
+                case 'showLogin':
+                    showLoginView();
+                    break;
+                case 'loginSuccess':
+                    // We are logged in, show the thread history
+                    showThreadHistory();
+                    break;
+                case 'authError':
+                    // Show error in the correct form
+                    if (loginContainer.style.display === 'block') {
+                        showAuthError('login', message.message);
+                    } else {
+                        showAuthError('register', message.message);
+                    }
+                    break;
+                case 'registrationSuccess':
+                    // Show message and switch to login view
+                    registerError.style.display = 'none';
+                    loginError.textContent = 'Registration successful! Please log in.';
+                    loginError.style.display = 'block';
+                    showLoginView();
+                    break;
+
+                // --- Chat Messages ---
                 case 'showThreadHistory':
                     showThreadHistory();
                     break;
@@ -1982,10 +2395,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         // Initial setup
-        messageInput.focus();
         updateButtonStates();
         
         // Request current processing state from extension
+        // This will now trigger the auth check
         vscode.postMessage({
             type: 'requestState'
         });

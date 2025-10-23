@@ -1,5 +1,6 @@
 // src/service/ThreadManager.ts
 import * as vscode from 'vscode';
+import { AuthManager } from './AuthService'; // Import AuthManager
 
 export interface Thread {
     id: string;
@@ -29,18 +30,20 @@ export class ThreadManager {
     private context: vscode.ExtensionContext;
     private currentThreadId: string | null = null;
     private baseUrl: string;
+    private authManager: AuthManager; // Add AuthManager
 
-    private constructor(context: vscode.ExtensionContext, baseUrl: string) {
+    private constructor(context: vscode.ExtensionContext, baseUrl: string, authManager: AuthManager) {
         this.context = context;
         this.baseUrl = baseUrl;
+        this.authManager = authManager; // Store AuthManager
     }
 
-    public static getInstance(context?: vscode.ExtensionContext, baseUrl?: string): ThreadManager {
+    public static getInstance(context?: vscode.ExtensionContext, baseUrl?: string, authManager?: AuthManager): ThreadManager {
         if (!ThreadManager.instance) {
-            if (!context || !baseUrl) {
-                throw new Error('ThreadManager must be initialized with context and baseUrl first');
+            if (!context || !baseUrl || !authManager) {
+                throw new Error('ThreadManager must be initialized with context, baseUrl, and authManager first');
             }
-            ThreadManager.instance = new ThreadManager(context, baseUrl);
+            ThreadManager.instance = new ThreadManager(context, baseUrl, authManager);
         }
         return ThreadManager.instance;
     }
@@ -83,6 +86,9 @@ export class ThreadManager {
 
     public setCurrentThreadId(threadId: string) {
         this.currentThreadId = threadId;
+        // Store last thread ID per-project and per-user
+        // We can't get user ID here easily, so let's just store it globally.
+        // The server will validate if the user can access it.
         this.context.globalState.update('currentThreadId', threadId);
     }
 
@@ -110,15 +116,14 @@ export class ThreadManager {
             });
         }
 
-        // Save to server
+        // Save to server (will now require auth)
         try {
             await this.saveThreadToServer(thread);
         } catch (error) {
             console.error('Failed to save thread to server:', error);
+            // Don't save to local storage if server save fails, as it's out of sync
+            throw error; // Re-throw to notify caller
         }
-
-        // Save to local storage as backup
-        await this.saveThreadToLocalStorage(thread);
 
         // Set as current thread
         this.setCurrentThreadId(threadId);
@@ -139,12 +144,12 @@ export class ThreadManager {
             if (thread) {
                 return thread;
             }
+            return null; // If server returns null (e.g., 404), don't check local
         } catch (error) {
             console.error('Failed to get thread from server:', error);
+            // Fallback to local storage (e.g., if offline)
+            return await this.getThreadFromLocalStorage(threadId);
         }
-
-        // Fallback to local storage
-        return await this.getThreadFromLocalStorage(threadId);
     }
 
     public async getThreads(projectPath?: string): Promise<ThreadMetadata[]> {
@@ -153,21 +158,51 @@ export class ThreadManager {
         // Try to get from server first
         try {
             const threads = await this.getThreadsFromServer(currentProject);
-            if (threads && threads.length > 0) {
-                return threads;
-            }
+            // Sync local storage with server list
+            await this.syncLocalStorageWithServer(threads);
+            return threads;
         } catch (error) {
             console.error('Failed to get threads from server:', error);
+            // Fallback to local storage
+            return await this.getThreadsFromLocalStorage(currentProject);
         }
-
-        // Fallback to local storage
-        return await this.getThreadsFromLocalStorage(currentProject);
+    }
+    
+    // Helper to update local storage based on server data
+    private async syncLocalStorageWithServer(serverThreads: ThreadMetadata[]): Promise<void> {
+        const projectPath = this.getCurrentProjectPath();
+        const threadsKey = `threads_${this.sanitizeProjectPath(projectPath)}`;
+        const localThreadMetas = await this.getThreadsFromLocalStorage(projectPath);
+        
+        // Simple sync: just overwrite local list with server list metadata
+        // A more complex sync would merge, but this is fine for now.
+        const localThreads: Thread[] = []; // We can't reconstruct full threads from metadata
+        
+        // This is tricky. We'll just update the metadata list,
+        // but can't fully update the local Thread[] cache without full data.
+        // For simplicity, let's clear local cache if we get a server list.
+        // This isn't perfect, but ensures we don't show stale local data.
+        
+        // A better approach: store threads locally by ID.
+        // Let's modify local storage to be a map.
+        const threadsKeyMap = `threads_map_${this.sanitizeProjectPath(projectPath)}`;
+        const localThreadMap = this.context.globalState.get<{[id: string]: Thread}>(threadsKeyMap, {});
+        
+        // Remove threads from local map that are NOT on the server
+        for (const localId in localThreadMap) {
+            if (!serverThreads.find(st => st.id === localId)) {
+                delete localThreadMap[localId];
+            }
+        }
+        await this.context.globalState.update(threadsKeyMap, localThreadMap);
     }
 
+
     public async addMessageToThread(threadId: string, type: 'user' | 'assistant', content: string): Promise<void> {
+        // Get thread from server to ensure we're up-to-date
         const thread = await this.getThread(threadId);
         if (!thread) {
-            throw new Error(`Thread ${threadId} not found`);
+            throw new Error(`Thread ${threadId} not found or access denied`);
         }
 
         const message = {
@@ -188,32 +223,30 @@ export class ThreadManager {
         // Save to server
         try {
             await this.saveThreadToServer(thread);
+            // Also update local cache
+            await this.saveThreadToLocalStorage(thread); 
         } catch (error) {
             console.error('Failed to save thread to server:', error);
+            throw error; // Re-throw
         }
-
-        // Save to local storage as backup
-        await this.saveThreadToLocalStorage(thread);
     }
 
     public async deleteMessages(threadId: string, messageIds: string[]): Promise<void> {
-        const thread = await this.getThread(threadId);
-        if (!thread) {
-            throw new Error(`Thread ${threadId} not found`);
-        }
-
-        thread.messages = thread.messages.filter(m => !messageIds.includes(m.id));
-        thread.updatedAt = Date.now();
-
-        // Save to server
+        // Delete from server first
         try {
             await this.deleteMessagesFromServer(threadId, messageIds);
         } catch (error) {
             console.error('Failed to delete messages from server:', error);
+            throw error; // Re-throw
         }
 
-        // Save to local storage as backup
-        await this.saveThreadToLocalStorage(thread);
+        // Update local storage
+        const thread = await this.getThreadFromLocalStorage(threadId);
+        if (thread) {
+            thread.messages = thread.messages.filter(m => !messageIds.includes(m.id));
+            thread.updatedAt = Date.now();
+            await this.saveThreadToLocalStorage(thread);
+        }
     }
 
     public async deleteThread(threadId: string): Promise<void> {
@@ -222,6 +255,7 @@ export class ThreadManager {
             await this.deleteThreadFromServer(threadId);
         } catch (error) {
             console.error('Failed to delete thread from server:', error);
+            throw error; // Re-throw
         }
 
         // Delete from local storage
@@ -233,14 +267,25 @@ export class ThreadManager {
             this.context.globalState.update('currentThreadId', null);
         }
     }
+    
+    // --- Helper for getting auth headers ---
+    private async getAuthHeaders(): Promise<Record<string, string>> {
+        const token = await this.authManager.getToken();
+        if (!token) {
+            throw new Error('Not authenticated. Please log in.');
+        }
+        return {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        };
+    }
 
     // Server API methods
     private async saveThreadToServer(thread: Thread): Promise<void> {
+        const headers = await this.getAuthHeaders();
         const response = await fetch(`${this.baseUrl}/threads/save`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: headers,
             body: JSON.stringify({
                 thread_id: thread.id,
                 title: thread.title,
@@ -252,25 +297,29 @@ export class ThreadManager {
         });
 
         if (!response.ok) {
-            throw new Error(`Failed to save thread: ${response.statusText}`);
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`Failed to save thread: ${response.statusText} - ${errorData.detail || ''}`);
         }
     }
 
     private async getThreadFromServer(threadId: string): Promise<Thread | null> {
+        const headers = await this.getAuthHeaders();
         const response = await fetch(`${this.baseUrl}/threads/get?thread_id=${encodeURIComponent(threadId)}`, {
             method: 'GET',
-            headers: {
-                'Content-Type': 'application/json',
-            }
+            headers: headers
         });
 
-        if (!response.ok) {
+        if (response.status === 404) {
             return null;
+        }
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`Failed to get thread: ${response.statusText} - ${errorData.detail || ''}`);
         }
 
         const data = await response.json();
         if (data.thread) {
-            return {
+            const thread: Thread = {
                 id: data.thread.thread_id,
                 title: data.thread.title,
                 projectPath: data.thread.project_path,
@@ -278,24 +327,27 @@ export class ThreadManager {
                 updatedAt: data.thread.updated_at,
                 messages: data.thread.messages || []
             };
+            // Cache locally
+            await this.saveThreadToLocalStorage(thread);
+            return thread;
         }
 
         return null;
     }
 
     private async getThreadsFromServer(projectPath: string): Promise<ThreadMetadata[]> {
+        const headers = await this.getAuthHeaders();
         const response = await fetch(`${this.baseUrl}/threads/list`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: headers,
             body: JSON.stringify({
                 project_path: projectPath
             })
         });
 
         if (!response.ok) {
-            return [];
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`Failed to get threads: ${response.statusText} - ${errorData.detail || ''}`);
         }
 
         const data = await response.json();
@@ -314,27 +366,26 @@ export class ThreadManager {
     }
 
     private async deleteThreadFromServer(threadId: string): Promise<void> {
+        const headers = await this.getAuthHeaders();
         const response = await fetch(`${this.baseUrl}/threads/delete`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: headers,
             body: JSON.stringify({
                 thread_id: threadId
             })
         });
 
         if (!response.ok) {
-            throw new Error(`Failed to delete thread: ${response.statusText}`);
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`Failed to delete thread: ${response.statusText} - ${errorData.detail || ''}`);
         }
     }
 
     private async deleteMessagesFromServer(threadId: string, messageIds: string[]): Promise<void> {
+        const headers = await this.getAuthHeaders();
         const response = await fetch(`${this.baseUrl}/threads/delete-message`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: headers,
             body: JSON.stringify({
                 thread_id: threadId,
                 message_ids: messageIds
@@ -342,41 +393,30 @@ export class ThreadManager {
         });
 
         if (!response.ok) {
-            throw new Error(`Failed to delete messages: ${response.statusText}`);
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`Failed to delete messages: ${response.statusText} - ${errorData.detail || ''}`);
         }
     }
 
-    // Local storage methods (backup)
+    // Local storage methods (backup) - Now using a map for better caching
     private async saveThreadToLocalStorage(thread: Thread): Promise<void> {
-        const threadsKey = `threads_${this.sanitizeProjectPath(thread.projectPath)}`;
-        const existingThreads = this.context.globalState.get<Thread[]>(threadsKey, []);
-        
-        const index = existingThreads.findIndex(t => t.id === thread.id);
-        if (index >= 0) {
-            existingThreads[index] = thread;
-        } else {
-            existingThreads.push(thread);
-        }
-
-        await this.context.globalState.update(threadsKey, existingThreads);
+        const threadsKeyMap = `threads_map_${this.sanitizeProjectPath(thread.projectPath)}`;
+        const localThreadMap = this.context.globalState.get<{[id: string]: Thread}>(threadsKeyMap, {});
+        localThreadMap[thread.id] = thread;
+        await this.context.globalState.update(threadsKeyMap, localThreadMap);
     }
 
     private async getThreadFromLocalStorage(threadId: string): Promise<Thread | null> {
-        const threadsKey = `threads_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
-        const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
-        const thread = threads.find(t => t.id === threadId);
-        if (thread) {
-            return thread;
-        }
-
-        return null;
+        const threadsKeyMap = `threads_map_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
+        const localThreadMap = this.context.globalState.get<{[id: string]: Thread}>(threadsKeyMap, {});
+        return localThreadMap[threadId] || null;
     }
 
     private async getThreadsFromLocalStorage(projectPath: string): Promise<ThreadMetadata[]> {
-        const threadsKey = `threads_${this.sanitizeProjectPath(projectPath)}`;
-        const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
+        const threadsKeyMap = `threads_map_${this.sanitizeProjectPath(projectPath)}`;
+        const localThreadMap = this.context.globalState.get<{[id: string]: Thread}>(threadsKeyMap, {});
         
-        return threads
+        return Object.values(localThreadMap)
             .map(t => ({
                 id: t.id,
                 title: t.title,
@@ -389,12 +429,12 @@ export class ThreadManager {
     }
 
     private async deleteThreadFromLocalStorage(threadId: string): Promise<void> {
-        const threadsKey = `threads_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
-        const threads = this.context.globalState.get<Thread[]>(threadsKey, []);
-        const filteredThreads = threads.filter(t => t.id !== threadId);
+        const threadsKeyMap = `threads_map_${this.sanitizeProjectPath(this.getCurrentProjectPath())}`;
+        const localThreadMap = this.context.globalState.get<{[id: string]: Thread}>(threadsKeyMap, {});
         
-        if (filteredThreads.length !== threads.length) {
-            await this.context.globalState.update(threadsKey, filteredThreads);
+        if (localThreadMap[threadId]) {
+            delete localThreadMap[threadId];
+            await this.context.globalState.update(threadsKeyMap, localThreadMap);
         }
     }
 

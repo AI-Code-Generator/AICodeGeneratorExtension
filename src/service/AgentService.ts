@@ -912,7 +912,7 @@ export class AgentService {
         this.toolbox.setWorkingDirectory(directory);
     }
 
-    private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         // If this is the first eviction, show it directly as the previous thought summary without calling the endpoint.
         if (!this.summarizedArchive) {
             this.summarizedArchive = `[*] ${evicted}`;
@@ -931,18 +931,25 @@ export class AgentService {
         console.log(`[ThoughtSummary] Appended evicted thought. Summary length ${this.summarizedArchive.length}`);
         // If the rolling summary itself grows too large, ask for a shorter version.
         if (this.summarizedArchive.length > 10000) {
-            await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
+            await this.shortenArchiveIfTooLong(sendUpdate, serverUrl, token);
         }
     }
 
-    private async shortenArchiveIfTooLong(sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async shortenArchiveIfTooLong(sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         if (this.summarizing) { return; }
         if (!this.summarizedArchive || this.summarizedArchive.length <= 2000) { return; }
         try {
             this.summarizing = true;
             const prompt = `Shorten the following rolling summary to ~1200 characters while preserving all key decisions, constraints, unresolved items, and next actions. Use compact bullets or short paragraphs.\n\n${this.summarizedArchive}`;
             console.log('[ThoughtSummary] Shortening rolling summary (too long).');
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            const resp = await fetch(serverUrl, { 
+                method: 'POST', 
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                }, 
+                body: JSON.stringify({ query: prompt })
+            });
             if (!resp.ok) {
                 console.warn(`[ThoughtSummary] Shorten request failed status ${resp.status}`);
                 return;
@@ -960,11 +967,18 @@ export class AgentService {
         }
     }
 
-    private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         try {
             const prompt = `Summarize the following agent thought into <= 400 characters, preserving concrete next actions, file targets, and decisions. Remove repetition.\n\n${rawThought}`;
             console.log(`[Thoughts] Summarizing the thought output`);
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            const resp = await fetch(serverUrl, { 
+                method: 'POST', 
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                }, 
+                body: JSON.stringify({ query: prompt })
+            });
             if (!resp.ok) {
                 console.warn(`[Thoughts] Thought summarization failed with status ${resp.status}`);
                 return;
@@ -981,7 +995,7 @@ export class AgentService {
         }
     }
 
-    private async summarizeOriginalPrompt(prompt: string, serverUrl: string): Promise<string> {
+    private async summarizeOriginalPrompt(prompt: string, serverUrl: string, token: string): Promise<string> {
         // Define the character limit for the summary and for the fallback truncation.
         const SUMMARY_MAX_LENGTH = 50000;
         
@@ -995,7 +1009,14 @@ export class AgentService {
             const summarizationInstruction = `Summarize the following user request into a clear and concise objective for an AI agent. Focus on the primary goal, key constraints, and specific files or functions mentioned. The summary should be a direct command. Maximum ${SUMMARY_MAX_LENGTH} characters.\n\nOriginal Request:\n${prompt}`;
             
             console.log(`[AgentService] Summarizing original prompt.`);
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: summarizationInstruction, user_ID: '0001' }) });
+            const resp = await fetch(serverUrl, { 
+                method: 'POST', 
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                }, 
+                body: JSON.stringify({ query: summarizationInstruction })
+            });
 
             if (!resp.ok) {
                 console.warn(`[AgentService] Prompt summarization failed with status ${resp.status}. Returning truncated prompt.`);
@@ -1021,7 +1042,7 @@ export class AgentService {
     private normalizeThought(t: string): string {
         return t.replace(/\s+/g, ' ').trim();
     }
-    private async recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         if (!thought) { return; }
         const norm = this.normalizeThought(thought);
         if (!norm) { return; }
@@ -1037,14 +1058,14 @@ export class AgentService {
         const LONG_THOUGHT_THRESHOLD = 1000;
         const isLong = finalThought.length > LONG_THOUGHT_THRESHOLD;
         if (isLong) {
-            finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl);
+            finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl, token);
         }
         if (this.recentThoughts.length >= this.MAX_RECENT_THOUGHTS) {
             const evicted = this.recentThoughts.shift();
             if (evicted) {
                 // Add to rolling summary (not losing content)
                 const remaining = this.recentThoughts.slice();
-                await this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
+                await this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl, token);
             }
         }
         this.recentThoughts.push(finalThought);
@@ -1061,7 +1082,13 @@ export class AgentService {
         return { recentThoughts: this.recentThoughts.slice(), summarizedArchive: this.summarizedArchive };
     }
 
-    public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void, threadId: string | null) {
+    public async processRequest(
+        prompt: string, 
+        serverUrl: string, 
+        token: string, // <-- ADDED: Accept the token
+        sendUpdate: (update: string) => void, 
+        threadId: string | null
+    ) {
         // Quiet UI: no initial debug to UI; log minimal info to console
         console.log(`[AgentService] processRequest start. WD=${this.toolbox.getWorkingDirectory() || 'Not set'} promptLen=${prompt.length}`);
         this.shouldStop = false;
@@ -1072,7 +1099,7 @@ export class AgentService {
         
         const PROMPT_LENGTH_THRESHOLD = 100000;
         if (originalPrompt.length > PROMPT_LENGTH_THRESHOLD) {
-            originalPrompt = await this.summarizeOriginalPrompt(originalPrompt, serverUrl);
+            originalPrompt = await this.summarizeOriginalPrompt(originalPrompt, serverUrl, token);
         }
 
         let currentInstruction = originalPrompt; // Instruction for the model (first step uses full prompt)
@@ -1088,8 +1115,16 @@ export class AgentService {
                 this.summarizedArchive = '';
             }
             console.log(`[Agent] Step ${i + 1}`);
-            const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl, threadId);
-            await this.recordThought(thought, sendUpdate, serverUrl);
+            const { tool, args, thought } = await this.getNextActionFromModel(
+                currentInstruction, 
+                originalPrompt, 
+                history, 
+                sendUpdate, 
+                serverUrl, 
+                token, // <-- PASS: Pass token down
+                threadId
+            );
+            await this.recordThought(thought, sendUpdate, serverUrl, token); // <-- PASS: Pass token down
             if (this.shouldStop) {
                 sendUpdate("❌ Stopped by user.");
                 return;
@@ -1165,7 +1200,15 @@ export class AgentService {
         ];
     }
 
-    private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string, threadId: string | null): Promise<{ tool: string, args: any[], thought: string }> {
+    private async getNextActionFromModel(
+        currentInstruction: string, 
+        originalPrompt: string, 
+        history: any[], 
+        sendUpdate: (update: string) => void, 
+        serverUrl: string, 
+        token: string,
+        threadId: string | null
+    ): Promise<{ tool: string, args: any[], thought: string }> {
     console.log("[AgentService] Asking the model for the next step...");
     console.log(`[AgentService] Making request to: ${serverUrl}`);
 
@@ -1288,16 +1331,16 @@ ${JSON.stringify(truncatedHistory)}
             this.currentAbortController = new AbortController();
             
             console.log(`[AgentService] Making fetch request to: ${serverUrl}`);
-            console.log(`[AgentService] Request payload length: ${JSON.stringify({ query: fullPrompt, user_ID: "0001", thread_id: threadId }).length} characters`);
+            console.log(`[AgentService] Request payload length: ${JSON.stringify({ query: fullPrompt, thread_id: threadId }).length} characters`);
             
             const response = await fetch(serverUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,
-                    user_ID: "0001",
                     thread_id: threadId
                 }),
                 signal: this.currentAbortController.signal
@@ -1308,6 +1351,13 @@ ${JSON.stringify(truncatedHistory)}
             if (!response.ok) {
                 const errorText = await response.text();
                 console.error(`[AgentService] Server error: ${response.status} - ${errorText}`);
+                if (response.status === 401) {
+                     return {
+                        thought: `Authentication failed. The user's token may be invalid.`,
+                        tool: 'finish',
+                        args: [`Authentication error: ${errorText}`]
+                    };
+                }
                 return {
                     thought: `The model API call failed with status ${response.status}.`,
                     tool: 'finish',
