@@ -242,8 +242,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Re-initialize threads and state
                     await this.initializeThreads();
                     
-                    // Send threads and history
-                    await this.sendThreadListToWebview();
                     await this.sendCurrentThreadToWebview();
 
                 } catch (error: any) {
@@ -287,14 +285,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             if (data.type === 'requestState') {
-                // Check auth first
+                // This is for a "fresh open" or "reload" of the webview
                 const token = await this.authManager.getToken();
                 if (!token) {
                     this._view?.webview.postMessage({ type: 'showLogin' });
                     return;
                 }
                 
-                // User is logged in, proceed
+                // User is logged in, proceed.
                 const userId = this.authManager.getUserIdFromToken(token);
                 this._view?.webview.postMessage({ type: 'loginSuccess', userId: userId });
 
@@ -303,8 +301,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     type: 'updateMode',
                     mode: this.currentMode
                 });
+
+                this.currentThread = null; 
                 await this.sendCurrentThreadToWebview();
-                await this.sendThreadListToWebview();
                 return;
             }
 
@@ -682,6 +681,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!this.currentThread) {
             // Create a new thread if none exists
             this.currentThread = await this.threadManager.createNewThread();
+            await this.sendThreadListToWebview();
         }
 
         await this.threadManager.addMessageToThread(this.currentThread.id, type, content);
@@ -701,11 +701,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
             this.currentThread = await this.threadManager.createNewThread();
             
-            // Clear the webview
-            this._view?.webview.postMessage({ type: 'clearMessages' });
-            
-            // Send the new thread list
             await this.sendThreadListToWebview();
+            await this.sendCurrentThreadToWebview();
             
             vscode.window.showInformationMessage('New conversation thread created');
         } catch (error: any) {
@@ -741,9 +738,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             if (this.currentThread && this.currentThread.id === threadId) {
                 this.currentThread = null;
                 this._context.globalState.update('currentThreadId', undefined);
+                // Tell webview to go back to history
                 this._view?.webview.postMessage({ type: 'showThreadHistory' });
             }
             
+            // Refresh the list
             await this.sendThreadListToWebview();
             
             vscode.window.showInformationMessage('Thread deleted');
@@ -768,14 +767,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.deleteThread(threadId);
     }
 
+    /**
+     * Decides what to show the webview.
+     * If a thread is active, sends 'loadHistory' (shows chat).
+     * If no thread is active, sends 'showThreadHistory' AND 'threadList' (shows list).
+     */
     private async sendCurrentThreadToWebview() {
         if (!this.currentThread) {
+            // No active thread, show the history list
             this._view?.webview.postMessage({
                 type: 'showThreadHistory'
             });
+            // Since we are showing the history, send the list.
+            await this.sendThreadListToWebview();
             return;
         }
 
+        // Active thread exists, send its content
         const history = this.currentThread.messages.map(msg => ({
             id: msg.id,
             type: msg.type,
@@ -830,6 +838,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             overflow: hidden;
             height: 100vh;
         }
+        
+        /* --- Global Loader --- */
+        .global-loading {
+            display: none; /* Hidden by default */
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            font-size: 1.2em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .global-loading.active {
+            display: flex;
+        }
+
         /* --- Login View --- */
         .login-view {
             display: none; /* Hidden by default */
@@ -1414,7 +1437,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
 
-    <div id="loginView" class="login-view active">
+    <div id="globalLoading" class="global-loading active">
+        <div>Loading...</div>
+    </div>
+
+    <div id="loginView" class="login-view">
         <div id="loginContainer" class="auth-container">
             <h2>Login</h2>
             <div id="loginError" class="auth-error"></div>
@@ -1465,8 +1492,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <div id="threadList" class="thread-list">
             <div class="empty-threads">
                 <div class="empty-threads-icon">💬</div>
-                <p>No conversations yet</p>
-                <p style="font-size: 12px;">Start a new conversation to begin</p>
+                <p>Loading conversations...</p>
             </div>
         </div>
     </div>
@@ -1510,6 +1536,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const vscode = acquireVsCodeApi();
         
         // --- Auth Elements ---
+        const globalLoading = document.getElementById('globalLoading');
         const loginView = document.getElementById('loginView');
         const loginContainer = document.getElementById('loginContainer');
         const registerContainer = document.getElementById('registerContainer');
@@ -1552,6 +1579,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // --- Auth View Management ---
         function showLoginView() {
+            globalLoading.classList.remove('active');
             loginView.classList.add('active');
             threadHistoryView.classList.remove('active');
             chatView.classList.remove('active');
@@ -1562,6 +1590,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         function showRegisterView() {
+            globalLoading.classList.remove('active');
             loginView.classList.add('active');
             threadHistoryView.classList.remove('active');
             chatView.classList.remove('active');
@@ -1579,13 +1608,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // --- Chat View Management ---
         function showThreadHistory() {
+            globalLoading.classList.remove('active');
             loginView.classList.remove('active');
             threadHistoryView.classList.add('active');
             chatView.classList.remove('active');
-            vscode.postMessage({ type: 'loadThreadList' });
+            // When showing, reset to "Loading" in case we are coming from 'Back'
+            threadList.innerHTML = \`
+                <div class="empty-threads">
+                    <div class="empty-threads-icon">💬</div>
+                    <p>Loading conversations...</p>
+                </div>
+            \`;
         }
 
         function showChat() {
+            globalLoading.classList.remove('active');
             loginView.classList.remove('active');
             threadHistoryView.classList.remove('active');
             chatView.classList.add('active');
@@ -1596,6 +1633,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             threads = threadData || [];
             currentThreadId = currentThread;
             
+            // --- FIX FOR PROBLEM #2 ---
+            // Only clear the list AFTER we know if it's empty or not.
+            // This prevents the "empty" flash.
             if (threads.length === 0) {
                 threadList.innerHTML = \`
                     <div class="empty-threads">
@@ -1607,7 +1647,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
+            // Now that we know we have threads, clear the "Loading..."
             threadList.innerHTML = '';
+
             threads.forEach(thread => {
                 const threadItem = document.createElement('div');
                 threadItem.className = 'thread-item';
@@ -1646,7 +1688,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         threadId: thread.id 
                     });
                     chatHeaderTitle.textContent = thread.title || 'Conversation';
-                    showChat();
+                    // showChat(); // Let 'loadHistory' message trigger this
                 };
                 
                 threadList.appendChild(threadItem);
@@ -1710,12 +1752,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Button Event Listeners
         backButton.addEventListener('click', () => {
             showThreadHistory();
+            // When going back, we MUST request a fresh list
+            vscode.postMessage({ type: 'loadThreadList' });
         });
 
         newThreadButton.addEventListener('click', () => {
             vscode.postMessage({ type: 'newThread' });
             chatHeaderTitle.textContent = 'New Conversation';
-            showChat();
+            // Let the extension send 'loadHistory' to trigger showChat()
         });
 
         // Mode buttons in chat view
@@ -2071,10 +2115,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 // --- Auth Messages ---
                 case 'showLogin':
                     showLoginView();
+
+                    // --- FIX: Clear all internal state to prevent stale data ---
+                    threads = [];
+                    currentThreadId = null;
+                    if (chatMessages) chatMessages.innerHTML = '';
+                    if (threadList) {
+                         threadList.innerHTML = \`
+                            <div class="empty-threads">
+                                <div class="empty-threads-icon">💬</div>
+                                <p>Loading conversations...</p>
+                            </div>
+                         \`;
+                    }
+                    // --- End of fix ---
                     break;
                 case 'loginSuccess':
-                    // We are logged in, show the thread history
-                    showThreadHistory();
+                    // We are logged in. The extension will now send
+                    // either 'showThreadHistory' or 'loadHistory'.
+                    // We do nothing here except note that we are logged in.
                     break;
                 case 'authError':
                     // Show error in the correct form
@@ -2095,6 +2154,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 // --- Chat Messages ---
                 case 'showThreadHistory':
                     showThreadHistory();
+                    // The extension MUST follow this with a 'threadList' message.
+                    // The view will show "Loading conversations..." until it arrives.
                     break;
                 case 'updateProcessingState':
                     isProcessing = message.isProcessing;
@@ -2398,7 +2459,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         updateButtonStates();
         
         // Request current processing state from extension
-        // This will now trigger the auth check
+        // This will now trigger the auth check and the extension
+        // will decide which view to show.
         vscode.postMessage({
             type: 'requestState'
         });
