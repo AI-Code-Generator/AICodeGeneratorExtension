@@ -15,7 +15,7 @@
     "type": "git",
     "url": "https://github.com/your-repo/ai-code-generator.git"
   },
-  "main": "./dist/extension.js",
+  "main": "./out/extension.js",
   "activationEvents": [
     "onStartup"
   ],
