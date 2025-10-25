@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import * as lancedb from '@lancedb/lancedb';
 import { CodeParser } from './Parser';
 import * as crypto from 'crypto';
+import { EXCLUDED_DIRS } from './constants';
 
 interface FileTrackingData {
     filePath: string;
@@ -25,10 +26,15 @@ interface CodeChunkMetadata {
 }
 
 let embedder: any = null;
-const EMBEDDING_DIM = 768;
+// MiniLM (all-MiniLM-L6-v2) outputs 384-d embeddings
+const EMBEDDING_DIM = 384;
+// Use a dimensioned table name to avoid schema conflicts when switching models
 const LANCEDB_TABLE_NAME = 'code_chunks';
 const FILE_TRACKING_TABLE = 'file_tracking';
 let STORAGEPATH: any = null;
+let CURRENT_PROJECT_KEY: string | null = null;
+// Conservative char cap for embedder input (~8k tokens headroom)
+const MAX_EMBED_INPUT_CHARS = 4000;
 
 export const state = {
     db: null as lancedb.Connection | null,
@@ -42,10 +48,36 @@ export const bulkState = {
     batchSize: 100
 };
 
-async function initializeEmbedder() {
-    if (!embedder) {
+export async function initializeEmbedder(context: vscode.ExtensionContext) {
+    if (embedder) {
+        return;
+    }
+
+    try {
+        // Construct the full, platform-independent path to your bundled model folder
+        const modelPath = vscode.Uri.joinPath(
+            context.extensionUri,
+            'resources',
+            'models',
+            'all-MiniLM-L6-v2'
+        ).fsPath;
+
         const { pipeline } = await import('@huggingface/transformers');
-        embedder = await pipeline('feature-extraction', 'nomic-ai/nomic-embed-text-v1.5');
+
+        // Tell the pipeline to load the model from your local folder
+        embedder = await pipeline('feature-extraction', modelPath, {
+            dtype: 'fp32',
+            device: 'cpu'
+        });
+
+        console.log('Embedder initialized successfully from local bundled model.');
+
+    } catch (error) {
+        console.error('Failed to initialize local embedder:', error);
+        vscode.window.showErrorMessage(
+            'Failed to load the local AI model. Similarity search and other features may be disabled. Please try reinstalling the extension.'
+        );
+        embedder = null; // Prevent further attempts
     }
 }
 
@@ -116,11 +148,9 @@ async function saveFileTrackingBatch(): Promise<void> {
 
 // File extensions to exclude from indexing (config files, documentation, etc.)
 const EXCLUDED_EXTENSIONS = new Set([
-    '.gitignore', '.gitattributes', '.gitmodules',
-    '.md', '.txt', '.rst', '.doc', '.docx', '.pdf',
-    '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.gitattributes', '.gitmodules',
+    '.pdf',
     '.lock', '.log', '.tmp', '.temp',
-    '.babelrc', '.eslintrc', '.prettierrc', '.editorconfig',
     '.env', '.env.local', '.env.development', '.env.production',
     '.min.js', '.min.css', '.map',
     '.ico', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
@@ -131,9 +161,6 @@ const EXCLUDED_EXTENSIONS = new Set([
 // File names to exclude (regardless of extension)
 const EXCLUDED_FILENAMES = new Set([
     'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
-    'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
-    'LICENSE', 'CHANGELOG', 'AUTHORS', 'CONTRIBUTORS',
-    'Makefile', 'Rakefile', 'Gemfile', 'Procfile',
     '.DS_Store', 'Thumbs.db'
 ]);
 
@@ -145,7 +172,7 @@ const CODE_EXTENSIONS = new Set([
     '.c', '.cpp', '.h', '.hpp',
     '.cs', '.php', '.swift',
     '.html', '.css', '.scss', '.sass', '.less',
-    '.sql', '.graphql', '.gql'
+    '.sql', '.graphql', '.gql', '.txt', '.md'
 ]);
 
 function shouldIndexFile(filePath: string): boolean {
@@ -180,10 +207,10 @@ function shouldIndexFile(filePath: string): boolean {
         return codeKeywords.some(keyword => fileName.toLowerCase().includes(keyword));
     }
     
-    return false;
+    return true;
 }
 
-export async function readFilesRecursive(directory: string, excludeList: string[] = []): Promise<string[]> {
+export async function readFilesRecursive(directory: string, context: vscode.ExtensionContext, excludeList: string[] = []): Promise<string[]> {
     let results: string[] = [];
 
     try {
@@ -193,11 +220,12 @@ export async function readFilesRecursive(directory: string, excludeList: string[
             const fullPath = path.join(directory, file.name);
 
             if (excludeList.includes(file.name)) {
+                console.log(`Skipping excluded directory: ${fullPath}`);
                 continue;
             }
 
             if (file.isDirectory()) {
-                const subFiles = await readFilesRecursive(fullPath, excludeList);
+                const subFiles = await readFilesRecursive(fullPath, context, excludeList);
                 results = results.concat(subFiles);
             } else if (shouldIndexFile(fullPath)) {
                 results.push(fullPath);
@@ -208,7 +236,7 @@ export async function readFilesRecursive(directory: string, excludeList: string[
                 if (shouldProcess) {
                     const chunks = CodeParser.parseCode(content, fullPath);
 
-                    await initializeEmbedder();
+                    await initializeEmbedder(context);
 
                     if (state.table) {
                         await state.table.delete(`\`filePath\` = '${fullPath.replace(/'/g, "''")}'`);
@@ -241,7 +269,6 @@ export async function readFilesRecursive(directory: string, excludeList: string[
         await flushRemainingMetadata();
         await flushRemainingFileTracking();
 
-        await removeDeletedFiles(directory, results, excludeList);
     } catch (error) {
         console.error('Error reading directory:', error);
     }
@@ -277,12 +304,15 @@ function isInExcludedDir(filePath: string, excludeList: string[]): boolean {
     return excludeList.some(dir => filePath.includes(`/${dir}/`) || filePath.includes(`\\${dir}\\`));
 }
 
-async function embedText(text: string): Promise<number[]> {
+export async function embedText(text: string): Promise<number[]> {
     if (!embedder) {
         throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
     }
 
-    const output = await embedder(text, {
+    // Trim overly long inputs; MiniLM doesn't require a task prefix
+    const safeText = text.length > MAX_EMBED_INPUT_CHARS ? text.slice(0, MAX_EMBED_INPUT_CHARS) : text;
+
+    const output = await embedder(safeText, {
         pooling: "mean",
         normalize: true
     });
@@ -291,7 +321,24 @@ async function embedText(text: string): Promise<number[]> {
     return embeddings;
 }
 
-export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = ['node_modules', '.git', 'dist', 'build']): Promise<string[]> {
+// Embed a user query using the query-specific task prefix to match document embeddings
+export async function embedQuery(query: string): Promise<number[]> {
+    if (!embedder) {
+        throw new Error("Embedder not initialized. Call initializeEmbedder() first.");
+    }
+
+    const safeQuery = query.length > MAX_EMBED_INPUT_CHARS ? query.slice(0, MAX_EMBED_INPUT_CHARS) : query;
+    
+    const output = await embedder(safeQuery, {
+        pooling: "mean",
+        normalize: true
+    });
+
+    const embeddings = Array.from(output[0].data) as number[];
+    return embeddings;
+}
+
+export async function indexWorkspaceFiles(storageUri: vscode.Uri, context: vscode.ExtensionContext, excludeDirs = EXCLUDED_DIRS): Promise<string[]> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         return [];
@@ -302,20 +349,20 @@ export async function indexWorkspaceFiles(storageUri: vscode.Uri, excludeDirs = 
 
     const rootDirectory = workspaceFolders[0].uri.fsPath;
     const startTime = Date.now();
-    const files = await readFilesRecursive(rootDirectory, excludeDirs);
+    const files = await readFilesRecursive(rootDirectory, context, excludeDirs);
+    await removeDeletedFiles(rootDirectory, files, excludeDirs);
     const endTime = Date.now();
 
     console.log(`Found ${files.length} files. Indexing completed in ${(endTime - startTime) / 1000} seconds.`);
     return files;
 }
 
-export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Uri): Promise<boolean> {
+export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Uri, context: vscode.ExtensionContext): Promise<boolean> {
     const filePath = fileUri.fsPath;
     
     try {
         // Skip excluded directories
-        const excludeDirs = ['node_modules', '.git', 'dist', 'build'];
-        if (isInExcludedDir(filePath, excludeDirs)) {
+        if (isInExcludedDir(filePath, EXCLUDED_DIRS)) {
             return false;
         }
 
@@ -341,7 +388,7 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
             const chunks = CodeParser.parseCode(content, filePath);
             console.log(`Processing changed file: ${filePath}`);
             
-            await initializeEmbedder();
+            await initializeEmbedder(context);
             
             if (state.table) {
                 await state.table.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
@@ -377,16 +424,73 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
     }
 }
 
+export async function deleteSingleFile(uri: vscode.Uri, storageUri: vscode.Uri): Promise<void> {
+    const filePath = uri.fsPath;
+
+    // Skip excluded directories
+    if (isInExcludedDir(filePath, EXCLUDED_DIRS)) {
+        return;
+    }
+
+    // Skip if not an indexable file type
+    if (!shouldIndexFile(filePath)) {
+        console.log(`Skipping deletion for excluded file type: ${filePath}`);
+        return;
+    }
+
+    // Initialize DB if needed
+    if (!state.db) {
+        STORAGEPATH = storageUri;
+        await initializeLanceDB(storageUri);
+    }
+
+    try {
+        // Delete chunks from code_chunks table
+        if (state.table) {
+            await state.table.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+        }
+
+        // Delete from file_tracking table
+        if (state.fileTrackingTable) {
+            await state.fileTrackingTable.delete(`\`filePath\` = '${filePath.replace(/'/g, "''")}'`);
+        }
+
+        console.log(`Deleted index data for file: ${filePath}`);
+    } catch (error) {
+        console.error(`Error deleting index data for ${filePath}:`, error);
+        throw error;
+    }
+}
+
+function getProjectKey(): string | null {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return null;
+    }
+    const root = workspaceFolders[0].uri.fsPath;
+    return crypto.createHash('sha1').update(root).digest('hex').slice(0,16);
+}
+
 async function initializeLanceDB(storageUri: vscode.Uri) {
     try {
-        const lanceDbPath = path.join(storageUri.fsPath, 'lancedb');
+        const projectKey = getProjectKey();
+        const lanceDbPath = path.join(storageUri.fsPath, 'lancedb', projectKey || 'default');
+
+        // If project changed, reset cached handles so new connection is created
+        if (CURRENT_PROJECT_KEY && projectKey && CURRENT_PROJECT_KEY !== projectKey) {
+            state.db = null;
+            state.table = null;
+            state.fileTrackingTable = null;
+        }
+
+        CURRENT_PROJECT_KEY = projectKey || null;
         state.db = await lancedb.connect(lanceDbPath);
 
         const tableNames = await state.db.tableNames();
 
         if (tableNames.includes(LANCEDB_TABLE_NAME)) {
             state.table = await state.db.openTable(LANCEDB_TABLE_NAME);
-            console.log('Loaded existing LanceDB table');
+            console.log(`Loaded existing LanceDB table for project ${CURRENT_PROJECT_KEY}`);
         } else {
             const sampleData = [{
                 id: 'sample',
@@ -402,12 +506,12 @@ async function initializeLanceDB(storageUri: vscode.Uri) {
 
             state.table = await state.db.createTable(LANCEDB_TABLE_NAME, sampleData);
             await state.table.delete('id = "sample"');
-            console.log('Created new LanceDB table');
+            console.log(`Created new LanceDB table for project ${CURRENT_PROJECT_KEY}`);
         }
 
         if (tableNames.includes(FILE_TRACKING_TABLE)) {
             state.fileTrackingTable = await state.db.openTable(FILE_TRACKING_TABLE);
-            console.log('Loaded existing file tracking table');
+            console.log(`Loaded existing file tracking table for project ${CURRENT_PROJECT_KEY}`);
         } else {
             const sampleData = [{
                 filePath: 'sample/path',
@@ -417,7 +521,7 @@ async function initializeLanceDB(storageUri: vscode.Uri) {
 
             state.fileTrackingTable = await state.db.createTable(FILE_TRACKING_TABLE, sampleData);
             await state.fileTrackingTable.delete('\`filePath\` = "sample/path"');
-            console.log('Created new file tracking table');
+            console.log(`Created new file tracking table for project ${CURRENT_PROJECT_KEY}`);
         }
     } catch (error) {
         console.error('Failed to initialize LanceDB:', error);
@@ -475,32 +579,39 @@ export async function flushRemainingFileTracking() {
     }
 }
 
-export async function similaritySearch(text: string, limit: number = 8) {
+export interface SimilaritySearchResultMetadata {
+    id: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    chunkType: string;
+    content: string;
+    score: number;
+}
+
+export async function similaritySearch(text: string, context: vscode.ExtensionContext, limit: number = 8): Promise<SimilaritySearchResultMetadata[] | null> {
     if (!text || !state.table) {
         return null;
     }
 
     try {
-        await initializeEmbedder();
-        const embeddedText = await embedText(text);
+        await initializeEmbedder(context);
+        const embeddedText = await embedQuery(text);
 
         const results = await state.table
             .vectorSearch(embeddedText)
             .limit(limit)
             .toArray();
 
-        // return results.map(result => ({
-        //     score: result._distance,
-        //     metadata: {
-        //         id: result.id,
-        //         content: result.content,
-        //         filePath: result.filePath,
-        //         startLine: result.startLine,
-        //         endLine: result.endLine,
-        //         chunkType: result.chunkType
-        //     }
-        // }));
-        return results.map(result => result.content);
+        return results.map(result => ({
+            id: result.id,
+            filePath: result.filePath,
+            startLine: result.startLine,
+            endLine: result.endLine,
+            chunkType: result.chunkType,
+            content: result.content,
+            score: result._distance
+        }));
     } catch (error) {
         console.error('Error in similarity search:', error);
         return null;
