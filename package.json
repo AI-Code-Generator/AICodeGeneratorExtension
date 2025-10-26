@@ -17,9 +17,28 @@
   },
   "main": "./out/extension.js",
   "activationEvents": [
-    "onStartup"
+    "onStartup",
+    "onView:aiCodeAssist.chatView"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ai-code-assist",
+          "title": "AI Code Assistant",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ai-code-assist": [
+        {
+          "type": "webview",
+          "id": "aiCodeAssist.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "aiCodeAssist.setToken",
@@ -44,7 +63,7 @@
       },
       {
         "command": "ai-code-assist.openChat",
-        "title": "Open AI Code Assist Chat (Disabled in SWE-bench mode)"
+        "title": "Open AI Code Assist Chat"
       },
       {
         "command": "ai-code-assist.toggleSuggestions",

@@ -1086,7 +1086,7 @@ export class AgentService {
         prompt: string, 
         serverUrl: string, 
         token: string, // <-- ADDED: Accept the token
-        sendUpdate: (update: string) => void, 
+        sendUpdate: (update: string) => void, // <-- THIS IS THE NEW CALLBACK
         threadId: string | null
     ) {
         // Quiet UI: no initial debug to UI; log minimal info to console
@@ -1337,7 +1337,7 @@ ${JSON.stringify(truncatedHistory)}
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${token}`
+                    'Authorization': `Bearer ${token}` // <-- *** THIS IS THE CRITICAL FIX ***
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,

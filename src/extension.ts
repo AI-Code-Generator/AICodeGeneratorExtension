@@ -9,7 +9,8 @@ import { DiffManager } from './service/DiffManager';
 import { DiffCodeLensProvider } from './service/DiffCodeLensProvider';
 import { SWEBenchAgent } from './service/SWEBenchAgent';
 import { AuthManager } from './service/AuthService';
-import { ThreadManager } from './service/ThreadManager'; // Import ThreadManager
+import { ThreadManager } from './service/ThreadManager';
+import { ChatViewProvider } from './ChatViewProvider'; // <-- IMPORT THE UI
 
 export async function activate(context: vscode.ExtensionContext) {
     let output = vscode.window.createOutputChannel("AI code assist");
@@ -17,14 +18,34 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // --- 1. INITIALIZE CORE SERVICES ---
     const authManager = AuthManager.getInstance(context);
-    // Pass authManager to ThreadManager
     const threadManager = ThreadManager.getInstance(context, config.serverUrl, authManager);
     const diffManager = DiffManager.getInstance();
     const astManager = ASTManager.getInstance();
     const diffCodeLensProvider = new DiffCodeLensProvider();
 
-    // --- 2. REGISTER THE NEW LOGIN COMMAND ---
-    // This is how you will log in on the VM
+    // --- 2. INITIALIZE CHAT UI PROVIDER (NEW) ---
+    // Get the singleton instance of the ChatViewProvider
+    const chatViewProvider = ChatViewProvider.getInstance(context, authManager);
+    
+    // Register the Chat View
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(
+            'aiCodeAssist.chatView',
+            chatViewProvider,
+            {
+                webviewOptions: { retainContextWhenHidden: true }
+            }
+        )
+    );
+
+    // Register command to open chat (from your feature branch)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('ai-code-assist.openChat', () => {
+            vscode.commands.executeCommand('aiCodeAssist.chatView.focus');
+        })
+    );
+
+    // --- 3. REGISTER THE LOGIN COMMAND ---
     let setTokenCommand = vscode.commands.registerCommand('aiCodeAssist.setToken', async () => {
         const token = await vscode.window.showInputBox({
             prompt: 'Enter your AI Code Assist Auth Token',
@@ -36,6 +57,12 @@ export async function activate(context: vscode.ExtensionContext) {
                 await authManager.setToken(token);
                 const userId = authManager.getUserIdFromToken(token);
                 vscode.window.showInformationMessage(`AI Code Assist: Logged in as ${userId}`);
+                // Refresh the chat view to show it's logged in
+                chatViewProvider.resolveWebviewView(
+                    vscode.window.visibleTextEditors.find(e => e.document.uri.scheme === 'webview') as any, 
+                    {} as any, 
+                    {} as any
+                );
             } catch (e:any) {
                 vscode.window.showErrorMessage(`AI Code Assist: Failed to store token: ${e.message}`);
             }
@@ -43,11 +70,11 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(setTokenCommand);
 
-    // --- 3. INITIALIZE SWE-BENCH COMMUNICATION ---
-    // Pass ThreadManager to the agent factory
-    await initializeSWEBenchCommunication(context, authManager, threadManager, output);
+    // --- 4. INITIALIZE SWE-BENCH COMMUNICATION ---
+    // Pass the ChatViewProvider instance so the agent can log to it
+    await initializeSWEBenchCommunication(context, authManager, threadManager, output, chatViewProvider);
 
-    // --- 4. INITIALIZE WORKSPACE (AST & VECTOR INDEX) ---
+    // --- 5. INITIALIZE WORKSPACE (AST & VECTOR INDEX) ---
     try {
         await astManager.initializeWorkspace(context);
         output.appendLine('AST Manager initialized successfully');
@@ -62,7 +89,7 @@ export async function activate(context: vscode.ExtensionContext) {
         output.appendLine(`Error indexing workspace: ${err.message}`);
     }
 
-    // --- 5. SET UP FILE WATCHERS (for index) ---
+    // --- 6. SET UP FILE WATCHERS (for index) ---
     const fileWatcher = vscode.workspace.createFileSystemWatcher("**/*", false, false, false);
     
     fileWatcher.onDidChange(async (uri) => {
@@ -93,7 +120,7 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(fileWatcher);
 
-    // --- 6. REGISTER DIFF/CODELENS COMMANDS ---
+    // --- 7. REGISTER DIFF/CODELENS COMMANDS ---
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider({ scheme: 'file' }, diffCodeLensProvider)
     );
@@ -138,8 +165,9 @@ const RESULT_FILE_PATH = path.join(IPC_DIR, 'ipc-result.json');
 async function initializeSWEBenchCommunication(
     context: vscode.ExtensionContext, 
     authManager: AuthManager, 
-    threadManager: ThreadManager, // Receive ThreadManager
-    output: vscode.OutputChannel
+    threadManager: ThreadManager,
+    output: vscode.OutputChannel,
+    chatViewProvider: ChatViewProvider // <-- RECEIVE CHAT VIEW
 ) {
     output.appendLine('[SWE-bench] Initializing file-based communication system');
     
@@ -154,7 +182,8 @@ async function initializeSWEBenchCommunication(
 
         const processTask = async (uri: vscode.Uri) => {
             output.appendLine(`[SWE-bench] Detected event in ${uri.fsPath}`);
-            await processSWEBenchTask(context, authManager, threadManager, output); // Pass ThreadManager
+            // Pass ChatViewProvider to the task processor
+            await processSWEBenchTask(context, authManager, threadManager, output, chatViewProvider);
         };
 
         watcher.onDidChange(processTask);
@@ -171,8 +200,9 @@ async function initializeSWEBenchCommunication(
 async function processSWEBenchTask(
     context: vscode.ExtensionContext, 
     authManager: AuthManager, 
-    threadManager: ThreadManager, // Receive ThreadManager
-    output: vscode.OutputChannel
+    threadManager: ThreadManager,
+    output: vscode.OutputChannel,
+    chatViewProvider: ChatViewProvider // <-- RECEIVE CHAT VIEW
 ) {
     let instance_id_from_task = 'unknown';
     try {
@@ -194,14 +224,37 @@ async function processSWEBenchTask(
 
         await fs.writeFile(TASK_FILE_PATH, '{}', 'utf-8'); // Acknowledge task
         output.appendLine(`[SWE-bench] Received task: ${taskData.instance_id}`);
+        
+        // --- NEW: Clear UI and create update function ---
+        chatViewProvider.clearMessages();
+        vscode.commands.executeCommand('aiCodeAssist.chatView.focus');
+        
+        const sendUpdate = (message: string) => {
+            output.appendLine(message); // Log to original output channel
+            chatViewProvider.logAgentUpdate(message); // Log to new Chat UI
+        };
+        // --- END NEW ---
+
+        sendUpdate(`[SWE-bench] Starting task: ${taskData.instance_id}`);
 
         // --- AGENT EXECUTION ---
-        // Pass ThreadManager to the agent
         const sweBenchAgent = new SWEBenchAgent(context, authManager, threadManager); 
+        
+        // *** IMPORTANT ***
+        // You MUST update your SWEBenchAgent.ts file.
+        // The 'generatePatch' method must now accept 'sendUpdate' as its third argument
+        // and pass it to 'agentService.processRequest'.
+        //
+        // Example change in SWEBenchAgent.ts:
+        // public async generatePatch(prompt: string, repo_path: string, sendUpdate: (update: string) => void) {
+        //     ...
+        //     await agentService.processRequest(prompt, ..., token, sendUpdate, ...);
+        //     ...
+        // }
         const generated_patch = await sweBenchAgent.generatePatch(
             taskData.problem_statement, 
             taskData.repo_path, 
-            output
+            sendUpdate // <-- PASS 'sendUpdate' INSTEAD OF 'output'
         );
         // --- END AGENT EXECUTION ---
 
@@ -211,14 +264,18 @@ async function processSWEBenchTask(
         };
         
         await fs.writeFile(RESULT_FILE_PATH, JSON.stringify(result, null, 2), 'utf-8');
-        output.appendLine(`[SWE-bench] Finished task: ${taskData.instance_id}`);
+        sendUpdate(`[SWE-bench] Finished task: ${taskData.instance_id}`);
 
-    } catch (error) {
+    } catch (error: any) {
         if (error instanceof SyntaxError) {
             output.appendLine(`[SWE-bench] Ignoring malformed task file (likely being written).`);
             return;
         }
-        output.appendLine(`[SWE-bench] Error processing task ${instance_id_from_task}: ${error}`);
+        const errorMsg = `[SWE-bench] Error processing task ${instance_id_from_task}: ${error}`;
+        output.appendLine(errorMsg);
+        if(chatViewProvider) {
+            chatViewProvider.logAgentUpdate(errorMsg);
+        }
         
         try {
             await fs.writeFile(RESULT_FILE_PATH, JSON.stringify({ 

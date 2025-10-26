@@ -22,9 +22,10 @@ export class SWEBenchAgent {
         this.threadManager = threadManager; // Store ThreadManager
         this.agentService = new AgentService(context);
         
+        // Auto-approve terminal commands for benchmark mode
         this.agentService.setTerminalCommandCallback(async (command: string) => {
             console.log(`[SWE-bench Agent] Auto-approving terminal command: ${command}`);
-            return true; // Auto-approve
+            return true; 
         });
     }
 
@@ -33,102 +34,63 @@ export class SWEBenchAgent {
      */
     public async generatePatch(
         problemStatement: string, 
-        repositoryPath?: string, 
-        outputChannel?: vscode.OutputChannel
+        repositoryPath: string, // This is passed from extension.ts
+        sendUpdate: (update: string) => void // <-- This is the new, correct param
     ): Promise<string> {
         
-        if (repositoryPath) {
-            this.repositoryPath = repositoryPath;
-            this.agentService.setWorkingDirectory(repositoryPath);
-            console.log(`[SWE-bench Agent] Set working directory to: ${repositoryPath}`);
+        this.repositoryPath = repositoryPath;
+        this.agentService.setWorkingDirectory(repositoryPath);
+        sendUpdate(`[SWE-bench Agent] Set working directory to: ${repositoryPath}`);
+        
+        sendUpdate(`[SWE-bench Agent] Starting agent with problem: ${problemStatement.substring(0, 100)}...`);
+        
+        // 1. Get auth token
+        const token = await this.authManager.getToken();
+        if (!token) {
+            const errorMsg = '[SWE-bench Agent] No auth token found. Agent cannot run. Run "AI Code Assist: Set Auth Token" command.';
+            sendUpdate(errorMsg);
+            throw new Error(errorMsg);
+        }
+
+        // 2. Create a new thread for this task
+        let threadId: string;
+        try {
+            // Use the problem statement as the initial message
+            const newThread = await this.threadManager.createNewThread(problemStatement); 
+            threadId = newThread.id;
+            sendUpdate(`[Agent] New thread created: ${threadId}`);
+        } catch (e:any) {
+            const errorMsg = `[SWE-bench Agent] Failed to create new thread: ${e.message}`;
+            sendUpdate(errorMsg);
+            throw new Error(errorMsg);
         }
         
-        console.log(`[SWE-bench Agent] Starting agent with problem: ${problemStatement.substring(0, 100)}...`);
+        // 3. Start the agent
+        sendUpdate(`[SWE-bench Agent] Starting agent processing...`);
         
-        return new Promise<string>(async (resolve, reject) => {
-            let generatedPatch = '';
-            let isFinished = false;
-
-            // 1. Get auth token
-            const token = await this.authManager.getToken();
-            if (!token) {
-                const errorMsg = '[SWE-bench Agent] No auth token found. Agent cannot run. Run "AI Code Assist: Set Auth Token" command.';
-                console.error(errorMsg);
-                outputChannel?.appendLine(errorMsg);
-                reject(new Error(errorMsg));
-                return;
-            }
-
-            // 2. Create a new thread for this task
-            let threadId: string;
-            try {
-                // Use the problem statement as the initial message
-                const newThread = await this.threadManager.createNewThread(problemStatement); 
-                threadId = newThread.id;
-                console.log(`[SWE-bench Agent] Created new thread for task: ${threadId}`);
-                outputChannel?.appendLine(`[Agent] New thread created: ${threadId}`);
-            } catch (e:any) {
-                const errorMsg = `[SWE-bench Agent] Failed to create new thread: ${e.message}`;
-                console.error(errorMsg);
-                outputChannel?.appendLine(errorMsg);
-                reject(new Error(errorMsg));
-                return;
-            }
-            
-            // 3. Setup agent update handler
-            const sendUpdate = (update: string) => {
-                console.log(`[SWE-bench Agent] ${update}`);
-                if (outputChannel) {
-                    outputChannel.appendLine(`[Agent] ${update}`);
-                }
-                
-                if (update.startsWith('✅ Done:') || update.includes('Agent stopped')) {
-                    console.log(`[SWE-bench Agent] Agent completed, extracting patch...`);
-                    isFinished = true;
-                    
-                    this.extractPatchFromWorkspace()
-                        .then(patch => {
-                            console.log(`[SWE-bench Agent] Extracted patch: ${patch.length} chars`);
-                            generatedPatch = patch;
-                            resolve(generatedPatch);
-                        })
-                        .catch(error => {
-                            console.error('[SWE-bench Agent] Error extracting patch:', error);
-                            resolve(generatedPatch);
-                        });
-                } else if (update.includes('Agent stopped after reaching max steps')) {
-                    console.log(`[SWE-bench Agent] Agent max steps, extracting patch...`);
-                    isFinished = true;
-                    
-                    this.extractPatchFromWorkspace()
-                        .then(patch => {
-                            console.log(`[SWE-bench Agent] Max steps - extracted patch: ${patch.length} chars`);
-                            generatedPatch = patch;
-                            resolve(generatedPatch);
-                        })
-                        .catch(error => {
-                            console.error('[SWE-bench Agent] Error extracting patch after max steps:', error);
-                            resolve('');
-                        });
-                }
-            };
-
-            // 4. Start the agent
-            console.log(`[SWE-bench Agent] Starting agent processing...`);
-            
-            this.agentService.processRequest(
+        try {
+            // Await the agent's full execution
+            await this.agentService.processRequest(
                 problemStatement,
-                config.serverUrl + '/ask-ai',
+                config.serverUrl + '/agent', // <-- *** CRITICAL FIX: Use the /agent endpoint ***
                 token,
-                sendUpdate,
+                sendUpdate, // Pass the update function directly
                 threadId // Pass the new threadId
-            ).catch(error => {
-                console.error('[SWE-bench Agent] Error during processing:', error);
-                if (!isFinished) {
-                    reject(error);
-                }
-            });
-        });
+            );
+
+            // When processRequest resolves, it means the agent called 'finish'
+            // or was stopped. Now we extract the patch.
+            sendUpdate(`[SWE-bench Agent] Agent completed, extracting patch...`);
+            const patch = await this.extractPatchFromWorkspace();
+            sendUpdate(`[SWE-bench Agent] Extracted patch: ${patch.length} chars`);
+            return patch;
+
+        } catch (error: any) {
+            console.error('[SWE-bench Agent] Error during processing:', error);
+            sendUpdate(`[SWE-bench Agent] Error during processing: ${error.message}`);
+            // If agent fails, return an empty patch
+            return ''; 
+        }
     }
 
     private async extractPatchFromWorkspace(): Promise<string> {
@@ -145,8 +107,10 @@ export class SWEBenchAgent {
 
             console.log(`[SWE-bench Agent] Extracting patch from: ${workingDirectory}`);
 
+            // Stage all changes
             await execAsync('git add .', { cwd: workingDirectory });
             
+            // Get the diff of staged changes
             const { stdout: patch, stderr } = await execAsync('git diff --cached', {
                 cwd: workingDirectory,
                 maxBuffer: 10 * 1024 * 1024 // 10MB buffer
