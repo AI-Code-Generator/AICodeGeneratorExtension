@@ -57,6 +57,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    /**
+     * Public method to re-check auth status and update the webview.
+     */
+    public async refreshLoginState() {
+        if (!this._view) {
+            // If the view isn't active, do nothing.
+            // It will check auth when it becomes active.
+            return;
+        }
+
+        const token = await this.authManager.getToken();
+        if (!token) {
+            this._view.webview.postMessage({ type: 'showLogin' });
+        } else {
+            const userId = this.authManager.getUserIdFromToken(token);
+            this._view.webview.postMessage({ type: 'loginSuccess', userId: userId });
+            // Also send the history, in case it's loading for the first time
+            this._view.webview.postMessage({ type: 'loadHistory', history: this.agentMessages });
+        }
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         context: vscode.WebviewViewResolveContext,
@@ -73,15 +94,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'requestState') {
-                const token = await this.authManager.getToken();
-                if (!token) {
-                    this._view?.webview.postMessage({ type: 'showLogin' });
-                } else {
-                    const userId = this.authManager.getUserIdFromToken(token);
-                    this._view?.webview.postMessage({ type: 'loginSuccess', userId: userId });
-                    // Load existing messages
-                    this._view?.webview.postMessage({ type: 'loadHistory', history: this.agentMessages });
-                }
+                // Just call the new method
+                await this.refreshLoginState();
             }
 
             if (data.type === 'openSetToken') {

@@ -57,12 +57,13 @@ export async function activate(context: vscode.ExtensionContext) {
                 await authManager.setToken(token);
                 const userId = authManager.getUserIdFromToken(token);
                 vscode.window.showInformationMessage(`AI Code Assist: Logged in as ${userId}`);
-                // Refresh the chat view to show it's logged in
-                chatViewProvider.resolveWebviewView(
-                    vscode.window.visibleTextEditors.find(e => e.document.uri.scheme === 'webview') as any, 
-                    {} as any, 
-                    {} as any
-                );
+                
+                // --- THIS IS THE FIX ---
+                // Tell the chat provider to refresh its state.
+                // This is safe and will update the UI if it's visible.
+                chatViewProvider.refreshLoginState();
+                // --- END FIX ---
+
             } catch (e:any) {
                 vscode.window.showErrorMessage(`AI Code Assist: Failed to store token: ${e.message}`);
             }
@@ -240,17 +241,6 @@ async function processSWEBenchTask(
         // --- AGENT EXECUTION ---
         const sweBenchAgent = new SWEBenchAgent(context, authManager, threadManager); 
         
-        // *** IMPORTANT ***
-        // You MUST update your SWEBenchAgent.ts file.
-        // The 'generatePatch' method must now accept 'sendUpdate' as its third argument
-        // and pass it to 'agentService.processRequest'.
-        //
-        // Example change in SWEBenchAgent.ts:
-        // public async generatePatch(prompt: string, repo_path: string, sendUpdate: (update: string) => void) {
-        //     ...
-        //     await agentService.processRequest(prompt, ..., token, sendUpdate, ...);
-        //     ...
-        // }
         const generated_patch = await sweBenchAgent.generatePatch(
             taskData.problem_statement, 
             taskData.repo_path, 
