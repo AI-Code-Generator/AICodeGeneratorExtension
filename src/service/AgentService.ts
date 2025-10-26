@@ -456,6 +456,10 @@ class ToolBox {
             let commandSent = false;
             let shellIntegrationLost = false;
             let lastShellExecutionEvent: vscode.TerminalShellExecutionEndEvent | null = null;
+            const originalCommand = command; // Preserve for display and matching
+            let commandToExecute = command;   // May be wrapped for robust capture
+            let logFilePath: string | null = null; // Fallback log path when wrapping
+            let usedLogWrapper = false;
             
             // Cleanup function to dispose all listeners
             const cleanup = () => {
@@ -491,9 +495,7 @@ class ToolBox {
                     if (term.shellIntegration) {
                         // Wait a bit for shell integration to update after command
                         await new Promise(resolve => setTimeout(resolve, 100));
-                        
                         // Try to get cwd from shell integration state
-                        // Shell integration tracks the cwd automatically
                         const currentCwd = (term.shellIntegration as any).cwd;
                         if (currentCwd) {
                             const newDir = currentCwd.fsPath || currentCwd.toString();
@@ -512,8 +514,30 @@ class ToolBox {
                 console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
                 
                 // Strip ANSI codes before sending to AI
-                const cleanStdout = stripAnsiCodes(stdout);
-                const cleanStderr = stripAnsiCodes(stderr);
+                let cleanStdout = stripAnsiCodes(stdout);
+                let cleanStderr = stripAnsiCodes(stderr);
+
+                // Fallback: if we used a log wrapper, prefer its contents when stream capture is missing/short
+                if (usedLogWrapper && logFilePath) {
+                    try {
+                        const logContent = await fs.readFile(logFilePath, 'utf-8');
+                        if (logContent && logContent.length > cleanStdout.length) {
+                            cleanStdout = logContent;
+                        }
+                        const m = logContent.match(/__COPILOT_EXIT_CODE:(\d+)/);
+                        if (m) {
+                            const exitCode = parseInt(m[1], 10);
+                            if (!isNaN(exitCode) && exitCode !== 0) {
+                                cleanStderr = [cleanStderr, `Exit code: ${exitCode}`].filter(Boolean).join('\n');
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('[Terminal] Could not read log wrapper output:', e);
+                    } finally {
+                        // Best-effort cleanup to avoid buildup
+                        try { await fs.unlink(logFilePath).catch(() => {}); } catch {}
+                    }
+                }
                 
                 console.log('[Terminal] Resolving with output length:', cleanStdout.length, '(original:', stdout.length, ')');
                 resolve({ stdout: cleanStdout, stderr: cleanStderr });
@@ -548,8 +572,8 @@ class ToolBox {
                 return installPatterns.some(pattern => pattern.test(cmd));
             };
 
-            const cmdType = isLongRunningCommand(command) ? 'long-running' : 
-                           isInstallCommand(command) ? 'install' : 'normal';
+            const cmdType = isLongRunningCommand(originalCommand) ? 'long-running' : 
+                           isInstallCommand(originalCommand) ? 'install' : 'normal';
             
             // Adaptive timeout based on command type
             const MAX_INACTIVITY_TIME = cmdType === 'install' ? 10000 : // 10 seconds for install
@@ -582,11 +606,14 @@ class ToolBox {
                     
                     if (streamEnded || shellIntegrationLost) {
                         // Stream ended or shell integration lost - command likely finished
+                        // *** ROBUSTNESS FIX 2 (Part A) ***
+                        // Use safe logic for exit code here too
+                        const stderr = (lastShellExecutionEvent && typeof lastShellExecutionEvent.exitCode === 'number' && lastShellExecutionEvent.exitCode !== 0)
+                            ? `Exit code: ${lastShellExecutionEvent.exitCode}`
+                            : '';
                         doResolve(
                             output || `Command "${command}" completed.`,
-                            lastShellExecutionEvent && lastShellExecutionEvent.exitCode !== 0 
-                                ? `Exit code: ${lastShellExecutionEvent.exitCode}` 
-                                : ''
+                            stderr
                         );
                     } else {
                         // Normal timeout behavior
@@ -609,7 +636,7 @@ class ToolBox {
                 
                 // If we've sent a command and a new execution starts that's different from our original,
                 // this might be the second part of a compound command. Attach to its stream!
-                if (commandSent && startedCommand && startedCommand !== command) {
+                if (commandSent && startedCommand && startedCommand !== commandToExecute) {
                     console.log('[Terminal] Detected subsequent execution in compound command, attaching to stream...');
                     
                     const newStream = event.execution.read();
@@ -647,6 +674,15 @@ class ToolBox {
                 if (event.terminal !== term) {
                     return;
                 }
+
+                // *** ROBUSTNESS FIX 1 (The Guard) ***
+                // Ignore spurious end events with undefined exit code, *unless* the stream has already ended.
+                // This is the core of the fix for the race condition.
+                if (typeof event.exitCode === 'undefined' && !streamEnded && !shellIntegrationLost) {
+                    console.log('[Terminal] Ignoring shell execution end event with undefined exitCode (stream not ended)');
+                    return;
+                }
+                // *** END FIX 1 ***
                 
                 // Get the command that finished (if available)
                 const finishedCommand = (event.execution as any)?.commandLine?.value || '';
@@ -658,9 +694,18 @@ class ToolBox {
                 const resolveWithDelay = (delay: number = 0) => {
                     setTimeout(() => {
                         console.log('[Terminal] Resolving after delay. Final output length:', output.length);
+                        
+                        // *** ROBUSTNESS FIX 2 (Part B) ***
+                        // Only report an exit code if it's a non-zero *number*.
+                        // This prevents "Exit code: undefined"
+                        const stderr = (typeof event.exitCode === 'number' && event.exitCode !== 0) 
+                            ? `Exit code: ${event.exitCode}` 
+                            : '';
+                        // *** END FIX 2 ***
+                        
                         doResolve(
                             output || `Command "${command}" completed.`,
-                            event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
+                            stderr
                         );
                     }, delay);
                 };
@@ -669,8 +714,8 @@ class ToolBox {
                 // For compound commands (e.g., "cd folder && npm start"), shell integration reports
                 // separate executions. Ignore the "cd" part if we haven't received output yet.
                 const isPartialCommand = finishedCommand.length > 0 && 
-                                       command.includes(finishedCommand) && 
-                                       finishedCommand !== command &&
+                                       commandToExecute.includes(finishedCommand) && 
+                                       finishedCommand !== commandToExecute &&
                                        output.length === 0 &&
                                        event.exitCode === 0; // Only ignore successful partial commands
                 
@@ -751,10 +796,30 @@ class ToolBox {
                 }
 
                 try {
-                    currentExecution = term.shellIntegration.executeCommand(command);
+                    // For non long-running commands, wrap the command to tee output to a log file as a fallback
+                    if (cmdType !== 'long-running') {
+                        try {
+                            const logsDir = path.join(this.context.globalStorageUri.fsPath, 'terminal-logs');
+                            await fs.mkdir(logsDir, { recursive: true });
+                            const fileBase = `cmd-${Date.now()}-${Math.random().toString(36).slice(2)}.log`;
+                            logFilePath = path.join(logsDir, fileBase);
+                            const escapedLog = logFilePath.replace(/"/g, '\\"');
+                            commandToExecute = `{ ${originalCommand}; ec=$?; printf "__COPILOT_EXIT_CODE:%s\\n" "$ec"; } > >(tee -a "${escapedLog}") 2> >(tee -a "${escapedLog}" >&2)`;
+                            usedLogWrapper = true;
+                        } catch (e) {
+                            console.warn('[Terminal] Failed to set up log capture wrapper, proceeding without it:', e);
+                            commandToExecute = originalCommand;
+                            usedLogWrapper = false;
+                            logFilePath = null;
+                        }
+                    } else {
+                        commandToExecute = originalCommand;
+                    }
+
+                    currentExecution = term.shellIntegration.executeCommand(commandToExecute);
                     commandSent = true;
                     const executionCommand = (currentExecution as any)?.commandLine?.value || 'unknown';
-                    console.log('[Terminal] Executing command with shell integration:', command);
+                    console.log('[Terminal] Executing command with shell integration:', commandToExecute);
                     console.log('[Terminal] Execution object command:', executionCommand);
                     
                     resetInactivityTimer();
@@ -837,13 +902,41 @@ class ToolBox {
                 if (waitAttempts >= maxWaitAttempts) {
                     clearInterval(waitInterval);
                     console.error('[Terminal] Shell integration not available after 15 seconds');
-                    console.error('[Terminal] This is unusual - shell integration should be available in a properly configured terminal');
-                    
-                    // Give up and return error
-                    doResolve(
-                        `Error: Shell integration not available after 15 seconds. This terminal may not support shell integration. Please check your terminal configuration or try closing and reopening VS Code.`,
-                        'Warning: Cannot execute commands without shell integration'
-                    );
+                    console.error('[Terminal] Falling back to direct terminal send with optional log capture');
+                    try {
+                        if (cmdType !== 'long-running') {
+                            try {
+                                const logsDir = path.join(this.context.globalStorageUri.fsPath, 'terminal-logs');
+                                await fs.mkdir(logsDir, { recursive: true });
+                                const fileBase = `cmd-${Date.now()}-${Math.random().toString(36).slice(2)}.log`;
+                                logFilePath = path.join(logsDir, fileBase);
+                                const escapedLog = logFilePath.replace(/"/g, '\\"');
+                                commandToExecute = `{ ${originalCommand}; ec=$?; printf "__COPILOT_EXIT_CODE:%s\\n" "$ec"; } > >(tee -a "${escapedLog}") 2> >(tee -a "${escapedLog}" >&2)`;
+                                usedLogWrapper = true;
+                            } catch (_) {
+                                commandToExecute = originalCommand;
+                                usedLogWrapper = false;
+                            }
+                        } else {
+                            commandToExecute = originalCommand;
+                        }
+                        term.sendText(commandToExecute, true);
+                        // Give a short grace period and attempt to read the log (if any)
+                        setTimeout(async () => {
+                            if (usedLogWrapper && logFilePath) {
+                                try {
+                                    const content = await fs.readFile(logFilePath!, 'utf-8');
+                                    await doResolve(content, '');
+                                } catch (e) {
+                                    await doResolve('Command sent to terminal. Unable to auto-capture output (no shell integration).', '');
+                                }
+                            } else {
+                                await doResolve('Command sent to terminal. Shell integration unavailable; output not captured.', '');
+                            }
+                        }, 3000);
+                    } catch (e: any) {
+                        doResolve(`Error: Failed to execute command without shell integration: ${e?.message || e}`, '');
+                    }
                 }
             }, 100);
         });
@@ -1086,7 +1179,7 @@ export class AgentService {
         prompt: string, 
         serverUrl: string, 
         token: string, // <-- ADDED: Accept the token
-        sendUpdate: (update: string) => void, // <-- THIS IS THE NEW CALLBACK
+        sendUpdate: (update: string) => void, 
         threadId: string | null
     ) {
         // Quiet UI: no initial debug to UI; log minimal info to console
@@ -1337,7 +1430,7 @@ ${JSON.stringify(truncatedHistory)}
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${token}` // <-- *** THIS IS THE CRITICAL FIX ***
+                    'Authorization': `Bearer ${token}`
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,
