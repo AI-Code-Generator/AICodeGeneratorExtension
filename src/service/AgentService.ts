@@ -55,7 +55,8 @@ class ToolBox {
             this.activeProcess = null;
         }
     }
-    public async list_files(offset: number = 0, limit: number = 10000): Promise<{files: string[], total: number, hasMore: boolean}> {
+    public async list_files(offset: number = 0): Promise<{files: string[], total: number, hasMore: boolean}> {
+        const limit: number = 10000;
         let allFiles: string[] = [];
         
         if (this.workingDirectory) {
@@ -270,17 +271,22 @@ class ToolBox {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
             const content = await fs.readFile(absolutePath, 'utf-8');
-            const FILE_SIZE_LIMIT = 15000; // Set a reasonable character limit
+            // Use a fixed chunk size for calculation, matching read_file_chunk
+            const CHUNK_SIZE = 100000;
+            const FILE_SIZE_LIMIT = CHUNK_SIZE; // Align limit with chunk size
 
             if (content.length > FILE_SIZE_LIMIT) {
-                // If file is too long, return a summary and instructions
+                // Calculate total chunks based on the fixed chunk size
+                const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+
+                // If file is too long, return error with total chunks
                 return `Error: File '${filePath}' is too long (${content.length} characters). ` +
-                       `File content has been truncated. ` +
-                       `To find specific content, use the 'search_in_file(filePath, keyword)' tool. ` +
-                       `To read the file in chunks, use 'read_file_chunk(filePath, chunkNumber, chunkSize)'.\n\n` +
-                       `Start of file:\n${content.substring(0, 4000)}`;
+                       `It has been divided into ${totalChunks} chunks. ` + // Inform about total chunks
+                       `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
+                       `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk (e.g., chunkNumber 1).`;
+                       // Removed the truncated content start
             }
-            return content;
+            return content; // Return full content if within limit
         } catch (error) {
             if ((error as any).code === 'ENOENT') {
                 return `Error: File not found at path: ${absolutePath}. Working directory: ${this.workingDirectory}`;
@@ -324,24 +330,25 @@ class ToolBox {
         }
     }
 
-    public async read_file_chunk(filePath: string, chunkNumber: number = 1, chunkSize: number = 8000): Promise<string> {
+    // Updated read_file_chunk: removed chunkSize, uses fixed size
+    public async read_file_chunk(filePath: string, chunkNumber: number = 1): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
+        const CHUNK_SIZE = 100000; // Use the fixed chunk size
+
         try {
             const content = await fs.readFile(absolutePath, 'utf-8');
-            const totalChunks = Math.ceil(content.length / chunkSize);
+            const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
 
-            if (chunkNumber < 1) {
-                chunkNumber = 1;
+            if (chunkNumber < 1 || chunkNumber > totalChunks) {
+                return `Error: Chunk number ${chunkNumber} is out of bounds. The file '${filePath}' only has ${totalChunks} chunks (1 to ${totalChunks}).`;
             }
 
-            const start = (chunkNumber - 1) * chunkSize;
-            
-            if (start > content.length) {
-                return `Error: Chunk number ${chunkNumber} is out of bounds. The file only has ${totalChunks} chunks.`;
-            }
+            const start = (chunkNumber - 1) * CHUNK_SIZE;
+            // End index is calculated correctly, Math.min handles the last chunk
+            const end = Math.min(start + CHUNK_SIZE, content.length);
+            const chunkContent = content.substring(start, end);
 
-            const chunkContent = content.substring(start, start + chunkSize);
-
+            // Never return truncated message from here
             return `--- Showing chunk ${chunkNumber} of ${totalChunks} from file '${filePath}' ---\n\n` + chunkContent;
 
         } catch (error) {
@@ -832,12 +839,12 @@ export class AgentService {
 
     private getToolDefinitions() {
         return [
-            { name: 'list_files', description: 'List files in the workspace with pagination. Returns an object with files array, total count, and hasMore flag. Use offset and limit for pagination.', args: [{ name: 'offset', type: 'number' }, { name: 'limit', type: 'number' }] },
+            { name: 'list_files', description: 'List files in the workspace. Provide an \'offset\' to get the next page of results. Default offset is 0 and increment by 1 to get the next results. Returns an object with files array, total count, and hasMore flag. Each call returns up to 10000 files.', args: [{ name: 'offset', type: 'number' }] },
             { name: 'search_files', description: 'Search for files by NAME or pattern only (does NOT search file contents).', args: [{ name: 'pattern', type: 'string' }] },
             { name: 'search_text', description: 'Search for a keyword across file CONTENTS. Returns file paths with matching line numbers and snippets.', args: [{ name: 'keyword', type: 'string' }, { name: 'maxFiles', type: 'number' }, { name: 'maxMatchesPerFile', type: 'number' }] },
-            { name: 'read_file', description: 'Read the FULL content of a file at a given relative path. CRITICAL: If a file is too long, this tool will fail and instruct you to use search_in_file or read_file_chunk instead.', args: [{ name: 'filePath', type: 'string' }] },
+            { name: 'read_file', description: 'Read the FULL content of a file at a given relative path. If the file is too long (>100000 chars), it returns an error message stating the total number of chunks. Use this first for reading file purposes.', args: [{ name: 'filePath', type: 'string' }] },
             { name: 'search_in_file', description: 'Search for a specific keyword within a single file (given relative path). This is the most efficient way to find relevant code in long files. Returns the matching lines with surrounding context.', args: [{ name: 'filePath', type: 'string' }, { name: 'keyword', type: 'string' }] },
-            { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
+            { name: 'read_file_chunk', description: `Read a specific chunk of a large file. Use this if read_file indicates the file is too long and you need to browse sequentially. read_file returns the total no. of chunks for that file`, args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }] },
             { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace. Asks for user permission first. Returns stdout and stderr. IMPORTANT: When you run "cd <directory>" command, the working directory is automatically updated for ALL subsequent file operations (read_file, apply_file_change, list_files, etc.). This means after "cd my-app", file paths like "src/App.js" will resolve to "my-app/src/App.js".', args: [{ name: 'command', type: 'string' }] },
             { name: 'similar_search', description: 'Perform semantic similarity search on the indexed codebase to find relevant code snippets. Useful for understanding code patterns or finding similar implementations. Returns list of matching chunks with metadata and similarity score.', args: [{ name: 'query', type: 'string' }, { name: 'limit', type: 'number' }] },
@@ -862,7 +869,7 @@ export class AgentService {
 
         // Include current working directory information
         const workingDirInfo = this.toolbox.getWorkingDirectory() 
-            ? `\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations will use paths relative to this directory\n`
+            ? `\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations, terminal commands will use paths relative to this directory\n`
             : '';
 
         const systemPrompt = `You are an expert AI programmer agent.
@@ -879,15 +886,16 @@ CRITICAL INSTRUCTIONS:
 
 IMPORTANT: Use tools efficiently to explore codebase:
 - search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
-- list_files(offset, limit) for paginated browsing when exploring structure 
-- To list more files, you MUST increment the 'offset' parameter in 'list_files'. DO NOT just increase the 'limit'.
-- list_files(0, 100) gets first 100 files, list_files(100, 100) gets next 100
+- list_files(offset) for paginated browsing when exploring structure. start with 0 and only increment one by one if has_more is true
+- To list more files, you MUST increment the 'offset' parameter in 'list_files'
+- list_files(0) gets first 10000 files, list_files(1) gets next 10000
 - The response includes hasMore flag to indicate if there are more files
 
 CRITICAL WORKFLOW FOR READING FILES:
-1. Your first step when reading a file should ALWAYS be the 'read_file' tool.
-2. If 'read_file' returns a "File is too long" error, your immediate next step MUST be to use the 'search_in_file' tool with a relevant keyword from the problem description. Do NOT use 'read_file_chunk' unless you have a specific reason to read from the beginning.
-3. Only use 'read_file_chunk' if you need to browse the file from the start or 'search_in_file' does not yield results.
+1. Your first step to read a file MUST be the 'read_file' tool.
+2. If 'read_file' returns an error like "File ... is too long ... It has been divided into X chunks", the file is too large to read at once.
+3. If the file is too long, your NEXT step should usually be 'search_in_file' with a relevant keyword to find specific information.
+4. Only use 'read_file_chunk(filePath, chunkNumber)' if you need to browse the file sequentially (e.g., starting with chunkNumber 1) after 'read_file' failed due to size. The error message from 'read_file' will tell you the total number of chunks available.
 
 CRITICAL INSTRUCTIONS FOR TESTING THE APPLICATION:
 1. Consider the language or framework you are dealing with when testing
@@ -903,12 +911,25 @@ ${JSON.stringify(this.getToolDefinitions())}
 Respond with a single JSON object with two keys: "thought" and "tool_call".
 "thought" should be a string explaining your reasoning for the chosen action.
 "tool_call" should be an object with two keys: "name" and "args".
-Example response:
+
+Example 1 (single argument tool):
 {
     "thought": "I need to see the files in the workspace to understand the project structure.",
     "tool_call": {
         "name": "list_files",
-        "args": {"offset": 0, "limit": 100}
+        "args": {"offset": 0}
+    }
+}
+
+Example 2 (multi-argument tool):
+{
+    "thought": "The file 'folder/example.py' was too long to read fully. I need to search inside it for the 'header_rows' keyword to find where it's handled.",
+    "tool_call": {
+        "name": "search_in_file",
+        "args": {
+            "filePath": "folder/example.py",
+            "keyword": "header_rows"
+        }
     }
 }`;
 
@@ -1015,6 +1036,16 @@ ${JSON.stringify(truncatedHistory)}
 
             // Check if server returned an error
             if (jsonResponse.error) {
+                // Check for the specific MAX_TOKENS error
+                 const errorMessage = jsonResponse.error || '';
+                 if (errorMessage.includes("finish_reason") && errorMessage.includes("2")) {
+                     console.warn(`[AgentService] Model response truncated due to MAX_TOKENS.`);
+                     return {
+                         thought: "The previous response was cut short because it was too long. I need to be more concise or take smaller steps.",
+                         tool: 'retry_with_valid_json', // Or potentially 'finish' if it happens too often
+                         args: [`Model output truncated (MAX_TOKENS). Error: ${errorMessage}`]
+                     };
+                 }
                 console.warn(`Server returned error: ${jsonResponse.error}`);
                 return {
                     thought: "Server returned an error.",
@@ -1123,15 +1154,15 @@ ${JSON.stringify(truncatedHistory)}
                 if (toolDef && toolDef.args) {
                     args = toolDef.args.map((argDef: any) => {
                         const value = args[argDef.name];
-                        // Handle optional parameters with defaults
-                        if (value === undefined) {
-                            if (argDef.name === 'offset') {
-                                return 0;
-                            }
-                            if (argDef.name === 'limit') {
-                                return 100;
-                            }
+                        // Handle optional offset default for list_files
+                        if (value === undefined && argDef.name === 'offset') {
+                            return 0;
                         }
+                        // Handle optional chunkNumber default for read_file_chunk
+                        if (value === undefined && argDef.name === 'chunkNumber') {
+                            return 1;
+                        }
+                        // Handle other potential defaults if needed
                         return value;
                     });
                     console.log(`Converted object args to array: ${JSON.stringify(args)}`);
@@ -1204,8 +1235,7 @@ ${JSON.stringify(truncatedHistory)}
             }
             case 'list_files': {
                 const off = argMap.offset ?? args[0];
-                const lim = argMap.limit ?? args[1];
-                return { startMsg: `Listing files (offset ${off}, limit ${lim})`, doneMsg: `Listed files` };
+                return { startMsg: `Listing files (offset ${off})`, doneMsg: `Listed files` };
             }
             case 'search_text': {
                 const k = argMap.keyword ?? args[0];
