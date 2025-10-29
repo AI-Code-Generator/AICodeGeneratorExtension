@@ -390,16 +390,25 @@ class ToolBox {
             return `Error reading file for patching: ${error}`;
         }
 
+        // Pre-sanitize common LLM patch issues before attempting to apply
+        const sanitized = this.sanitizeUnifiedDiff(patchContent);
+
         try {
-            const patchedContent = Diff.applyPatch(originalContent, patchContent);
+            const patchedContent = Diff.applyPatch(originalContent, sanitized);
 
             if (patchedContent === false) {
                 // The patch didn't apply cleanly
                 console.warn(`[apply_file_patch] Patch did not apply cleanly to ${filePath}.`);
                 // Attempt to apply with fuzz factor (optional, can be noisy)
-                const fuzzyResult = Diff.applyPatch(originalContent, patchContent, { fuzzFactor: 2 });
+                const fuzzyResult = Diff.applyPatch(originalContent, sanitized, { fuzzFactor: 2 });
                 if (fuzzyResult === false) {
-                    return `Error: Patch could not be applied cleanly to file ${filePath}. The file content might have changed, or the patch format is incorrect.`;
+                    // As a last-resort, try a manual hunk applier that tolerates incorrect counts
+                    const manual = this.tryManualHunkApply(originalContent, sanitized);
+                    if (manual === null) {
+                        return `Error: Patch could not be applied cleanly to file ${filePath}. The file content might have changed, or the patch format is incorrect.`;
+                    }
+                    console.log(`[apply_file_patch] Patch applied via manual hunk applier.`);
+                    return await this.diffManager.applyChangeWithDiff(absolutePath, manual);
                 }
                 console.log(`[apply_file_patch] Patch applied with fuzz factor.`);
                 // If fuzzy patching worked, use that result.
@@ -411,9 +420,178 @@ class ToolBox {
             return await this.diffManager.applyChangeWithDiff(absolutePath, patchedContent);
 
         } catch (error: any) {
-            console.error(`[apply_file_patch] Error applying patch to ${filePath}:`, error);
-            return `Error applying patch: ${error.message || error}`;
+            console.warn(`[apply_file_patch] Parser threw while applying patch to ${filePath}: ${error?.message || error}. Trying manual fallback.`);
+            // Try manual fallback even on thrown parse errors
+            const manual = this.tryManualHunkApply(originalContent, sanitized);
+            if (manual !== null) {
+                console.log(`[apply_file_patch] Patch applied via manual hunk applier after exception.`);
+                return await this.diffManager.applyChangeWithDiff(absolutePath, manual);
+            }
+            console.error(`[apply_file_patch] Manual fallback also failed for ${filePath}.`);
+            return `Error applying patch (and manual fallback failed): ${error?.message || error}`;
         }
+    }
+
+    /**
+     * Attempts to normalize a unified diff string to be acceptable by the 'diff' library parser.
+     * Fixes these common issues:
+     * - Removes surrounding code fences (``` or *** Begin/End Patch wrappers left in content)
+     * - Normalizes CRLF to LF
+     * - Ensures lines inside @@ hunk blocks start with a valid marker (' ', '+', '-', '\\')
+     * - Ensures the patch ends with a trailing newline (some parsers require it)
+     */
+    private sanitizeUnifiedDiff(patch: string): string {
+        if (!patch) { return patch; }
+
+        // 1) Strip code fences and wrapper markers if present
+        let p = patch.trim();
+        // Remove markdown code fences
+        if (p.startsWith('```')) {
+            p = p.replace(/^```[a-zA-Z0-9]*\n?/m, '');
+            p = p.replace(/\n?```\s*$/m, '');
+        }
+        // Remove our Begin/End Patch wrapper if mistakenly included inside
+        p = p.replace(/\*\*\*\s*Begin Patch\s*\n/g, '')
+             .replace(/\n?\*\*\*\s*End Patch\s*$/g, '')
+             .trim();
+
+        // 2) Normalize line endings
+        p = p.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        // 3) Ensure hunk lines have proper prefixes
+        const lines = p.split('\n');
+        let inHunk = false;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.startsWith('@@')) {
+                inHunk = true;
+                continue;
+            }
+            // Headers or file markers exit hunk context
+            if (line.startsWith('diff ') || line.startsWith('Index:') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+                inHunk = false; // outside hunk until next @@
+                continue;
+            }
+            if (inHunk) {
+                // Valid prefixes inside a hunk: space, '+', '-', '\\' (for no newline at EOF)
+                if (!(line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line.startsWith('\\'))) {
+                    // Likely an unchanged context line missing the required leading space
+                    lines[i] = ' ' + line;
+                }
+            }
+        }
+        p = lines.join('\n');
+
+        // 4) Ensure patch ends with a newline
+        if (!p.endsWith('\n')) {
+            p += '\n';
+        }
+
+        return p;
+    }
+
+    /**
+     * Manual unified-diff hunk application that ignores incorrect hunk counts.
+     * Strategy: split into hunks, derive old/new blocks from line markers, and
+     * perform a straightforward substring replacement per hunk in sequence.
+     * Returns null if any hunk cannot be located.
+     */
+    private tryManualHunkApply(original: string, patch: string): string | null {
+        let src = original.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const p = patch.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        // Extract hunks: everything after a line starting with @@ until next @@ or end
+        const lines = p.split('\n');
+        const hunks: string[][] = [];
+        let current: string[] | null = null;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.startsWith('@@')) {
+                if (current) { hunks.push(current); }
+                current = [line];
+            } else if (current) {
+                // Stop hunk at a new index header (---/+++/diff/Index)
+                if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('diff ') || line.startsWith('Index:')) {
+                    hunks.push(current);
+                    current = null;
+                } else {
+                    current.push(line);
+                }
+            }
+        }
+        if (current) { hunks.push(current); }
+
+        const applyOne = (content: string, hunkLines: string[]): string | null => {
+            // Build old/new text blocks from markers
+            const oldParts: string[] = [];
+            const newParts: string[] = [];
+            for (let i = 1; i < hunkLines.length; i++) { // skip header line
+                const l = hunkLines[i];
+                if (!l.length) { // blank line inside hunk => context blank line
+                    oldParts.push('');
+                    newParts.push('');
+                    continue;
+                }
+                const tag = l[0];
+                const body = l.substring(1);
+                if (tag === ' ') {
+                    oldParts.push(body);
+                    newParts.push(body);
+                } else if (tag === '-') {
+                    oldParts.push(body);
+                } else if (tag === '+') {
+                    newParts.push(body);
+                } else if (tag === '\\') {
+                    // No newline marker; ignore
+                } else {
+                    // Unexpected, treat as context line (auto-fix)
+                    oldParts.push(l);
+                    newParts.push(l);
+                }
+            }
+            const oldText = oldParts.join('\n');
+            const newText = newParts.join('\n');
+
+            // Direct substring search
+            let idx = content.indexOf(oldText);
+            if (idx === -1) {
+                // Try a weaker anchor match: use first and last 2 context lines
+                const contextLines = hunkLines.filter(h => h.startsWith(' ')).map(h => h.substring(1));
+                const head = contextLines.slice(0, 2).join('\n');
+                const tail = contextLines.slice(-2).join('\n');
+                if (head) {
+                    const headIdx = content.indexOf(head);
+                    if (headIdx !== -1) {
+                        const searchStart = headIdx;
+                        const tailIdx = tail ? content.indexOf(tail, searchStart) : -1;
+                        if (tailIdx !== -1 && tailIdx >= headIdx) {
+                            // Assume the old block spans from after head to before tail
+                            idx = headIdx;
+                            // Approximate old block length to cover region between anchors
+                            const before = content.substring(0, idx + head.length);
+                            const afterStart = tailIdx;
+                            const after = content.substring(afterStart);
+                            const middle = content.substring(idx + head.length, afterStart);
+                            const candidate = head + middle + (tail ? tail : '');
+                            // Replace candidate with newText adjusted to keep anchors
+                            const newCandidate = head + newText.substring(head.length, newText.length - (tail ? tail.length : 0)) + (tail ? tail : '');
+                            return before + newCandidate + after;
+                        }
+                    }
+                }
+                return null;
+            }
+            return content.substring(0, idx) + newText + content.substring(idx + oldText.length);
+        };
+
+        for (const h of hunks) {
+            const next = applyOne(src, h);
+            if (next === null) {
+                return null;
+            }
+            src = next;
+        }
+        return src;
     }
 
 
