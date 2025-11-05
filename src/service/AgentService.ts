@@ -612,17 +612,19 @@ class ToolBox {
                         const searchStart = headIdx;
                         const tailIdx = tail ? content.indexOf(tail, searchStart) : -1;
                         if (tailIdx !== -1 && tailIdx >= headIdx) {
-                            // Assume the old block spans from after head to before tail
-                            idx = headIdx;
-                            // Approximate old block length to cover region between anchors
-                            const before = content.substring(0, idx + head.length);
-                            const afterStart = tailIdx;
-                            const after = content.substring(afterStart);
-                            const middle = content.substring(idx + head.length, afterStart);
-                            const candidate = head + middle + (tail ? tail : '');
-                            // Replace candidate with newText adjusted to keep anchors
+                            
+                            // --- FIX STARTS HERE ---
+                            // 'before' should be the content *before* the head anchor
+                            const before = content.substring(0, headIdx);
+                            // 'after' should be the content *after* the tail anchor
+                            const after = content.substring(tailIdx + (tail ? tail.length : 0));
+                            
+                            // 'newCandidate' is the full new block (head + new middle + tail)
                             const newCandidate = head + newText.substring(head.length, newText.length - (tail ? tail.length : 0)) + (tail ? tail : '');
+                            
+                            // This now correctly assembles: (before) + (newCandidate) + (after)
                             return before + newCandidate + after;
+                            // --- FIX ENDS HERE ---
                         }
                     }
                 }
