@@ -2,7 +2,6 @@
 import * as vscode from 'vscode';
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { ChildProcess, spawn } from 'child_process'; // Import spawn and ChildProcess
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedQuery } from './FileIndexer';
 import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
@@ -13,8 +12,11 @@ class ToolBox {
     private diffManager: DiffManager;
     private terminalCommandCallback?: (command: string) => Promise<boolean>;
     private workingDirectory: string = '';
+    private terminal?: vscode.Terminal;
+    private captureTimeout?: NodeJS.Timeout;
+    private terminalCommandCount: number = 0;
+    private readonly MAX_COMMANDS_PER_TERMINAL = 5; // Refresh terminal after 5 commands
     private context: vscode.ExtensionContext; // Store the extension context
-    private activeProcess: ChildProcess | null = null; // To track the running process
     private sendUpdateCallback?: (update: string) => void; // For streaming terminal output
 
     constructor(context: vscode.ExtensionContext) { // Accept context in constructor
@@ -46,16 +48,61 @@ class ToolBox {
         return this.workingDirectory;
     }
 
-    /**
-     * Stops the currently active terminal command, if any.
-     */
-    public stop() {
-        if (this.activeProcess) {
-            console.log(`[ToolBox] Killing active process (PID: ${this.activeProcess.pid})`);
-            this.activeProcess.kill(); // Send SIGTERM
-            this.activeProcess = null;
+    private ensureTerminal(): vscode.Terminal {
+        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        
+        // Check if we should refresh the terminal (too many commands executed)
+        const shouldRefresh = this.terminalCommandCount >= this.MAX_COMMANDS_PER_TERMINAL;
+        
+        if (!this.terminal || this.terminal.exitStatus || shouldRefresh) {
+            // Dispose old terminal if refreshing
+            if (shouldRefresh && this.terminal && !this.terminal.exitStatus) {
+                console.log(`[Terminal] Refreshing terminal after ${this.terminalCommandCount} commands`);
+                try {
+                    this.terminal.dispose();
+                } catch { /* ignore */ }
+                this.terminalCommandCount = 0; // Reset counter
+            }
+            
+            // Create a new terminal
+            this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
+            // Show terminal immediately to initialize shell integration faster
+            this.terminal.show(false);
+            console.log('[Terminal] Created new terminal, waiting for shell integration to initialize...');
+        } else {
+            // Reusing existing terminal
+            console.log(`[Terminal] Reusing existing terminal (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL} commands)`);
+            this.terminal.show(false);
         }
+        return this.terminal;
     }
+
+    // Deleted the ensurePseudoTerminal method - we'll use the regular terminal only
+
+    // Attempt to stop any currently running process in the agent terminal.
+    // Strategy: send Ctrl+C a couple times, wait briefly, then dispose and recreate terminal to guarantee a clean state.
+    private async killRunningTerminalProcess(): Promise<void> {
+        // Clear any pending timeout
+        if (this.captureTimeout) {
+            clearTimeout(this.captureTimeout);
+            this.captureTimeout = undefined;
+        }
+
+        // Only send Ctrl+C if terminal exists and is not closed
+        // DON'T dispose the terminal - we want to reuse it!
+        if (this.terminal && !this.terminal.exitStatus) {
+            try {
+                // Send Ctrl+C twice to gracefully terminate any running process
+                console.log('[Terminal] Sending Ctrl+C to stop any running process...');
+                this.terminal.sendText('\x03', false);  // Ctrl+C without newline
+                await new Promise((r) => setTimeout(r, 300));
+                this.terminal.sendText('\x03', false);
+                await new Promise((r) => setTimeout(r, 300));
+            } catch { /* ignore */ }
+        }
+        // Keep the terminal alive for reuse!
+    }
+
     public async list_files(offset: number = 0): Promise<{files: string[], total: number, hasMore: boolean}> {
         const limit: number = 10000;
         let allFiles: string[] = [];
@@ -596,12 +643,87 @@ class ToolBox {
 
 
     /**
+     * NEW: Helper function to strip ANSI codes.
+     */
+    private stripAnsiCodes(text: string): string {
+        return text
+            // Remove ANSI escape sequences (colors, cursor movement, etc.)
+            .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+            // Remove other escape sequences
+            .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
+            // Remove control characters except newline, carriage return, and tab
+            .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+            // Clean up excessive whitespace while preserving structure
+            .replace(/\r\n/g, '\n')  // Normalize line endings
+            .replace(/\r/g, '\n')     // Convert remaining \r to \n
+            .replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
+    }
+
+    /**
+     * NEW: Fallback command execution using sendText and clipboard scrape
+     */
+    private async runFallbackCommand(term: vscode.Terminal, command: string): Promise<{ stdout: string, stderr: string }> {
+        console.warn(`[Terminal] Using fallback 'sendText' for command: ${command}`);
+        
+        // Store original clipboard content
+        let originalClipboard = '';
+        try {
+            originalClipboard = await vscode.env.clipboard.readText();
+        } catch (e) {
+            console.warn('[Terminal] Could not read clipboard before fallback.');
+        }
+
+        // Send the command
+        term.sendText(command, true);
+
+        // Wait 3 seconds, as Cline does. This is an arbitrary guess.
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+
+        let output = '';
+        let errorMsg = '';
+        try {
+            // This is the "scrape" logic from Cline
+            await vscode.commands.executeCommand("workbench.action.terminal.selectAll");
+            await vscode.commands.executeCommand("workbench.action.terminal.copySelection");
+            await vscode.commands.executeCommand("workbench.action.terminal.clearSelection");
+            output = await vscode.env.clipboard.readText();
+        } catch (e: any) {
+            console.error(`[Terminal] Fallback clipboard scrape failed: ${e.message}`);
+            errorMsg = `Fallback execution failed: ${e.message}`;
+        }
+
+        // Restore original clipboard
+        try {
+            await vscode.env.clipboard.writeText(originalClipboard);
+        } catch (e) {
+            console.warn('[Terminal] Could not restore clipboard after fallback.');
+        }
+
+        // We can't distinguish stdout/stderr, and the output is the *entire buffer*.
+        const cleanOutput = this.stripAnsiCodes(output);
+        let finalOutput = cleanOutput;
+        
+        // Try to get *just* the last command's output.
+        // This is imperfect. We'll find the last instance of the command prompt.
+        const lastCommandIndex = cleanOutput.lastIndexOf(command);
+        if (lastCommandIndex !== -1) {
+             // Take everything *after* the command.
+            finalOutput = cleanOutput.substring(lastCommandIndex + command.length).trim();
+        }
+
+        return { 
+            stdout: finalOutput, 
+            stderr: errorMsg 
+        };
+    }
+
+    /**
      * Executes a shell command using Node.js child_process.spawn for live output.
      * Intercepts 'cd' commands to update the internal working directory.
      * Streams stdout/stderr to the sendUpdateCallback.
      */
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
-        // Ask for permission
+        // 1. Ask for permission
         let allow = false;
         if (this.terminalCommandCallback) {
             allow = await this.terminalCommandCallback(command);
@@ -619,108 +741,112 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // --- Special 'cd' command handling ---
-        const trimmedCommand = command.trim();
-        if (trimmedCommand.startsWith('cd ')) {
-            const targetDir = trimmedCommand.substring(3).trim().replace(/"/g, ''); // Get dir path
-            
-            // Resolve the new path relative to the *current* working directory
-            const newPath = path.resolve(this.getWorkingDirectory(), targetDir);
+        // 2. Stop any previous process
+        await this.killRunningTerminalProcess();
+        
+        // 3. Get or create a terminal
+        const term = this.ensureTerminal();
+        term.show(true); // Show terminal with focus
 
-            try {
-                // Check if the new path exists and is a directory
-                const stats = await fs.stat(newPath);
-                if (stats.isDirectory()) {
-                    // Update the working directory
-                    this.workingDirectory = newPath;
-                    console.log(`[ToolBox] Working directory changed to: ${this.workingDirectory}`);
-                    return { stdout: `Working directory changed to ${this.workingDirectory}`, stderr: '' };
-                } else {
-                    return { stdout: '', stderr: `Error: Not a directory: ${newPath}` };
-                }
-            } catch (error: any) {
-                if (error.code === 'ENOENT') {
-                    return { stdout: '', stderr: `Error: No such file or directory: ${newPath}` };
-                }
-                return { stdout: '', stderr: `Error checking path ${newPath}: ${error.message}` };
-            }
+        // 4. Wait for shell integration
+        if (!term.shellIntegration) {
+            console.log('[Terminal] Waiting for shell integration to initialize...');
+            await new Promise<void>(resolve => {
+                const disposable = vscode.window.onDidChangeTerminalShellIntegration(e => {
+                    if (e.terminal === term && e.shellIntegration) {
+                        console.log('[Terminal] Shell integration initialized via listener.');
+                        disposable.dispose();
+                        resolve();
+                    }
+                });
+                // Failsafe timeout
+                setTimeout(() => {
+                    if (term.shellIntegration) {
+                        console.log('[Terminal] Shell integration was ready after timeout check.');
+                    } else {
+                        console.warn('[Terminal] Shell integration timed out.');
+                    }
+                    disposable.dispose();
+                    resolve();
+                }, 3000); // 3-second wait
+            });
         }
-        // --- End of special 'cd' handling ---
-
-        // For all other commands, execute them using child_process.spawn for live output
-        return new Promise((resolve) => {
-            // Stop any previously active process
-            this.stop(); 
-
-            const cwd = this.getWorkingDirectory();
-            console.log(`[ToolBox] Spawning command: ${command} in ${cwd}`);
-
-            // Generate unique terminal ID for this command execution
-            const terminalId = `terminal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-            // Send terminal start message
-            if (this.sendUpdateCallback) {
-                this.sendUpdateCallback(`__TERMINAL_START__${terminalId}__${command}__`);
+        
+        // 5. Execute command: Primary path or Fallback path
+        if (term.shellIntegration) {
+            // --- PRIMARY (GOOD) PATH ---
+            console.log('[Terminal] Shell integration is available. Running with stream API.');
+            let currentExecution: vscode.TerminalShellExecution;
+            try {
+                currentExecution = term.shellIntegration.executeCommand(command);
+                console.log('[Terminal] Executing command with shell integration:', command);
+            } catch (error: any) {
+                console.error(`[Terminal] Failed to execute command with shell integration: ${error.message}. Trying fallback.`);
+                // If executeCommand fails (e.g., shell integration is in a bad state), try fallback.
+                return await this.runFallbackCommand(term, command);
             }
 
-            let stdout = '';
-            let stderr = '';
-            const COMMAND_TIMEOUT = 60000; // 60 seconds
+            let output = '';
+            let exitCode: number | undefined = undefined;
 
-            // Use 'spawn' with 'shell: true' to correctly interpret complex commands
-            // This is the most cross-platform and robust way.
-            this.activeProcess = spawn(command, { 
-                cwd: cwd,
-                shell: true, // <-- Use shell to interpret the command string
-                timeout: COMMAND_TIMEOUT,
-                detached: true // Helps in killing the process and its children
+            // Promise that resolves when the command "end" event fires
+            const commandFinished = new Promise<void>(resolve => {
+                const disposable = vscode.window.onDidEndTerminalShellExecution(event => {
+                    if (event.execution === currentExecution) {
+                        console.log(`[Terminal] onDidEndTerminalShellExecution fired. Exit code: ${event.exitCode}`);
+                        exitCode = event.exitCode;
+                        disposable.dispose();
+                        resolve();
+                    }
+                });
             });
 
-            // Handle STDOUT stream
-            this.activeProcess.stdout!.on('data', (data: Buffer) => {
-                const chunk = data.toString();
-                console.log(`[ToolBox] stdout: ${chunk}`);
-                stdout += chunk;
-                if (this.sendUpdateCallback) {
-                    // Send terminal output with ID
-                    this.sendUpdateCallback(`__TERMINAL_OUTPUT__${terminalId}__${chunk}__`);
+            // Async function to read the stream to completion
+            const readStream = async () => {
+                try {
+                    const stream = currentExecution.read();
+                    console.log('[Terminal] Reading output stream...');
+                    for await (const data of stream) {
+                        output += data;
+                    }
+                    console.log('[Terminal] Output stream ended. Total output length:', output.length);
+                } catch (error: any) {
+                    console.error(`[Terminal] Error reading stream: ${error.message}`);
                 }
-            });
+            };
 
-            // Handle STDERR stream
-            this.activeProcess.stderr!.on('data', (data: Buffer) => {
-                const chunk = data.toString();
-                console.warn(`[ToolBox] stderr: ${chunk}`);
-                stderr += chunk;
-                if (this.sendUpdateCallback) {
-                    // Send terminal output with ID (marked as stderr)
-                    this.sendUpdateCallback(`__TERMINAL_OUTPUT__${terminalId}__[STDERR] ${chunk}__`);
-                }
-            });
+            // 6. Wait for both the stream to end AND the event to fire
+            await Promise.all([readStream(), commandFinished]);
 
-            // Handle process exit
-            this.activeProcess.on('close', (code) => {
-                this.activeProcess = null;
-                console.log(`[ToolBox] Command finished with code ${code}`);
-                if (this.sendUpdateCallback) {
-                    this.sendUpdateCallback(`__TERMINAL_END__${terminalId}__${code}__`);
+            // 7. Process CWD change
+            try {
+                // Shell integration tracks the cwd automatically
+                const currentCwd = (term.shellIntegration as any).cwd;
+                if (currentCwd) {
+                    const newDir = currentCwd.fsPath || currentCwd.toString();
+                    if (newDir && newDir !== this.workingDirectory) {
+                        console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
+                        this.workingDirectory = newDir;
+                    }
                 }
-                resolve({ stdout, stderr });
-            });
+            } catch (error) {
+                console.warn('[Terminal] Could not update CWD:', error);
+            }
+            
+            // 8. Increment counter and clean up
+            this.terminalCommandCount++;
+            console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
 
-            // Handle errors (e.g., command not found, timeout)
-            this.activeProcess.on('error', (err) => {
-                this.activeProcess = null;
-                const errorMsg = `[ToolBox] Failed to start process: ${err.message}`;
-                console.error(errorMsg);
-                stderr += `\n${errorMsg}`;
-                if (this.sendUpdateCallback) {
-                    this.sendUpdateCallback(`__TERMINAL_OUTPUT__${terminalId}__[ERROR] ${err.message}__`);
-                    this.sendUpdateCallback(`__TERMINAL_END__${terminalId}__-1__`);
-                }
-                resolve({ stdout, stderr });
-            });
-        });
+            const cleanStdout = this.stripAnsiCodes(output);
+            const cleanStderr = exitCode !== 0 ? `Command exited with code ${exitCode}` : '';
+
+            return { stdout: cleanStdout, stderr: cleanStderr };
+
+        } else {
+            // --- FALLBACK (CLINE'S) PATH ---
+            console.warn('[Terminal] Shell integration NOT available. Using fallback (sendText + clipboard scrape).');
+            return await this.runFallbackCommand(term, command);
+        }
     }
     
     public async similar_search(query: string, limit: number = 8): Promise<object[]> {
@@ -1058,7 +1184,6 @@ export class AgentService {
 
     public stop() {
         this.shouldStop = true;
-        this.toolbox.stop(); // <-- ADDED: Stop the active toolbox command
         if (this.currentAbortController) {
             this.currentAbortController.abort();
         }
