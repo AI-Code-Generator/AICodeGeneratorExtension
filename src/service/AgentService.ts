@@ -15,7 +15,7 @@ class ToolBox {
     private terminal?: vscode.Terminal;
     private captureTimeout?: NodeJS.Timeout;
     private terminalCommandCount: number = 0;
-    private readonly MAX_COMMANDS_PER_TERMINAL = 5; // Refresh terminal after 5 commands
+    private readonly MAX_COMMANDS_PER_TERMINAL = 20; // Refresh terminal after 20 commands
     private context: vscode.ExtensionContext; // Store the extension context
     private sendUpdateCallback?: (update: string) => void; // For streaming terminal output
 
@@ -684,7 +684,7 @@ class ToolBox {
         let output = '';
         let errorMsg = '';
         try {
-            // This is the "scrape" logic from Cline
+            // This is the "scrape" logic
             await vscode.commands.executeCommand("workbench.action.terminal.selectAll");
             await vscode.commands.executeCommand("workbench.action.terminal.copySelection");
             await vscode.commands.executeCommand("workbench.action.terminal.clearSelection");
@@ -784,45 +784,74 @@ class ToolBox {
                 console.log('[Terminal] Executing command with shell integration:', command);
             } catch (error: any) {
                 console.error(`[Terminal] Failed to execute command with shell integration: ${error.message}. Trying fallback.`);
-                // If executeCommand fails (e.g., shell integration is in a bad state), try fallback.
                 return await this.runFallbackCommand(term, command);
             }
 
             let output = '';
             let exitCode: number | undefined = undefined;
+            let streamClosed = false;
 
-            // Promise that resolves when the command "end" event fires
-            const commandFinished = new Promise<void>(resolve => {
+            // Promise for the 'end' event
+            const commandFinished = new Promise<'event'>(resolve => {
                 const disposable = vscode.window.onDidEndTerminalShellExecution(event => {
                     if (event.execution === currentExecution) {
                         console.log(`[Terminal] onDidEndTerminalShellExecution fired. Exit code: ${event.exitCode}`);
                         exitCode = event.exitCode;
                         disposable.dispose();
-                        resolve();
+                        resolve('event');
                     }
                 });
             });
 
-            // Async function to read the stream to completion
-            const readStream = async () => {
-                try {
-                    const stream = currentExecution.read();
-                    console.log('[Terminal] Reading output stream...');
-                    for await (const data of stream) {
-                        output += data;
-                    }
-                    console.log('[Terminal] Output stream ended. Total output length:', output.length);
-                } catch (error: any) {
-                    console.error(`[Terminal] Error reading stream: ${error.message}`);
+            // Max execution timeout
+            const MAX_EXECUTION_TIME_MS = 30000; // 30 seconds
+            const commandTimeout = new Promise<'timeout'>(resolve => {
+                setTimeout(() => {
+                    console.warn(`[Terminal] Command hit max execution timeout (${MAX_EXECUTION_TIME_MS}ms).`);
+                    resolve('timeout');
+                }, MAX_EXECUTION_TIME_MS);
+            });
+
+            // 6. Manual stream iteration to prevent 'for await' hang
+            const stream = currentExecution.read();
+            const iterator = stream[Symbol.asyncIterator]();
+            console.log('[Terminal] Reading output stream manually...');
+
+            while (!streamClosed) {
+                const nextChunkPromise = iterator.next(); // Promise<IteratorResult<string>>
+                
+                // Race the next chunk against the event and the timeout
+                const winner = await Promise.race([nextChunkPromise, commandFinished, commandTimeout]);
+
+                if (winner === 'event') {
+                    // Event fired first. Command is done.
+                    // Give a brief moment for any final stream data.
+                    console.log('[Terminal] Event fired. Waiting 200ms for final stream data.');
+                    await new Promise(r => setTimeout(r, 200)); 
+                    streamClosed = true; // Force-break the loop
+                } else if (winner === 'timeout') {
+                    // Timeout fired. Command is stuck or stream is hung.
+                    console.warn('[Terminal] Timeout fired. Breaking stream loop.');
+                    streamClosed = true; // Force-break the loop
+                } else if (winner.done) {
+                    // Stream *actually* closed. This is the happy path.
+                    console.log('[Terminal] Stream closed naturally.');
+                    streamClosed = true;
+                } else {
+                    // We got data. Append it.
+                    output += winner.value;
                 }
-            };
+            }
 
-            // 6. Wait for both the stream to end AND the event to fire
-            await Promise.all([readStream(), commandFinished]);
+            // 7. We've exited the loop.
+            // Check if the event *still* hasn't fired (e.g., stream closed but event is delayed).
+            if (exitCode === undefined) {
+                console.log('[Terminal] Stream closed, waiting for event or 2s grace period...');
+                await Promise.race([commandFinished, new Promise(r => setTimeout(r, 2000))]);
+            }
 
-            // 7. Process CWD change
+            // 8. Process CWD change (best effort)
             try {
-                // Shell integration tracks the cwd automatically
                 const currentCwd = (term.shellIntegration as any).cwd;
                 if (currentCwd) {
                     const newDir = currentCwd.fsPath || currentCwd.toString();
@@ -835,12 +864,26 @@ class ToolBox {
                 console.warn('[Terminal] Could not update CWD:', error);
             }
             
-            // 8. Increment counter and clean up
+            // 9. Increment counter
             this.terminalCommandCount++;
             console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
 
+            // 10. Check results and decide on fallback
             const cleanStdout = this.stripAnsiCodes(output);
-            const cleanStderr = exitCode !== 0 ? `Command exited with code ${exitCode}` : '';
+            let cleanStderr = '';
+
+            if (output.length === 0 && exitCode === undefined) {
+                // Total failure: Timed out with no stream data and no event.
+                console.error('[Terminal] Timeout with 0 output. Stream/Event failed. Retrying with fallback scrape.');
+                return await this.runFallbackCommand(term, command);
+            }
+
+            if (exitCode !== undefined && exitCode !== 0) {
+                cleanStderr = `Command exited with code ${exitCode}`;
+            } else if (exitCode === undefined) {
+                // This means we timed out, but we *have* the partial output
+                cleanStderr = `Command timed out after ${MAX_EXECUTION_TIME_MS / 1000}s. Output may be incomplete.`;
+            }
 
             return { stdout: cleanStdout, stderr: cleanStderr };
 
