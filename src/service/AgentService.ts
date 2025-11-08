@@ -5,6 +5,7 @@ import * as path from 'path';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedQuery } from './FileIndexer';
 import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
+import { extractCommandOutput } from './terminalUtils';
 import * as Diff from 'diff';
 
 // The ToolBox holds the set of functions the agent can execute.
@@ -661,19 +662,41 @@ class ToolBox {
             .replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
     }
 
+    private async scrapeTerminalBuffer(term: vscode.Terminal): Promise<{ buffer: string, error: string }> {
+        let originalClipboard = '';
+        let buffer = '';
+        let errorMsg = '';
+
+        try {
+            originalClipboard = await vscode.env.clipboard.readText();
+        } catch (e) {
+            console.warn('[Terminal] Could not read clipboard before scraping.');
+        }
+
+        try {
+            await vscode.commands.executeCommand('workbench.action.terminal.selectAll');
+            await vscode.commands.executeCommand('workbench.action.terminal.copySelection');
+            await vscode.commands.executeCommand('workbench.action.terminal.clearSelection');
+            buffer = await vscode.env.clipboard.readText();
+        } catch (e: any) {
+            console.error(`[Terminal] Failed to scrape terminal buffer: ${e.message}`);
+            errorMsg = `Failed to capture terminal output: ${e.message}`;
+        }
+
+        try {
+            await vscode.env.clipboard.writeText(originalClipboard);
+        } catch (e) {
+            console.warn('[Terminal] Could not restore clipboard after scraping.');
+        }
+
+        return { buffer: this.stripAnsiCodes(buffer), error: errorMsg };
+    }
+
     /**
      * NEW: Fallback command execution using sendText and clipboard scrape
      */
     private async runFallbackCommand(term: vscode.Terminal, command: string): Promise<{ stdout: string, stderr: string }> {
         console.warn(`[Terminal] Using fallback 'sendText' for command: ${command}`);
-        
-        // Store original clipboard content
-        let originalClipboard = '';
-        try {
-            originalClipboard = await vscode.env.clipboard.readText();
-        } catch (e) {
-            console.warn('[Terminal] Could not read clipboard before fallback.');
-        }
 
         // Send the command
         term.sendText(command, true);
@@ -681,41 +704,12 @@ class ToolBox {
         // Wait 3 seconds, as Cline does. This is an arbitrary guess.
         await new Promise((resolve) => setTimeout(resolve, 3000));
 
-        let output = '';
-        let errorMsg = '';
-        try {
-            // This is the "scrape" logic
-            await vscode.commands.executeCommand("workbench.action.terminal.selectAll");
-            await vscode.commands.executeCommand("workbench.action.terminal.copySelection");
-            await vscode.commands.executeCommand("workbench.action.terminal.clearSelection");
-            output = await vscode.env.clipboard.readText();
-        } catch (e: any) {
-            console.error(`[Terminal] Fallback clipboard scrape failed: ${e.message}`);
-            errorMsg = `Fallback execution failed: ${e.message}`;
-        }
+    const { buffer, error } = await this.scrapeTerminalBuffer(term);
+    const finalOutput = extractCommandOutput(buffer, command);
 
-        // Restore original clipboard
-        try {
-            await vscode.env.clipboard.writeText(originalClipboard);
-        } catch (e) {
-            console.warn('[Terminal] Could not restore clipboard after fallback.');
-        }
-
-        // We can't distinguish stdout/stderr, and the output is the *entire buffer*.
-        const cleanOutput = this.stripAnsiCodes(output);
-        let finalOutput = cleanOutput;
-        
-        // Try to get *just* the last command's output.
-        // This is imperfect. We'll find the last instance of the command prompt.
-        const lastCommandIndex = cleanOutput.lastIndexOf(command);
-        if (lastCommandIndex !== -1) {
-             // Take everything *after* the command.
-            finalOutput = cleanOutput.substring(lastCommandIndex + command.length).trim();
-        }
-
-        return { 
-            stdout: finalOutput, 
-            stderr: errorMsg 
+        return {
+            stdout: finalOutput,
+            stderr: error
         };
     }
 
@@ -725,7 +719,7 @@ class ToolBox {
      * Streams stdout/stderr to the sendUpdateCallback.
      */
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
-        // Ask for permission
+        // 1. Ask for permission
         let allow = false;
         if (this.terminalCommandCallback) {
             allow = await this.terminalCommandCallback(command);
@@ -743,431 +737,169 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Stop any running process (but don't dispose terminal)
+        // 2. Stop any previous process
         await this.killRunningTerminalProcess();
         
-        // Reuse existing terminal or create new one if needed
+        // 3. Get or create a terminal
         const term = this.ensureTerminal();
-        
-        // If terminal was just created, give it time to initialize shell integration
-        if (!term.shellIntegration) {
-            console.log('[Terminal] Waiting for shell integration to initialize (new terminal)...');
-            // Wait up to 3 seconds, checking every 200ms
-            for (let i = 0; i < 15; i++) {
-                await new Promise(resolve => setTimeout(resolve, 200));
-                if (term.shellIntegration) {
-                    console.log(`[Terminal] Shell integration initialized after ${(i + 1) * 200}ms`);
-                    break;
-                }
-            }
-            
-            if (!term.shellIntegration) {
-                console.warn('[Terminal] Shell integration still not available after 3 seconds');
-            }
-        }
-        
-        // DON'T automatically cd before every command - let commands execute naturally
-        // The terminal will stay in whatever directory the last command left it in
-        // Only the cd tracking above will update our workingDirectory variable
-        
         term.show(true); // Show terminal with focus
 
-        return new Promise(async (resolve) => {
-            let resolved = false;
-            let output = '';
-            let currentExecution: vscode.TerminalShellExecution | null = null;
-            const disposables: vscode.Disposable[] = [];
-            let commandSent = false;
-            let shellIntegrationLost = false;
-            let lastShellExecutionEvent: vscode.TerminalShellExecutionEndEvent | null = null;
-            
-            // Cleanup function to dispose all listeners
-            const cleanup = () => {
-                disposables.forEach(d => d.dispose());
-                disposables.length = 0;
-            };
-            
-            // Final resolve function
-            const doResolve = async (stdout: string, stderr: string) => {
-                if (resolved) {
-                    return;
-                }
-                resolved = true;
-                cleanup();
-                
-                // Query terminal's current directory silently by checking shell integration cwd
-                try {
+        // 4. Wait for shell integration
+        if (!term.shellIntegration) {
+            console.log('[Terminal] Waiting for shell integration to initialize...');
+            await new Promise<void>(resolve => {
+                const disposable = vscode.window.onDidChangeTerminalShellIntegration(e => {
+                    if (e.terminal === term && e.shellIntegration) {
+                        console.log('[Terminal] Shell integration initialized via listener.');
+                        disposable.dispose();
+                        resolve();
+                    }
+                });
+                // Failsafe timeout
+                setTimeout(() => {
                     if (term.shellIntegration) {
-                        // Wait a bit for shell integration to update after command
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                        
-                        // Try to get cwd from shell integration state
-                        // Shell integration tracks the cwd automatically
-                        const currentCwd = (term.shellIntegration as any).cwd;
-                        if (currentCwd) {
-                            const newDir = currentCwd.fsPath || currentCwd.toString();
-                            if (newDir && newDir !== this.workingDirectory) {
-                                console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
-                                this.workingDirectory = newDir;
-                            }
-                        }
-                    }
-                } catch (error) {
-                    // Silently ignore - this is a best-effort tracking
-                }
-                
-                // Increment command counter for terminal refresh tracking
-                this.terminalCommandCount++;
-                console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
-                
-                // Strip ANSI codes before sending to AI
-                const cleanStdout = this.stripAnsiCodes(stdout);
-                const cleanStderr = this.stripAnsiCodes(stderr);
-                
-                console.log('[Terminal] Resolving with output length:', cleanStdout.length, '(original:', stdout.length, ')');
-                resolve({ stdout: cleanStdout, stderr: cleanStderr });
-            };
-
-            // Detect if command is likely to be long-running (servers, watchers, etc.)
-            const isLongRunningCommand = (cmd: string): boolean => {
-                const longRunningPatterns = [
-                    /npm\s+(run\s+)?(start|dev|serve|watch)/i,
-                    /yarn\s+(run\s+)?(start|dev|serve|watch)/i,
-                    /ng\s+serve/i,
-                    /webpack\s+.*--watch/i,
-                    /nodemon/i,
-                    /python\s+.*manage\.py\s+runserver/i,
-                    /rails\s+server/i,
-                    /mvn\s+.*spring-boot:run/i,
-                    /gradle\s+.*bootRun/i
-                ];
-                return longRunningPatterns.some(pattern => pattern.test(cmd));
-            };
-
-            // Detect if command is installation/build type (completes but might take time)
-            const isInstallCommand = (cmd: string): boolean => {
-                const installPatterns = [
-                    /npm\s+(install|i|ci)/i,
-                    /yarn\s+(install|add)/i,
-                    /pip\s+install/i,
-                    /mvn\s+(install|package|clean)/i,
-                    /gradle\s+(build|assemble)/i,
-                    /cargo\s+build/i
-                ];
-                return installPatterns.some(pattern => pattern.test(cmd));
-            };
-
-            const cmdType = isLongRunningCommand(command) ? 'long-running' : 
-                           isInstallCommand(command) ? 'install' : 'normal';
-            
-            // Adaptive timeout based on command type
-            const MAX_INACTIVITY_TIME = cmdType === 'install' ? 10000 : // 10 seconds for install
-                                       cmdType === 'long-running' ? 30000 : // 30 seconds for servers (then return output)
-                                       30000; // 30 seconds for normal commands
-            
-            let inactivityTimeout: NodeJS.Timeout | null = null;
-            let streamEnded = false;
-            let streamReadingActive = false;
-
-            // Reset inactivity timer
-            const resetInactivityTimer = () => {
-                if (inactivityTimeout) {
-                    clearTimeout(inactivityTimeout);
-                }
-                
-                inactivityTimeout = setTimeout(() => {
-                    console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length, 'cmdType:', cmdType);
-                    
-                    // For long-running commands: if we have output, return it with a detached message
-                    // The process continues running in the background, but we return what we captured
-                    if (cmdType === 'long-running' && output.length > 0) {
-                        console.log('[Terminal] Long-running process timeout - returning captured output (process continues in background)');
-                        doResolve(
-                            output + `\n\n[INFO] Long-running process started successfully. Process continues in background. Output captured: ${output.length} characters.`,
-                            ''
-                        );
-                        return;
-                    }
-                    
-                    if (streamEnded || shellIntegrationLost) {
-                        // Stream ended or shell integration lost - command likely finished
-                        doResolve(
-                            output || `Command "${command}" completed.`,
-                            lastShellExecutionEvent && lastShellExecutionEvent.exitCode !== 0 
-                                ? `Exit code: ${lastShellExecutionEvent.exitCode}` 
-                                : ''
-                        );
+                        console.log('[Terminal] Shell integration was ready after timeout check.');
                     } else {
-                        // Normal timeout behavior
-                        doResolve(
-                            output + `\n\n[INFO] Command execution timeout (${MAX_INACTIVITY_TIME/1000}s of inactivity). Output captured so far.`,
-                            ""
-                        );
+                        console.warn('[Terminal] Shell integration timed out.');
                     }
-                }, MAX_INACTIVITY_TIME);
-            };
-
-            // Listen for execution START events to capture subsequent commands in compound commands
-            const startListener = vscode.window.onDidStartTerminalShellExecution(event => {
-                if (event.terminal !== term || resolved) {
-                    return;
-                }
-                
-                const startedCommand = (event.execution as any)?.commandLine?.value || '';
-                console.log('[Terminal] Shell execution STARTED:', startedCommand, 'commandSent:', commandSent);
-                
-                // If we've sent a command and a new execution starts that's different from our original,
-                // this might be the second part of a compound command. Attach to its stream!
-                if (commandSent && startedCommand && startedCommand !== command) {
-                    console.log('[Terminal] Detected subsequent execution in compound command, attaching to stream...');
-                    
-                    const newStream = event.execution.read();
-                    streamReadingActive = true;
-                    
-                    (async () => {
-                        try {
-                            for await (const data of newStream) {
-                                if (resolved) {
-                                    break;
-                                }
-                                output += data;
-                                console.log('[Terminal] Output chunk from subsequent execution:', data.length, 'chars, total:', output.length);
-                                resetInactivityTimer();
-                            }
-                            console.log('[Terminal] Subsequent execution stream ended. Total output:', output.length, 'chars');
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            
-                            await new Promise(resolve => setTimeout(resolve, 100));
-                            resetInactivityTimer();
-                        } catch (error) {
-                            console.error('[Terminal] Error reading subsequent execution stream:', error);
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            resetInactivityTimer();
-                        }
-                    })();
-                }
+                    disposable.dispose();
+                    resolve();
+                }, 3000); // 3-second wait
             });
-            disposables.push(startListener);
+        }
+        
+        // 5. Execute command: Primary path or Fallback path
+        if (term.shellIntegration) {
+            // --- PRIMARY (GOOD) PATH ---
+            console.log('[Terminal] Shell integration is available. Running with stream API.');
+            let currentExecution: vscode.TerminalShellExecution;
+            try {
+                currentExecution = term.shellIntegration.executeCommand(command);
+                console.log('[Terminal] Executing command with shell integration:', command);
+            } catch (error: any) {
+                console.error(`[Terminal] Failed to execute command with shell integration: ${error.message}. Trying fallback.`);
+                return await this.runFallbackCommand(term, command);
+            }
 
-            // Listen for ANY shell execution end event from our terminal
-            const endListener = vscode.window.onDidEndTerminalShellExecution(event => {
-                if (event.terminal !== term) {
-                    return;
-                }
-                
-                // Get the command that finished (if available)
-                const finishedCommand = (event.execution as any)?.commandLine?.value || '';
-                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'command:', finishedCommand, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length, 'streamReadingActive:', streamReadingActive);
-                console.log('[Terminal] Event execution matches current?', event.execution === currentExecution);
-                lastShellExecutionEvent = event;
-                
-                // Helper function to resolve with delay to allow stream to catch up
-                const resolveWithDelay = (delay: number = 0) => {
-                    setTimeout(() => {
-                        console.log('[Terminal] Resolving after delay. Final output length:', output.length);
-                        doResolve(
-                            output || `Command "${command}" completed.`,
-                            event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
-                        );
-                    }, delay);
-                };
-                
-                // CRITICAL: Check for partial command completion FIRST (before exact match)
-                // For compound commands (e.g., "cd folder && npm start"), shell integration reports
-                // separate executions. Ignore the "cd" part if we haven't received output yet.
-                const isPartialCommand = finishedCommand.length > 0 && 
-                                       command.includes(finishedCommand) && 
-                                       finishedCommand !== command &&
-                                       output.length === 0 &&
-                                       event.exitCode === 0; // Only ignore successful partial commands
-                
-                if (isPartialCommand && commandSent) {
-                    console.log('[Terminal] Ignoring partial command completion:', finishedCommand);
-                    return; // Don't resolve yet - wait for the actual command
-                }
-                
-                // If we have a matching execution, resolve
-                if (currentExecution && event.execution === currentExecution) {
-                    console.log('[Terminal] Exact execution match - resolving');
-                    resolveWithDelay(streamReadingActive ? 500 : 0);
-                    return;
-                }
-                
-                // If we sent a command but lost shell integration (terminal refresh scenario)
-                if (commandSent && shellIntegrationLost) {
-                    console.log('[Terminal] Detected command completion after shell integration loss');
-                    resolveWithDelay(streamReadingActive ? 500 : 0);
-                    return;
-                }
-                
-                // For compound commands where execution objects don't match:
-                // If we have output OR the stream has ended, this is likely our command completing
-                if (commandSent && (output.length > 0 || streamEnded)) {
-                    console.log('[Terminal] Command sent + (have output OR stream ended), treating as completion');
-                    resolveWithDelay(streamReadingActive ? 1000 : 500); // Longer delay for compound commands
-                    return;
-                }
-                
-                // If we're waiting for a command and stream is still reading, don't resolve yet
-                // This handles the case where cd completes but npm is still starting
-                if (commandSent && streamReadingActive) {
-                    console.log('[Terminal] Stream still active, waiting for output or completion...');
-                    return; // Keep waiting
-                }
-                
-                // Last fallback: any execution from our terminal when command was sent
-                if (commandSent) {
-                    console.log('[Terminal] Command was sent and execution ended (fallback)');
-                    resolveWithDelay(500);
-                }
+            let output = '';
+            let exitCode: number | undefined = undefined;
+            let streamClosed = false;
+            let timeoutTriggered = false;
+
+            // Promise for the 'end' event
+            const commandFinished = new Promise<'event'>(resolve => {
+                const disposable = vscode.window.onDidEndTerminalShellExecution(event => {
+                    if (event.execution === currentExecution) {
+                        console.log(`[Terminal] onDidEndTerminalShellExecution fired. Exit code: ${event.exitCode}`);
+                        exitCode = event.exitCode;
+                        disposable.dispose();
+                        resolve('event');
+                    }
+                });
             });
-            disposables.push(endListener);
 
-            // Monitor shell integration changes (for terminal refresh scenarios)
-            const integrationChangeListener = vscode.window.onDidChangeTerminalShellIntegration(async event => {
-                if (event.terminal !== term || resolved) {
-                    return;
-                }
-                
-                const hadIntegration = !!currentExecution;
-                const hasIntegration = !!event.shellIntegration;
-                
-                console.log('[Terminal] Shell integration changed. had:', hadIntegration, 'has:', hasIntegration, 'commandSent:', commandSent);
-
-                // Detect when shell integration is LOST (terminal refresh during command execution)
-                if (hadIntegration && !hasIntegration && commandSent) {
-                    console.warn('[Terminal] Shell integration LOST during command execution. Aborting and re-running with fallback.');
-                    shellIntegrationLost = true; // Mark as lost
-                    
-                    // If we've already resolved, do nothing
-                    if (resolved) return;
-
-                    // Stop all listeners, we are taking over
-                    cleanup();
-                    if (inactivityTimeout) clearTimeout(inactivityTimeout);
-                    
-                    // Stop the (now detached) process
-                    await this.killRunningTerminalProcess();
-
-                    // Re-run the command using the fallback
-                    const fallbackResult = await this.runFallbackCommand(term, command);
-                    
-                    // Resolve using the standard path
-                    doResolve(fallbackResult.stdout, fallbackResult.stderr);
-                    return; // Fallback has taken over
-                }
-                
-                // Shell integration restored - but DON'T re-execute the command!
-                if (!hadIntegration && hasIntegration && commandSent && shellIntegrationLost) {
-                    console.log('[Terminal] Shell integration restored after refresh - waiting for completion event');
-                    // Just wait for the onDidEndTerminalShellExecution event
-                }
+            // Max execution timeout
+            const MAX_EXECUTION_TIME_MS = 30000; // 30 seconds
+            const commandTimeout = new Promise<'timeout'>(resolve => {
+                setTimeout(() => {
+                    console.warn(`[Terminal] Command hit max execution timeout (${MAX_EXECUTION_TIME_MS}ms).`);
+                    resolve('timeout');
+                }, MAX_EXECUTION_TIME_MS);
             });
-            disposables.push(integrationChangeListener);
 
-            // Main function to attach to shell integration and capture output
-            const attachToShellIntegration = async (): Promise<boolean> => {
-                if (!term.shellIntegration || resolved) {
-                    return false;
-                }
+            // 6. Manual stream iteration to prevent 'for await' hang
+            const stream = currentExecution.read();
+            const iterator = stream[Symbol.asyncIterator]();
+            console.log('[Terminal] Reading output stream manually...');
 
-                try {
-                    currentExecution = term.shellIntegration.executeCommand(command);
-                    commandSent = true;
-                    const executionCommand = (currentExecution as any)?.commandLine?.value || 'unknown';
-                    console.log('[Terminal] Executing command with shell integration:', command);
-                    console.log('[Terminal] Execution object command:', executionCommand);
-                    
-                    resetInactivityTimer();
+            while (!streamClosed) {
+                const nextChunkPromise = iterator.next(); // Promise<IteratorResult<string>>
+                
+                // Race the next chunk against the event and the timeout
+                const winner = await Promise.race([nextChunkPromise, commandFinished, commandTimeout]);
 
-                    // Read the output stream
-                    const stream = currentExecution.read();
-                    streamReadingActive = true;
-                    
-                    (async () => {
-                        try {
-                            for await (const data of stream) {
-                                if (resolved) {
-                                    break;
-                                }
-                                output += data;
-                                console.log('[Terminal] Output chunk received:', data.length, 'chars, total:', output.length);
-                                resetInactivityTimer();
-                            }
-                            console.log('[Terminal] Output stream ended normally. Total output:', output.length, 'chars');
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            
-                            // Give a tiny bit more time for any final output to arrive
-                            await new Promise(resolve => setTimeout(resolve, 100));
-                            
-                            // After stream ends, start inactivity timer
-                            // If command actually finished, onDidEndTerminalShellExecution will fire
-                            // Otherwise, inactivity timer will resolve after grace period
-                            resetInactivityTimer();
-                        } catch (error) {
-                            console.error('[Terminal] Error reading stream:', error);
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            // Still reset timer to handle gracefully
-                            resetInactivityTimer();
-                        }
-                    })();
-                    
-                    return true;
-                } catch (error) {
-                    console.warn('[Terminal] Shell integration failed:', error);
-                    commandSent = false;
-                    return false;
-                }
-            };
-
-            // Try shell integration immediately if available
-            if (term.shellIntegration) {
-                if (await attachToShellIntegration()) {
-                    return; // Successfully started with shell integration
+                if (winner === 'event') {
+                    // Event fired first. Command is done.
+                    // Give a brief moment for any final stream data.
+                    console.log('[Terminal] Event fired. Waiting 200ms for final stream data.');
+                    await new Promise(r => setTimeout(r, 200)); 
+                    streamClosed = true; // Force-break the loop
+                } else if (winner === 'timeout') {
+                    // Timeout fired. Command is stuck or stream is hung.
+                    console.warn('[Terminal] Timeout fired. Breaking stream loop.');
+                    timeoutTriggered = true;
+                    streamClosed = true; // Force-break the loop
+                } else if (winner.done) {
+                    // Stream *actually* closed. This is the happy path.
+                    console.log('[Terminal] Stream closed naturally.');
+                    streamClosed = true;
+                } else {
+                    // We got data. Append it.
+                    output += winner.value;
                 }
             }
 
-            // Wait for shell integration to become available (up to 15 seconds for newly created terminals)
-            let waitAttempts = 0;
-            const maxWaitAttempts = 150; // 150 * 100ms = 15 seconds (longer wait for new terminals)
-            
-            const waitInterval = setInterval(async () => {
-                waitAttempts++;
-                
-                if (resolved) {
-                    clearInterval(waitInterval);
-                    return;
-                }
-                
-                if (term.shellIntegration && !commandSent) {
-                    clearInterval(waitInterval);
-                    console.log('[Terminal] Shell integration became available after', waitAttempts * 100, 'ms');
-                    if (await attachToShellIntegration()) {
-                        return; // Successfully started
+            // 7. We've exited the loop.
+            // Check if the event *still* hasn't fired (e.g., stream closed but event is delayed).
+            if (exitCode === undefined) {
+                console.log('[Terminal] Stream closed, waiting for event or 2s grace period...');
+                await Promise.race([commandFinished, new Promise(r => setTimeout(r, 2000))]);
+            }
+
+            // 8. Process CWD change (best effort)
+            try {
+                const currentCwd = (term.shellIntegration as any).cwd;
+                if (currentCwd) {
+                    const newDir = currentCwd.fsPath || currentCwd.toString();
+                    if (newDir && newDir !== this.workingDirectory) {
+                        console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
+                        this.workingDirectory = newDir;
                     }
                 }
-                
-                // Log progress every 2 seconds
-                if (waitAttempts % 20 === 0) {
-                    console.log(`[Terminal] Still waiting for shell integration... (${waitAttempts * 100}ms elapsed)`);
+            } catch (error) {
+                console.warn('[Terminal] Could not update CWD:', error);
+            }
+            
+            // 9. Increment counter
+            this.terminalCommandCount++;
+            console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
+
+            // 10. Check results and decide on fallback
+            let cleanStdout = this.stripAnsiCodes(output);
+            let cleanStderr = '';
+
+            if (!timeoutTriggered && output.length === 0 && exitCode === undefined) {
+                // Total failure: Timed out with no stream data and no event.
+                console.error('[Terminal] Timeout with 0 output. Stream/Event failed. Retrying with fallback scrape.');
+                return await this.runFallbackCommand(term, command);
+            }
+
+            if (exitCode !== undefined && exitCode !== 0) {
+                cleanStderr = `Command exited with code ${exitCode}`;
+            } else if (exitCode === undefined) {
+                // This means we timed out, but we *have* the partial output
+                cleanStderr = `Command timed out after ${MAX_EXECUTION_TIME_MS / 1000}s. Output may be incomplete.`;
+            }
+
+            if (timeoutTriggered) {
+                console.warn('[Terminal] Timeout detected, attempting clipboard scrape for final output.');
+                const { buffer, error } = await this.scrapeTerminalBuffer(term);
+                const scrapedOutput = extractCommandOutput(buffer, command);
+                if (scrapedOutput) {
+                    cleanStdout = scrapedOutput;
                 }
-                
-                // Timeout waiting for shell integration
-                if (waitAttempts >= maxWaitAttempts) {
-                    clearInterval(waitInterval);
-                    console.error('[Terminal] Shell integration not available after 15 seconds. Using fallback command execution.');
-                    
-                    // Use fallback and resolve the main promise
-                    const fallbackResult = await this.runFallbackCommand(term, command);
-                    // We MUST use doResolve to update cwd, increment counters, etc.
-                    doResolve(fallbackResult.stdout, fallbackResult.stderr);
+                if (error) {
+                    cleanStderr = cleanStderr ? `${cleanStderr}\n${error}` : error;
                 }
-            }, 100);
-        });
+            }
+
+            return { stdout: cleanStdout, stderr: cleanStderr };
+
+        } else {
+            // --- FALLBACK (CLINE'S) PATH ---
+            console.warn('[Terminal] Shell integration NOT available. Using fallback (sendText + clipboard scrape).');
+            return await this.runFallbackCommand(term, command);
+        }
     }
     
     public async similar_search(query: string, limit: number = 8): Promise<object[]> {
