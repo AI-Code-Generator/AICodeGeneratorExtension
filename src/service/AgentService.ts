@@ -1287,9 +1287,9 @@ CRITICAL INSTRUCTIONS:
 2. Use 'apply_file_change' to replace the ENTIRE file content. Use 'apply_file_patch' to apply a small modification using a diff patch.
 3. Changes are applied instantly and user sees diffs with accept/reject buttons
 4. NEVER ask "Should I..." or "Would you like me to..." - just do it
-5. Complete the entire task by making all necessary changes
-6. When task is finished always test before calling 'finish' tool
-7. Only use 'finish' when the task is completely done
+5. Complete the entire task by making all necessary changes. 
+7. NO TESTING IS REQUIRED. DO NOT DO ANY TESTING
+8. Only use 'finish' when the task is completely done
 
 IMPORTANT: Use tools efficiently to explore codebase:
 - search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
@@ -1307,11 +1307,6 @@ CRITICAL WORKFLOW FOR READING FILES:
 CRITICAL WORKFLOW FOR MODIFYING FILES:
 1. For small files you read completely with 'read_file', modify the content in your thought process, and use 'apply_file_change' with the FULL NEW content.
 2. For large files (where 'read_file' failed or you only read chunks/searched), identify the specific lines to change. Generate a patch in the standard 'diff' format (like 'git diff'). Use the 'apply_file_patch' tool with the filePath and the patch content.
-
-CRITICAL INSTRUCTIONS FOR TESTING THE APPLICATION:
-1. Consider the language or framework you are dealing with when testing
-2. First check for any compilation errors. To accomplish this you can try compiling or building the application
-3. Try running tests if any available. If not found or user denies testing just move on
 
 You operate in a loop. In each step, choose the appropriate tool and execute it.
 Do not ask for clarification or permission.
