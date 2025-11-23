@@ -5,6 +5,8 @@ import * as path from 'path';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedQuery } from './FileIndexer';
 import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
+import { extractCommandOutput } from './terminalUtils';
+import * as Diff from 'diff';
 
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
@@ -14,8 +16,9 @@ class ToolBox {
     private terminal?: vscode.Terminal;
     private captureTimeout?: NodeJS.Timeout;
     private terminalCommandCount: number = 0;
-    private readonly MAX_COMMANDS_PER_TERMINAL = 5; // Refresh terminal after 5 commands
+    private readonly MAX_COMMANDS_PER_TERMINAL = 10; // Refresh terminal after 10 commands
     private context: vscode.ExtensionContext; // Store the extension context
+    private sendUpdateCallback?: (update: string) => void; // For streaming terminal output
 
     constructor(context: vscode.ExtensionContext) { // Accept context in constructor
         this.diffManager = DiffManager.getInstance();
@@ -24,6 +27,13 @@ class ToolBox {
 
     public setTerminalCommandCallback(callback: (command: string) => Promise<boolean>) {
         this.terminalCommandCallback = callback;
+    }
+
+    /**
+     * Set the callback function for sending live updates to the chat view.
+     */
+    public setSendUpdateCallback(callback: (update: string) => void) {
+        this.sendUpdateCallback = callback;
     }
 
     public setWorkingDirectory(directory: string) {
@@ -94,7 +104,8 @@ class ToolBox {
         // Keep the terminal alive for reuse!
     }
 
-    public async list_files(offset: number = 0, limit: number = 100): Promise<{files: string[], total: number, hasMore: boolean}> {
+    public async list_files(offset: number = 0): Promise<{files: string[], total: number, hasMore: boolean}> {
+        const limit: number = 10000;
         let allFiles: string[] = [];
         
         if (this.workingDirectory) {
@@ -309,17 +320,22 @@ class ToolBox {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
             const content = await fs.readFile(absolutePath, 'utf-8');
-            const FILE_SIZE_LIMIT = 15000; // Set a reasonable character limit
+            // Use a fixed chunk size for calculation, matching read_file_chunk
+            const CHUNK_SIZE = 100000;
+            const FILE_SIZE_LIMIT = CHUNK_SIZE; // Align limit with chunk size
 
             if (content.length > FILE_SIZE_LIMIT) {
-                // If file is too long, return a summary and instructions
+                // Calculate total chunks based on the fixed chunk size
+                const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+
+                // If file is too long, return error with total chunks
                 return `Error: File '${filePath}' is too long (${content.length} characters). ` +
-                       `File content has been truncated. ` +
-                       `To find specific content, use the 'search_in_file(filePath, keyword)' tool. ` +
-                       `To read the file in chunks, use 'read_file_chunk(filePath, chunkNumber, chunkSize)'.\n\n` +
-                       `Start of file:\n${content.substring(0, 4000)}`;
+                       `It has been divided into ${totalChunks} chunks. ` + // Inform about total chunks
+                       `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
+                       `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk (e.g., chunkNumber 1).`;
+                       // Removed the truncated content start
             }
-            return content;
+            return content; // Return full content if within limit
         } catch (error) {
             if ((error as any).code === 'ENOENT') {
                 return `Error: File not found at path: ${absolutePath}. Working directory: ${this.workingDirectory}`;
@@ -363,24 +379,25 @@ class ToolBox {
         }
     }
 
-    public async read_file_chunk(filePath: string, chunkNumber: number = 1, chunkSize: number = 8000): Promise<string> {
+    // Updated read_file_chunk: removed chunkSize, uses fixed size
+    public async read_file_chunk(filePath: string, chunkNumber: number = 1): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
+        const CHUNK_SIZE = 100000; // Use the fixed chunk size
+
         try {
             const content = await fs.readFile(absolutePath, 'utf-8');
-            const totalChunks = Math.ceil(content.length / chunkSize);
+            const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
 
-            if (chunkNumber < 1) {
-                chunkNumber = 1;
+            if (chunkNumber < 1 || chunkNumber > totalChunks) {
+                return `Error: Chunk number ${chunkNumber} is out of bounds. The file '${filePath}' only has ${totalChunks} chunks (1 to ${totalChunks}).`;
             }
 
-            const start = (chunkNumber - 1) * chunkSize;
-            
-            if (start > content.length) {
-                return `Error: Chunk number ${chunkNumber} is out of bounds. The file only has ${totalChunks} chunks.`;
-            }
+            const start = (chunkNumber - 1) * CHUNK_SIZE;
+            // End index is calculated correctly, Math.min handles the last chunk
+            const end = Math.min(start + CHUNK_SIZE, content.length);
+            const chunkContent = content.substring(start, end);
 
-            const chunkContent = content.substring(start, start + chunkSize);
-
+            // Never return truncated message from here
             return `--- Showing chunk ${chunkNumber} of ${totalChunks} from file '${filePath}' ---\n\n` + chunkContent;
 
         } catch (error) {
@@ -391,6 +408,9 @@ class ToolBox {
         }
     }
 
+    /**
+     * Replaces the entire content of a file. Use apply_file_patch for smaller changes.
+     */
     public async apply_file_change(filePath: string, newContent: string): Promise<string> {
         // Convert relative path to absolute path using workingDirectory
         const absolutePath = this.getAbsolutePath(filePath);
@@ -400,8 +420,306 @@ class ToolBox {
         return await this.diffManager.applyChangeWithDiff(absolutePath, newContent);
     }
 
+    /**
+     * Applies a patch (in standard diff format) to a file.
+     * Useful for applying small changes generated by the agent without replacing the whole file.
+     */
+    public async apply_file_patch(filePath: string, patchContent: string): Promise<string> {
+        const absolutePath = this.getAbsolutePath(filePath);
+        console.log('[apply_file_patch] Applying patch to:', absolutePath);
+
+        let originalContent: string;
+        try {
+            originalContent = await fs.readFile(absolutePath, 'utf-8');
+        } catch (error) {
+            if ((error as any).code === 'ENOENT') {
+                return `Error: File not found at path: ${absolutePath} to apply patch. Working directory: ${this.workingDirectory}`;
+            }
+            return `Error reading file for patching: ${error}`;
+        }
+
+        // Pre-sanitize common LLM patch issues before attempting to apply
+        const sanitized = this.sanitizeUnifiedDiff(patchContent);
+
+        try {
+            const patchedContent = Diff.applyPatch(originalContent, sanitized);
+
+            if (patchedContent === false) {
+                // The patch didn't apply cleanly
+                console.warn(`[apply_file_patch] Patch did not apply cleanly to ${filePath}.`);
+                // Attempt to apply with fuzz factor (optional, can be noisy)
+                const fuzzyResult = Diff.applyPatch(originalContent, sanitized, { fuzzFactor: 2 });
+                if (fuzzyResult === false) {
+                    // As a last-resort, try a manual hunk applier that tolerates incorrect counts
+                    const manual = this.tryManualHunkApply(originalContent, sanitized);
+                    if (manual === null) {
+                        return `Error: Patch could not be applied cleanly to file ${filePath}. The file content might have changed, or the patch format is incorrect.`;
+                    }
+                    console.log(`[apply_file_patch] Patch applied via manual hunk applier.`);
+                    return await this.diffManager.applyChangeWithDiff(absolutePath, manual);
+                }
+                console.log(`[apply_file_patch] Patch applied with fuzz factor.`);
+                // If fuzzy patching worked, use that result.
+                // We still use applyChangeWithDiff to leverage existing UI.
+                return await this.diffManager.applyChangeWithDiff(absolutePath, fuzzyResult);
+            }
+
+            // If patch applied cleanly, use applyChangeWithDiff to show the result
+            return await this.diffManager.applyChangeWithDiff(absolutePath, patchedContent);
+
+        } catch (error: any) {
+            console.warn(`[apply_file_patch] Parser threw while applying patch to ${filePath}: ${error?.message || error}. Trying manual fallback.`);
+            // Try manual fallback even on thrown parse errors
+            const manual = this.tryManualHunkApply(originalContent, sanitized);
+            if (manual !== null) {
+                console.log(`[apply_file_patch] Patch applied via manual hunk applier after exception.`);
+                return await this.diffManager.applyChangeWithDiff(absolutePath, manual);
+            }
+            console.error(`[apply_file_patch] Manual fallback also failed for ${filePath}.`);
+            return `Error applying patch (and manual fallback failed): ${error?.message || error}`;
+        }
+    }
+
+    /**
+     * Attempts to normalize a unified diff string to be acceptable by the 'diff' library parser.
+     * Fixes these common issues:
+     * - Removes surrounding code fences (``` or *** Begin/End Patch wrappers left in content)
+     * - Normalizes CRLF to LF
+     * - Ensures lines inside @@ hunk blocks start with a valid marker (' ', '+', '-', '\\')
+     * - Ensures the patch ends with a trailing newline (some parsers require it)
+     */
+    private sanitizeUnifiedDiff(patch: string): string {
+        if (!patch) { return patch; }
+
+        // 1) Strip code fences and wrapper markers if present
+        let p = patch.trim();
+        // Remove markdown code fences
+        if (p.startsWith('```')) {
+            p = p.replace(/^```[a-zA-Z0-9]*\n?/m, '');
+            p = p.replace(/\n?```\s*$/m, '');
+        }
+        // Remove our Begin/End Patch wrapper if mistakenly included inside
+        p = p.replace(/\*\*\*\s*Begin Patch\s*\n/g, '')
+             .replace(/\n?\*\*\*\s*End Patch\s*$/g, '')
+             .trim();
+
+        // 2) Normalize line endings
+        p = p.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        // 3) Ensure hunk lines have proper prefixes
+        const lines = p.split('\n');
+        let inHunk = false;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.startsWith('@@')) {
+                inHunk = true;
+                continue;
+            }
+            // Headers or file markers exit hunk context
+            if (line.startsWith('diff ') || line.startsWith('Index:') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+                inHunk = false; // outside hunk until next @@
+                continue;
+            }
+            if (inHunk) {
+                // Valid prefixes inside a hunk: space, '+', '-', '\\' (for no newline at EOF)
+                if (!(line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line.startsWith('\\'))) {
+                    // Likely an unchanged context line missing the required leading space
+                    lines[i] = ' ' + line;
+                }
+            }
+        }
+        p = lines.join('\n');
+
+        // 4) Ensure patch ends with a newline
+        if (!p.endsWith('\n')) {
+            p += '\n';
+        }
+
+        return p;
+    }
+
+    /**
+     * Manual unified-diff hunk application that ignores incorrect hunk counts.
+     * Strategy: split into hunks, derive old/new blocks from line markers, and
+     * perform a straightforward substring replacement per hunk in sequence.
+     * Returns null if any hunk cannot be located.
+     */
+    private tryManualHunkApply(original: string, patch: string): string | null {
+        let src = original.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const p = patch.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        // Extract hunks: everything after a line starting with @@ until next @@ or end
+        const lines = p.split('\n');
+        const hunks: string[][] = [];
+        let current: string[] | null = null;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.startsWith('@@')) {
+                if (current) { hunks.push(current); }
+                current = [line];
+            } else if (current) {
+                // Stop hunk at a new index header (---/+++/diff/Index)
+                if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('diff ') || line.startsWith('Index:')) {
+                    hunks.push(current);
+                    current = null;
+                } else {
+                    current.push(line);
+                }
+            }
+        }
+        if (current) { hunks.push(current); }
+
+        const applyOne = (content: string, hunkLines: string[]): string | null => {
+            // Build old/new text blocks from markers
+            const oldParts: string[] = [];
+            const newParts: string[] = [];
+            for (let i = 1; i < hunkLines.length; i++) { // skip header line
+                const l = hunkLines[i];
+                if (!l.length) { // blank line inside hunk => context blank line
+                    oldParts.push('');
+                    newParts.push('');
+                    continue;
+                }
+                const tag = l[0];
+                const body = l.substring(1);
+                if (tag === ' ') {
+                    oldParts.push(body);
+                    newParts.push(body);
+                } else if (tag === '-') {
+                    oldParts.push(body);
+                } else if (tag === '+') {
+                    newParts.push(body);
+                } else if (tag === '\\') {
+                    // No newline marker; ignore
+                } else {
+                    // Unexpected, treat as context line (auto-fix)
+                    oldParts.push(l);
+                    newParts.push(l);
+                }
+            }
+            const oldText = oldParts.join('\n');
+            const newText = newParts.join('\n');
+
+            // Direct substring search
+            let idx = content.indexOf(oldText);
+            if (idx === -1) {
+                // Try a weaker anchor match: use first and last 2 context lines
+                const contextLines = hunkLines.filter(h => h.startsWith(' ')).map(h => h.substring(1));
+                const head = contextLines.slice(0, 2).join('\n');
+                const tail = contextLines.slice(-2).join('\n');
+                if (head) {
+                    const headIdx = content.indexOf(head);
+                    if (headIdx !== -1) {
+                        const searchStart = headIdx;
+                        const tailIdx = tail ? content.indexOf(tail, searchStart) : -1;
+                        if (tailIdx !== -1 && tailIdx >= headIdx) {
+                            
+                            // --- FIX STARTS HERE ---
+                            // 'before' should be the content *before* the head anchor
+                            const before = content.substring(0, headIdx);
+                            // 'after' should be the content *after* the tail anchor
+                            const after = content.substring(tailIdx + (tail ? tail.length : 0));
+                            
+                            // 'newCandidate' is the full new block (head + new middle + tail)
+                            const newCandidate = head + newText.substring(head.length, newText.length - (tail ? tail.length : 0)) + (tail ? tail : '');
+                            
+                            // This now correctly assembles: (before) + (newCandidate) + (after)
+                            return before + newCandidate + after;
+                            // --- FIX ENDS HERE ---
+                        }
+                    }
+                }
+                return null;
+            }
+            return content.substring(0, idx) + newText + content.substring(idx + oldText.length);
+        };
+
+        for (const h of hunks) {
+            const next = applyOne(src, h);
+            if (next === null) {
+                return null;
+            }
+            src = next;
+        }
+        return src;
+    }
+
+
+    /**
+     * NEW: Helper function to strip ANSI codes.
+     */
+    private stripAnsiCodes(text: string): string {
+        return text
+            // Remove ANSI escape sequences (colors, cursor movement, etc.)
+            .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+            // Remove other escape sequences
+            .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
+            // Remove control characters except newline, carriage return, and tab
+            .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+            // Clean up excessive whitespace while preserving structure
+            .replace(/\r\n/g, '\n')  // Normalize line endings
+            .replace(/\r/g, '\n')     // Convert remaining \r to \n
+            .replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
+    }
+
+    private async scrapeTerminalBuffer(term: vscode.Terminal): Promise<{ buffer: string, error: string }> {
+        let originalClipboard = '';
+        let buffer = '';
+        let errorMsg = '';
+
+        try {
+            originalClipboard = await vscode.env.clipboard.readText();
+        } catch (e) {
+            console.warn('[Terminal] Could not read clipboard before scraping.');
+        }
+
+        try {
+            await vscode.commands.executeCommand('workbench.action.terminal.selectAll');
+            await vscode.commands.executeCommand('workbench.action.terminal.copySelection');
+            await vscode.commands.executeCommand('workbench.action.terminal.clearSelection');
+            buffer = await vscode.env.clipboard.readText();
+        } catch (e: any) {
+            console.error(`[Terminal] Failed to scrape terminal buffer: ${e.message}`);
+            errorMsg = `Failed to capture terminal output: ${e.message}`;
+        }
+
+        try {
+            await vscode.env.clipboard.writeText(originalClipboard);
+        } catch (e) {
+            console.warn('[Terminal] Could not restore clipboard after scraping.');
+        }
+
+        return { buffer: this.stripAnsiCodes(buffer), error: errorMsg };
+    }
+
+    /**
+     * NEW: Fallback command execution using sendText and clipboard scrape
+     */
+    private async runFallbackCommand(term: vscode.Terminal, command: string): Promise<{ stdout: string, stderr: string }> {
+        console.warn(`[Terminal] Using fallback 'sendText' for command: ${command}`);
+
+        // Send the command
+        term.sendText(command, true);
+
+        // Wait 3 seconds. This is an arbitrary guess.
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const { buffer, error } = await this.scrapeTerminalBuffer(term);
+    const finalOutput = extractCommandOutput(buffer, command);
+
+        return {
+            stdout: finalOutput,
+            stderr: error
+        };
+    }
+
+    /**
+     * Executes a shell command using Node.js child_process.spawn for live output.
+     * Intercepts 'cd' commands to update the internal working directory.
+     * Streams stdout/stderr to the sendUpdateCallback.
+     */
     public async run_terminal_command(command: string): Promise<{ stdout: string, stderr: string }> {
-        // Ask for permission
+        // 1. Ask for permission
         let allow = false;
         if (this.terminalCommandCallback) {
             allow = await this.terminalCommandCallback(command);
@@ -419,434 +737,169 @@ class ToolBox {
             return { stdout: '', stderr: 'Command not allowed by user.' };
         }
 
-        // Stop any running process (but don't dispose terminal)
+        // 2. Stop any previous process
         await this.killRunningTerminalProcess();
         
-        // Reuse existing terminal or create new one if needed
+        // 3. Get or create a terminal
         const term = this.ensureTerminal();
-        
-        // If terminal was just created, give it time to initialize shell integration
-        if (!term.shellIntegration) {
-            console.log('[Terminal] Waiting for shell integration to initialize (new terminal)...');
-            // Wait up to 3 seconds, checking every 200ms
-            for (let i = 0; i < 15; i++) {
-                await new Promise(resolve => setTimeout(resolve, 200));
-                if (term.shellIntegration) {
-                    console.log(`[Terminal] Shell integration initialized after ${(i + 1) * 200}ms`);
-                    break;
-                }
-            }
-            
-            if (!term.shellIntegration) {
-                console.warn('[Terminal] Shell integration still not available after 3 seconds');
-            }
-        }
-        
-        // DON'T automatically cd before every command - let commands execute naturally
-        // The terminal will stay in whatever directory the last command left it in
-        // Only the cd tracking above will update our workingDirectory variable
-        
         term.show(true); // Show terminal with focus
 
-        return new Promise(async (resolve) => {
-            let resolved = false;
-            let output = '';
-            let currentExecution: vscode.TerminalShellExecution | null = null;
-            const disposables: vscode.Disposable[] = [];
-            let commandSent = false;
-            let shellIntegrationLost = false;
-            let lastShellExecutionEvent: vscode.TerminalShellExecutionEndEvent | null = null;
-            
-            // Cleanup function to dispose all listeners
-            const cleanup = () => {
-                disposables.forEach(d => d.dispose());
-                disposables.length = 0;
-            };
-            
-            // Function to strip ANSI escape codes and control characters
-            const stripAnsiCodes = (text: string): string => {
-                return text
-                    // Remove ANSI escape sequences (colors, cursor movement, etc.)
-                    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-                    // Remove other escape sequences
-                    .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
-                    // Remove control characters except newline, carriage return, and tab
-                    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
-                    // Clean up excessive whitespace while preserving structure
-                    .replace(/\r\n/g, '\n')  // Normalize line endings
-                    .replace(/\r/g, '\n')     // Convert remaining \r to \n
-                    .replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
-            };
-            
-            // Final resolve function
-            const doResolve = async (stdout: string, stderr: string) => {
-                if (resolved) {
-                    return;
-                }
-                resolved = true;
-                cleanup();
-                
-                // Query terminal's current directory silently by checking shell integration cwd
-                try {
+        // 4. Wait for shell integration
+        if (!term.shellIntegration) {
+            console.log('[Terminal] Waiting for shell integration to initialize...');
+            await new Promise<void>(resolve => {
+                const disposable = vscode.window.onDidChangeTerminalShellIntegration(e => {
+                    if (e.terminal === term && e.shellIntegration) {
+                        console.log('[Terminal] Shell integration initialized via listener.');
+                        disposable.dispose();
+                        resolve();
+                    }
+                });
+                // Failsafe timeout
+                setTimeout(() => {
                     if (term.shellIntegration) {
-                        // Wait a bit for shell integration to update after command
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                        
-                        // Try to get cwd from shell integration state
-                        // Shell integration tracks the cwd automatically
-                        const currentCwd = (term.shellIntegration as any).cwd;
-                        if (currentCwd) {
-                            const newDir = currentCwd.fsPath || currentCwd.toString();
-                            if (newDir && newDir !== this.workingDirectory) {
-                                console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
-                                this.workingDirectory = newDir;
-                            }
-                        }
-                    }
-                } catch (error) {
-                    // Silently ignore - this is a best-effort tracking
-                }
-                
-                // Increment command counter for terminal refresh tracking
-                this.terminalCommandCount++;
-                console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
-                
-                // Strip ANSI codes before sending to AI
-                const cleanStdout = stripAnsiCodes(stdout);
-                const cleanStderr = stripAnsiCodes(stderr);
-                
-                console.log('[Terminal] Resolving with output length:', cleanStdout.length, '(original:', stdout.length, ')');
-                resolve({ stdout: cleanStdout, stderr: cleanStderr });
-            };
-
-            // Detect if command is likely to be long-running (servers, watchers, etc.)
-            const isLongRunningCommand = (cmd: string): boolean => {
-                const longRunningPatterns = [
-                    /npm\s+(run\s+)?(start|dev|serve|watch)/i,
-                    /yarn\s+(run\s+)?(start|dev|serve|watch)/i,
-                    /ng\s+serve/i,
-                    /webpack\s+.*--watch/i,
-                    /nodemon/i,
-                    /python\s+.*manage\.py\s+runserver/i,
-                    /rails\s+server/i,
-                    /mvn\s+.*spring-boot:run/i,
-                    /gradle\s+.*bootRun/i
-                ];
-                return longRunningPatterns.some(pattern => pattern.test(cmd));
-            };
-
-            // Detect if command is installation/build type (completes but might take time)
-            const isInstallCommand = (cmd: string): boolean => {
-                const installPatterns = [
-                    /npm\s+(install|i|ci)/i,
-                    /yarn\s+(install|add)/i,
-                    /pip\s+install/i,
-                    /mvn\s+(install|package|clean)/i,
-                    /gradle\s+(build|assemble)/i,
-                    /cargo\s+build/i
-                ];
-                return installPatterns.some(pattern => pattern.test(cmd));
-            };
-
-            const cmdType = isLongRunningCommand(command) ? 'long-running' : 
-                           isInstallCommand(command) ? 'install' : 'normal';
-            
-            // Adaptive timeout based on command type
-            const MAX_INACTIVITY_TIME = cmdType === 'install' ? 10000 : // 10 seconds for install
-                                       cmdType === 'long-running' ? 30000 : // 30 seconds for servers (then return output)
-                                       30000; // 30 seconds for normal commands
-            
-            let inactivityTimeout: NodeJS.Timeout | null = null;
-            let streamEnded = false;
-            let streamReadingActive = false;
-
-            // Reset inactivity timer
-            const resetInactivityTimer = () => {
-                if (inactivityTimeout) {
-                    clearTimeout(inactivityTimeout);
-                }
-                
-                inactivityTimeout = setTimeout(() => {
-                    console.log('[Terminal] Inactivity timeout triggered. streamEnded:', streamEnded, 'shellIntegrationLost:', shellIntegrationLost, 'outputLength:', output.length, 'cmdType:', cmdType);
-                    
-                    // For long-running commands: if we have output, return it with a detached message
-                    // The process continues running in the background, but we return what we captured
-                    if (cmdType === 'long-running' && output.length > 0) {
-                        console.log('[Terminal] Long-running process timeout - returning captured output (process continues in background)');
-                        doResolve(
-                            output + `\n\n[INFO] Long-running process started successfully. Process continues in background. Output captured: ${output.length} characters.`,
-                            ''
-                        );
-                        return;
-                    }
-                    
-                    if (streamEnded || shellIntegrationLost) {
-                        // Stream ended or shell integration lost - command likely finished
-                        doResolve(
-                            output || `Command "${command}" completed.`,
-                            lastShellExecutionEvent && lastShellExecutionEvent.exitCode !== 0 
-                                ? `Exit code: ${lastShellExecutionEvent.exitCode}` 
-                                : ''
-                        );
+                        console.log('[Terminal] Shell integration was ready after timeout check.');
                     } else {
-                        // Normal timeout behavior
-                        doResolve(
-                            output + `\n\n[INFO] Command execution timeout (${MAX_INACTIVITY_TIME/1000}s of inactivity). Output captured so far.`,
-                            ""
-                        );
+                        console.warn('[Terminal] Shell integration timed out.');
                     }
-                }, MAX_INACTIVITY_TIME);
-            };
-
-            // Listen for execution START events to capture subsequent commands in compound commands
-            const startListener = vscode.window.onDidStartTerminalShellExecution(event => {
-                if (event.terminal !== term || resolved) {
-                    return;
-                }
-                
-                const startedCommand = (event.execution as any)?.commandLine?.value || '';
-                console.log('[Terminal] Shell execution STARTED:', startedCommand, 'commandSent:', commandSent);
-                
-                // If we've sent a command and a new execution starts that's different from our original,
-                // this might be the second part of a compound command. Attach to its stream!
-                if (commandSent && startedCommand && startedCommand !== command) {
-                    console.log('[Terminal] Detected subsequent execution in compound command, attaching to stream...');
-                    
-                    const newStream = event.execution.read();
-                    streamReadingActive = true;
-                    
-                    (async () => {
-                        try {
-                            for await (const data of newStream) {
-                                if (resolved) {
-                                    break;
-                                }
-                                output += data;
-                                console.log('[Terminal] Output chunk from subsequent execution:', data.length, 'chars, total:', output.length);
-                                resetInactivityTimer();
-                            }
-                            console.log('[Terminal] Subsequent execution stream ended. Total output:', output.length, 'chars');
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            
-                            await new Promise(resolve => setTimeout(resolve, 100));
-                            resetInactivityTimer();
-                        } catch (error) {
-                            console.error('[Terminal] Error reading subsequent execution stream:', error);
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            resetInactivityTimer();
-                        }
-                    })();
-                }
+                    disposable.dispose();
+                    resolve();
+                }, 3000); // 3-second wait
             });
-            disposables.push(startListener);
+        }
+        
+        // 5. Execute command: Primary path or Fallback path
+        if (term.shellIntegration) {
+            // --- PRIMARY (GOOD) PATH ---
+            console.log('[Terminal] Shell integration is available. Running with stream API.');
+            let currentExecution: vscode.TerminalShellExecution;
+            try {
+                currentExecution = term.shellIntegration.executeCommand(command);
+                console.log('[Terminal] Executing command with shell integration:', command);
+            } catch (error: any) {
+                console.error(`[Terminal] Failed to execute command with shell integration: ${error.message}. Trying fallback.`);
+                return await this.runFallbackCommand(term, command);
+            }
 
-            // Listen for ANY shell execution end event from our terminal
-            const endListener = vscode.window.onDidEndTerminalShellExecution(event => {
-                if (event.terminal !== term) {
-                    return;
-                }
-                
-                // Get the command that finished (if available)
-                const finishedCommand = (event.execution as any)?.commandLine?.value || '';
-                console.log('[Terminal] Shell execution ended. exitCode:', event.exitCode, 'command:', finishedCommand, 'currentExecution:', !!currentExecution, 'commandSent:', commandSent, 'outputLength:', output.length, 'streamReadingActive:', streamReadingActive);
-                console.log('[Terminal] Event execution matches current?', event.execution === currentExecution);
-                lastShellExecutionEvent = event;
-                
-                // Helper function to resolve with delay to allow stream to catch up
-                const resolveWithDelay = (delay: number = 0) => {
-                    setTimeout(() => {
-                        console.log('[Terminal] Resolving after delay. Final output length:', output.length);
-                        doResolve(
-                            output || `Command "${command}" completed.`,
-                            event.exitCode !== 0 ? `Exit code: ${event.exitCode}` : ''
-                        );
-                    }, delay);
-                };
-                
-                // CRITICAL: Check for partial command completion FIRST (before exact match)
-                // For compound commands (e.g., "cd folder && npm start"), shell integration reports
-                // separate executions. Ignore the "cd" part if we haven't received output yet.
-                const isPartialCommand = finishedCommand.length > 0 && 
-                                       command.includes(finishedCommand) && 
-                                       finishedCommand !== command &&
-                                       output.length === 0 &&
-                                       event.exitCode === 0; // Only ignore successful partial commands
-                
-                if (isPartialCommand && commandSent) {
-                    console.log('[Terminal] Ignoring partial command completion:', finishedCommand);
-                    return; // Don't resolve yet - wait for the actual command
-                }
-                
-                // If we have a matching execution, resolve
-                if (currentExecution && event.execution === currentExecution) {
-                    console.log('[Terminal] Exact execution match - resolving');
-                    resolveWithDelay(streamReadingActive ? 500 : 0);
-                    return;
-                }
-                
-                // If we sent a command but lost shell integration (terminal refresh scenario)
-                if (commandSent && shellIntegrationLost) {
-                    console.log('[Terminal] Detected command completion after shell integration loss');
-                    resolveWithDelay(streamReadingActive ? 500 : 0);
-                    return;
-                }
-                
-                // For compound commands where execution objects don't match:
-                // If we have output OR the stream has ended, this is likely our command completing
-                if (commandSent && (output.length > 0 || streamEnded)) {
-                    console.log('[Terminal] Command sent + (have output OR stream ended), treating as completion');
-                    resolveWithDelay(streamReadingActive ? 1000 : 500); // Longer delay for compound commands
-                    return;
-                }
-                
-                // If we're waiting for a command and stream is still reading, don't resolve yet
-                // This handles the case where cd completes but npm is still starting
-                if (commandSent && streamReadingActive) {
-                    console.log('[Terminal] Stream still active, waiting for output or completion...');
-                    return; // Keep waiting
-                }
-                
-                // Last fallback: any execution from our terminal when command was sent
-                if (commandSent) {
-                    console.log('[Terminal] Command was sent and execution ended (fallback)');
-                    resolveWithDelay(500);
-                }
+            let output = '';
+            let exitCode: number | undefined = undefined;
+            let streamClosed = false;
+            let timeoutTriggered = false;
+
+            // Promise for the 'end' event
+            const commandFinished = new Promise<'event'>(resolve => {
+                const disposable = vscode.window.onDidEndTerminalShellExecution(event => {
+                    if (event.execution === currentExecution) {
+                        console.log(`[Terminal] onDidEndTerminalShellExecution fired. Exit code: ${event.exitCode}`);
+                        exitCode = event.exitCode;
+                        disposable.dispose();
+                        resolve('event');
+                    }
+                });
             });
-            disposables.push(endListener);
 
-            // Monitor shell integration changes (for terminal refresh scenarios)
-            const integrationChangeListener = vscode.window.onDidChangeTerminalShellIntegration(async event => {
-                if (event.terminal !== term || resolved) {
-                    return;
-                }
-                
-                const hadIntegration = !!currentExecution;
-                const hasIntegration = !!event.shellIntegration;
-                
-                console.log('[Terminal] Shell integration changed. had:', hadIntegration, 'has:', hasIntegration, 'commandSent:', commandSent);
-
-                // Detect when shell integration is LOST (terminal refresh during command execution)
-                if (hadIntegration && !hasIntegration && commandSent) {
-                    console.log('[Terminal] Shell integration LOST during command execution (terminal refresh detected)');
-                    shellIntegrationLost = true;
-                    streamEnded = true; // Consider stream ended when integration is lost
-                    // Reset inactivity timer to wait for completion
-                    resetInactivityTimer();
-                }
-                
-                // Shell integration restored - but DON'T re-execute the command!
-                if (!hadIntegration && hasIntegration && commandSent && shellIntegrationLost) {
-                    console.log('[Terminal] Shell integration restored after refresh - waiting for completion event');
-                    // Just wait for the onDidEndTerminalShellExecution event
-                }
+            // Max execution timeout
+            const MAX_EXECUTION_TIME_MS = 30000; // 30 seconds
+            const commandTimeout = new Promise<'timeout'>(resolve => {
+                setTimeout(() => {
+                    console.warn(`[Terminal] Command hit max execution timeout (${MAX_EXECUTION_TIME_MS}ms).`);
+                    resolve('timeout');
+                }, MAX_EXECUTION_TIME_MS);
             });
-            disposables.push(integrationChangeListener);
 
-            // Main function to attach to shell integration and capture output
-            const attachToShellIntegration = async (): Promise<boolean> => {
-                if (!term.shellIntegration || resolved) {
-                    return false;
-                }
+            // 6. Manual stream iteration to prevent 'for await' hang
+            const stream = currentExecution.read();
+            const iterator = stream[Symbol.asyncIterator]();
+            console.log('[Terminal] Reading output stream manually...');
 
-                try {
-                    currentExecution = term.shellIntegration.executeCommand(command);
-                    commandSent = true;
-                    const executionCommand = (currentExecution as any)?.commandLine?.value || 'unknown';
-                    console.log('[Terminal] Executing command with shell integration:', command);
-                    console.log('[Terminal] Execution object command:', executionCommand);
-                    
-                    resetInactivityTimer();
+            while (!streamClosed) {
+                const nextChunkPromise = iterator.next(); // Promise<IteratorResult<string>>
+                
+                // Race the next chunk against the event and the timeout
+                const winner = await Promise.race([nextChunkPromise, commandFinished, commandTimeout]);
 
-                    // Read the output stream
-                    const stream = currentExecution.read();
-                    streamReadingActive = true;
-                    
-                    (async () => {
-                        try {
-                            for await (const data of stream) {
-                                if (resolved) {
-                                    break;
-                                }
-                                output += data;
-                                console.log('[Terminal] Output chunk received:', data.length, 'chars, total:', output.length);
-                                resetInactivityTimer();
-                            }
-                            console.log('[Terminal] Output stream ended normally. Total output:', output.length, 'chars');
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            
-                            // Give a tiny bit more time for any final output to arrive
-                            await new Promise(resolve => setTimeout(resolve, 100));
-                            
-                            // After stream ends, start inactivity timer
-                            // If command actually finished, onDidEndTerminalShellExecution will fire
-                            // Otherwise, inactivity timer will resolve after grace period
-                            resetInactivityTimer();
-                        } catch (error) {
-                            console.error('[Terminal] Error reading stream:', error);
-                            streamEnded = true;
-                            streamReadingActive = false;
-                            // Still reset timer to handle gracefully
-                            resetInactivityTimer();
-                        }
-                    })();
-                    
-                    return true;
-                } catch (error) {
-                    console.warn('[Terminal] Shell integration failed:', error);
-                    commandSent = false;
-                    return false;
-                }
-            };
-
-            // Try shell integration immediately if available
-            if (term.shellIntegration) {
-                if (await attachToShellIntegration()) {
-                    return; // Successfully started with shell integration
+                if (winner === 'event') {
+                    // Event fired first. Command is done.
+                    // Give a brief moment for any final stream data.
+                    console.log('[Terminal] Event fired. Waiting 200ms for final stream data.');
+                    await new Promise(r => setTimeout(r, 200)); 
+                    streamClosed = true; // Force-break the loop
+                } else if (winner === 'timeout') {
+                    // Timeout fired. Command is stuck or stream is hung.
+                    console.warn('[Terminal] Timeout fired. Breaking stream loop.');
+                    timeoutTriggered = true;
+                    streamClosed = true; // Force-break the loop
+                } else if (winner.done) {
+                    // Stream *actually* closed. This is the happy path.
+                    console.log('[Terminal] Stream closed naturally.');
+                    streamClosed = true;
+                } else {
+                    // We got data. Append it.
+                    output += winner.value;
                 }
             }
 
-            // Wait for shell integration to become available (up to 15 seconds for newly created terminals)
-            let waitAttempts = 0;
-            const maxWaitAttempts = 150; // 150 * 100ms = 15 seconds (longer wait for new terminals)
-            
-            const waitInterval = setInterval(async () => {
-                waitAttempts++;
-                
-                if (resolved) {
-                    clearInterval(waitInterval);
-                    return;
-                }
-                
-                if (term.shellIntegration && !commandSent) {
-                    clearInterval(waitInterval);
-                    console.log('[Terminal] Shell integration became available after', waitAttempts * 100, 'ms');
-                    if (await attachToShellIntegration()) {
-                        return; // Successfully started
+            // 7. We've exited the loop.
+            // Check if the event *still* hasn't fired (e.g., stream closed but event is delayed).
+            if (exitCode === undefined) {
+                console.log('[Terminal] Stream closed, waiting for event or 2s grace period...');
+                await Promise.race([commandFinished, new Promise(r => setTimeout(r, 2000))]);
+            }
+
+            // 8. Process CWD change (best effort)
+            try {
+                const currentCwd = (term.shellIntegration as any).cwd;
+                if (currentCwd) {
+                    const newDir = currentCwd.fsPath || currentCwd.toString();
+                    if (newDir && newDir !== this.workingDirectory) {
+                        console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
+                        this.workingDirectory = newDir;
                     }
                 }
-                
-                // Log progress every 2 seconds
-                if (waitAttempts % 20 === 0) {
-                    console.log(`[Terminal] Still waiting for shell integration... (${waitAttempts * 100}ms elapsed)`);
+            } catch (error) {
+                console.warn('[Terminal] Could not update CWD:', error);
+            }
+            
+            // 9. Increment counter
+            this.terminalCommandCount++;
+            console.log(`[Terminal] Command completed (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL})`);
+
+            // 10. Check results and decide on fallback
+            let cleanStdout = this.stripAnsiCodes(output);
+            let cleanStderr = '';
+
+            if (!timeoutTriggered && output.length === 0 && exitCode === undefined) {
+                // Total failure: Timed out with no stream data and no event.
+                console.error('[Terminal] Timeout with 0 output. Stream/Event failed. Retrying with fallback scrape.');
+                return await this.runFallbackCommand(term, command);
+            }
+
+            if (exitCode !== undefined && exitCode !== 0) {
+                cleanStderr = `Command exited with code ${exitCode}`;
+            } else if (exitCode === undefined) {
+                // This means we timed out, but we *have* the partial output
+                cleanStderr = `Command timed out after ${MAX_EXECUTION_TIME_MS / 1000}s. Output may be incomplete.`;
+            }
+
+            if (timeoutTriggered) {
+                console.warn('[Terminal] Timeout detected, attempting clipboard scrape for final output.');
+                const { buffer, error } = await this.scrapeTerminalBuffer(term);
+                const scrapedOutput = extractCommandOutput(buffer, command);
+                if (scrapedOutput) {
+                    cleanStdout = scrapedOutput;
                 }
-                
-                // Timeout waiting for shell integration
-                if (waitAttempts >= maxWaitAttempts) {
-                    clearInterval(waitInterval);
-                    console.error('[Terminal] Shell integration not available after 15 seconds');
-                    console.error('[Terminal] This is unusual - shell integration should be available in a properly configured terminal');
-                    
-                    // Give up and return error
-                    doResolve(
-                        `Error: Shell integration not available after 15 seconds. This terminal may not support shell integration. Please check your terminal configuration or try closing and reopening VS Code.`,
-                        'Warning: Cannot execute commands without shell integration'
-                    );
+                if (error) {
+                    cleanStderr = cleanStderr ? `${cleanStderr}\n${error}` : error;
                 }
-            }, 100);
-        });
+            }
+
+            return { stdout: cleanStdout, stderr: cleanStderr };
+
+        } else {
+            // --- FALLBACK PATH ---
+            console.warn('[Terminal] Shell integration NOT available. Using fallback (sendText + clipboard scrape).');
+            return await this.runFallbackCommand(term, command);
+        }
     }
     
     public async similar_search(query: string, limit: number = 8): Promise<object[]> {
@@ -912,7 +965,7 @@ export class AgentService {
         this.toolbox.setWorkingDirectory(directory);
     }
 
-    private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async summarizeEvictedThought(evicted: string, remainingRecent: string[], sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         // If this is the first eviction, show it directly as the previous thought summary without calling the endpoint.
         if (!this.summarizedArchive) {
             this.summarizedArchive = `[*] ${evicted}`;
@@ -931,18 +984,25 @@ export class AgentService {
         console.log(`[ThoughtSummary] Appended evicted thought. Summary length ${this.summarizedArchive.length}`);
         // If the rolling summary itself grows too large, ask for a shorter version.
         if (this.summarizedArchive.length > 10000) {
-            await this.shortenArchiveIfTooLong(sendUpdate, serverUrl);
+            await this.shortenArchiveIfTooLong(sendUpdate, serverUrl, token);
         }
     }
 
-    private async shortenArchiveIfTooLong(sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async shortenArchiveIfTooLong(sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         if (this.summarizing) { return; }
         if (!this.summarizedArchive || this.summarizedArchive.length <= 2000) { return; }
         try {
             this.summarizing = true;
             const prompt = `Shorten the following rolling summary to ~1200 characters while preserving all key decisions, constraints, unresolved items, and next actions. Use compact bullets or short paragraphs.\n\n${this.summarizedArchive}`;
             console.log('[ThoughtSummary] Shortening rolling summary (too long).');
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            const resp = await fetch(serverUrl, { 
+                method: 'POST', 
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                }, 
+                body: JSON.stringify({ query: prompt })
+            });
             if (!resp.ok) {
                 console.warn(`[ThoughtSummary] Shorten request failed status ${resp.status}`);
                 return;
@@ -960,11 +1020,18 @@ export class AgentService {
         }
     }
 
-    private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async summarizeLongThought(rawThought: string, sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         try {
             const prompt = `Summarize the following agent thought into <= 400 characters, preserving concrete next actions, file targets, and decisions. Remove repetition.\n\n${rawThought}`;
             console.log(`[Thoughts] Summarizing the thought output`);
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: prompt, user_ID: '0001' }) });
+            const resp = await fetch(serverUrl, { 
+                method: 'POST', 
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                }, 
+                body: JSON.stringify({ query: prompt })
+            });
             if (!resp.ok) {
                 console.warn(`[Thoughts] Thought summarization failed with status ${resp.status}`);
                 return;
@@ -981,7 +1048,7 @@ export class AgentService {
         }
     }
 
-    private async summarizeOriginalPrompt(prompt: string, serverUrl: string): Promise<string> {
+    private async summarizeOriginalPrompt(prompt: string, serverUrl: string, token: string): Promise<string> {
         // Define the character limit for the summary and for the fallback truncation.
         const SUMMARY_MAX_LENGTH = 50000;
         
@@ -995,7 +1062,14 @@ export class AgentService {
             const summarizationInstruction = `Summarize the following user request into a clear and concise objective for an AI agent. Focus on the primary goal, key constraints, and specific files or functions mentioned. The summary should be a direct command. Maximum ${SUMMARY_MAX_LENGTH} characters.\n\nOriginal Request:\n${prompt}`;
             
             console.log(`[AgentService] Summarizing original prompt.`);
-            const resp = await fetch(serverUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: summarizationInstruction, user_ID: '0001' }) });
+            const resp = await fetch(serverUrl, { 
+                method: 'POST', 
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                }, 
+                body: JSON.stringify({ query: summarizationInstruction })
+            });
 
             if (!resp.ok) {
                 console.warn(`[AgentService] Prompt summarization failed with status ${resp.status}. Returning truncated prompt.`);
@@ -1021,7 +1095,7 @@ export class AgentService {
     private normalizeThought(t: string): string {
         return t.replace(/\s+/g, ' ').trim();
     }
-    private async recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string) {
+    private async recordThought(thought: string | undefined, sendUpdate: (u: string)=>void, serverUrl: string, token: string) {
         if (!thought) { return; }
         const norm = this.normalizeThought(thought);
         if (!norm) { return; }
@@ -1037,14 +1111,14 @@ export class AgentService {
         const LONG_THOUGHT_THRESHOLD = 1000;
         const isLong = finalThought.length > LONG_THOUGHT_THRESHOLD;
         if (isLong) {
-            finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl);
+            finalThought = await this.summarizeLongThought(finalThought, sendUpdate, serverUrl, token);
         }
         if (this.recentThoughts.length >= this.MAX_RECENT_THOUGHTS) {
             const evicted = this.recentThoughts.shift();
             if (evicted) {
                 // Add to rolling summary (not losing content)
                 const remaining = this.recentThoughts.slice();
-                await this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl);
+                await this.summarizeEvictedThought(evicted, remaining, sendUpdate, serverUrl, token);
             }
         }
         this.recentThoughts.push(finalThought);
@@ -1061,7 +1135,13 @@ export class AgentService {
         return { recentThoughts: this.recentThoughts.slice(), summarizedArchive: this.summarizedArchive };
     }
 
-    public async processRequest(prompt: string, serverUrl: string, sendUpdate: (update: string) => void, threadId: string | null) {
+    public async processRequest(
+        prompt: string, 
+        serverUrl: string, 
+        token: string, // <-- ADDED: Accept the token
+        sendUpdate: (update: string) => void, 
+        threadId: string | null
+    ) {
         // Quiet UI: no initial debug to UI; log minimal info to console
         console.log(`[AgentService] processRequest start. WD=${this.toolbox.getWorkingDirectory() || 'Not set'} promptLen=${prompt.length}`);
         this.shouldStop = false;
@@ -1069,10 +1149,14 @@ export class AgentService {
         const maxSteps = 60;
         // Preserve the original user request for all subsequent iterations.
         let originalPrompt = prompt;
+
+        // --- Pass sendUpdate to ToolBox for streaming ---
+        this.toolbox.setSendUpdateCallback(sendUpdate);
+        // ---
         
         const PROMPT_LENGTH_THRESHOLD = 100000;
         if (originalPrompt.length > PROMPT_LENGTH_THRESHOLD) {
-            originalPrompt = await this.summarizeOriginalPrompt(originalPrompt, serverUrl);
+            originalPrompt = await this.summarizeOriginalPrompt(originalPrompt, serverUrl, token);
         }
 
         let currentInstruction = originalPrompt; // Instruction for the model (first step uses full prompt)
@@ -1088,8 +1172,16 @@ export class AgentService {
                 this.summarizedArchive = '';
             }
             console.log(`[Agent] Step ${i + 1}`);
-            const { tool, args, thought } = await this.getNextActionFromModel(currentInstruction, originalPrompt, history, sendUpdate, serverUrl, threadId);
-            await this.recordThought(thought, sendUpdate, serverUrl);
+            const { tool, args, thought } = await this.getNextActionFromModel(
+                currentInstruction, 
+                originalPrompt, 
+                history, 
+                sendUpdate, 
+                serverUrl, 
+                token, // <-- PASS: Pass token down
+                threadId
+            );
+            await this.recordThought(thought, sendUpdate, serverUrl, token); // <-- PASS: Pass token down
             if (this.shouldStop) {
                 sendUpdate("❌ Stopped by user.");
                 return;
@@ -1151,21 +1243,31 @@ export class AgentService {
     }
 
     private getToolDefinitions() {
+        // <-- Updated descriptions and added the new tool -->
         return [
-            { name: 'list_files', description: 'List files in the workspace with pagination. Returns an object with files array, total count, and hasMore flag. Use offset and limit for pagination.', args: [{ name: 'offset', type: 'number' }, { name: 'limit', type: 'number' }] },
+            { name: 'list_files', description: 'List files in the workspace. Provide an \'offset\' to get the next page of results. Default offset is 0 and increment by 1 to get the next results. Returns an object with files array, total count, and hasMore flag. Each call returns up to 10000 files.', args: [{ name: 'offset', type: 'number' }] },
             { name: 'search_files', description: 'Search for files by NAME or pattern only (does NOT search file contents).', args: [{ name: 'pattern', type: 'string' }] },
             { name: 'search_text', description: 'Search for a keyword across file CONTENTS. Returns file paths with matching line numbers and snippets.', args: [{ name: 'keyword', type: 'string' }, { name: 'maxFiles', type: 'number' }, { name: 'maxMatchesPerFile', type: 'number' }] },
-            { name: 'read_file', description: 'Read the FULL content of a file at a given relative path. CRITICAL: If a file is too long, this tool will fail and instruct you to use search_in_file or read_file_chunk instead.', args: [{ name: 'filePath', type: 'string' }] },
+            { name: 'read_file', description: 'Read the FULL content of a file at a given relative path. If the file is too long (>100000 chars), it returns an error message stating the total number of chunks. Use this first for reading file purposes.', args: [{ name: 'filePath', type: 'string' }] },
             { name: 'search_in_file', description: 'Search for a specific keyword within a single file (given relative path). This is the most efficient way to find relevant code in long files. Returns the matching lines with surrounding context.', args: [{ name: 'filePath', type: 'string' }, { name: 'keyword', type: 'string' }] },
-            { name: 'read_file_chunk', description: 'Read a large file in smaller pieces (chunks) (arg is relative file path). Use this if you need to understand the overall structure of a long file.', args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }, { name: 'chunkSize', type: 'number' }] },
-            { name: 'apply_file_change', description: 'Apply a change to a file immediately without asking user permission. Changes are applied instantly and user sees diffs with accept/reject buttons. Continue with next action immediately. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
+            { name: 'read_file_chunk', description: `Read a specific chunk of a large file. Use this if read_file indicates the file is too long and you need to browse sequentially. read_file returns the total no. of chunks for that file`, args: [{ name: 'filePath', type: 'string' }, { name: 'chunkNumber', type: 'number' }] },
+            { name: 'apply_file_change', description: 'Replaces the ENTIRE content of a file. Use this only when replacing the whole file, often after reading it fully. For smaller modifications, prefer apply_file_patch. Changes are applied instantly. Returns a status message.', args: [{ name: 'filePath', type: 'string' }, { name: 'newContent', type: 'string' }] },
+            { name: 'apply_file_patch', description: 'Applies a patch (in standard `diff` format, like `git diff`) to modify an existing file. Use this for making targeted changes without needing the full file content, especially for large files read in chunks. Provide the relative filePath and the patch content. Returns a status message or an error if the patch cannot be applied.', args: [{ name: 'filePath', type: 'string' }, { name: 'patchContent', type: 'string' }] }, // <-- New tool definition
             { name: 'run_terminal_command', description: 'Run a shell command in the workspace. Asks for user permission first. Returns stdout and stderr. IMPORTANT: When you run "cd <directory>" command, the working directory is automatically updated for ALL subsequent file operations (read_file, apply_file_change, list_files, etc.). This means after "cd my-app", file paths like "src/App.js" will resolve to "my-app/src/App.js".', args: [{ name: 'command', type: 'string' }] },
             { name: 'similar_search', description: 'Perform semantic similarity search on the indexed codebase to find relevant code snippets. Useful for understanding code patterns or finding similar implementations. Returns list of matching chunks with metadata and similarity score.', args: [{ name: 'query', type: 'string' }, { name: 'limit', type: 'number' }] },
             { name: 'finish', description: 'Finishes the task with a message.', args: [{ name: 'message', type: 'string' }] }
         ];
     }
 
-    private async getNextActionFromModel(currentInstruction: string, originalPrompt: string, history: any[], sendUpdate: (update: string) => void, serverUrl: string, threadId: string | null): Promise<{ tool: string, args: any[], thought: string }> {
+    private async getNextActionFromModel(
+        currentInstruction: string, 
+        originalPrompt: string, 
+        history: any[], 
+        sendUpdate: (update: string) => void, 
+        serverUrl: string, 
+        token: string,
+        threadId: string | null
+    ): Promise<{ tool: string, args: any[], thought: string }> {
     console.log("[AgentService] Asking the model for the next step...");
     console.log(`[AgentService] Making request to: ${serverUrl}`);
 
@@ -1174,7 +1276,7 @@ export class AgentService {
 
         // Include current working directory information
         const workingDirInfo = this.toolbox.getWorkingDirectory() 
-            ? `\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations will use paths relative to this directory\n`
+            ? `\nCURRENT WORKING DIRECTORY: ${this.toolbox.getWorkingDirectory()}\n- All file paths (read_file, apply_file_change, apply_file_patch, list_files, etc.) are relative to this directory\n- When you run 'cd' command, this directory updates automatically\n- File operations, terminal commands will use paths relative to this directory\n`
             : '';
 
         const systemPrompt = `You are an expert AI programmer agent.
@@ -1182,24 +1284,29 @@ Your goal is to complete the user's ORIGINAL request.
 ${workingDirInfo}
 CRITICAL INSTRUCTIONS:
 1. You operate autonomously - make file changes immediately without asking permission
-2. apply_file_change tool applies changes instantly to files
-3. Users see diffs with accept/reject buttons after you make changes
+2. Use 'apply_file_change' to replace the ENTIRE file content. Use 'apply_file_patch' to apply a small modification using a diff patch.
+3. Changes are applied instantly and user sees diffs with accept/reject buttons
 4. NEVER ask "Should I..." or "Would you like me to..." - just do it
-5. Complete the entire task by making all necessary changes
-6. When task is finished always test before calling 'finish' tool
-7. Only use 'finish' when the task is completely done
+5. Complete the entire task by making all necessary changes. 
+7. When task is finished always test before calling 'finish' tool
+8. Only use 'finish' when the task is completely done
 
 IMPORTANT: Use tools efficiently to explore codebase:
 - search_files(pattern) to find specific files by name/pattern (e.g., "separable" finds separable.py)
-- list_files(offset, limit) for paginated browsing when exploring structure 
-- To list more files, you MUST increment the 'offset' parameter in 'list_files'. DO NOT just increase the 'limit'.
-- list_files(0, 100) gets first 100 files, list_files(100, 100) gets next 100
+- list_files(offset) for paginated browsing when exploring structure. start with 0 and only increment one by one if has_more is true
+- To list more files, you MUST increment the 'offset' parameter in 'list_files'
+- list_files(0) gets first 10000 files, list_files(1) gets next 10000
 - The response includes hasMore flag to indicate if there are more files
 
 CRITICAL WORKFLOW FOR READING FILES:
-1. Your first step when reading a file should ALWAYS be the 'read_file' tool.
-2. If 'read_file' returns a "File is too long" error, your immediate next step MUST be to use the 'search_in_file' tool with a relevant keyword from the problem description. Do NOT use 'read_file_chunk' unless you have a specific reason to read from the beginning.
-3. Only use 'read_file_chunk' if you need to browse the file from the start or 'search_in_file' does not yield results.
+1. Your first step to read a file MUST be the 'read_file' tool.
+2. If 'read_file' returns an error like "File ... is too long ... It has been divided into X chunks", the file is too large to read at once.
+3. If the file is too long, your NEXT step should usually be 'search_in_file' with a relevant keyword to find specific information.
+4. Only use 'read_file_chunk(filePath, chunkNumber)' if you need to browse the file sequentially (e.g., starting with chunkNumber 1) after 'read_file' failed due to size. The error message from 'read_file' will tell you the total number of chunks available.
+
+CRITICAL WORKFLOW FOR MODIFYING FILES:
+1. For small files you read completely with 'read_file', modify the content in your thought process, and use 'apply_file_change' with the FULL NEW content.
+2. For large files (where 'read_file' failed or you only read chunks/searched), identify the specific lines to change. Generate a patch in the standard 'diff' format (like 'git diff'). Use the 'apply_file_patch' tool with the filePath and the patch content.
 
 CRITICAL INSTRUCTIONS FOR TESTING THE APPLICATION:
 1. Consider the language or framework you are dealing with when testing
@@ -1215,12 +1322,49 @@ ${JSON.stringify(this.getToolDefinitions())}
 Respond with a single JSON object with two keys: "thought" and "tool_call".
 "thought" should be a string explaining your reasoning for the chosen action.
 "tool_call" should be an object with two keys: "name" and "args".
-Example response:
+
+Example 1 (single argument tool):
 {
     "thought": "I need to see the files in the workspace to understand the project structure.",
     "tool_call": {
         "name": "list_files",
-        "args": {"offset": 0, "limit": 100}
+        "args": {"offset": 0}
+    }
+}
+
+Example 2 (multi-argument tool):
+{
+    "thought": "The file 'folder/example.py' was too long to read fully. I need to search inside it for the 'header_rows' keyword to find where it's handled.",
+    "tool_call": {
+        "name": "search_in_file",
+        "args": {
+            "filePath": "folder/example.py",
+            "keyword": "header_rows"
+        }
+    }
+}
+
+Example 3 (replace whole file):
+{
+    "thought": "I read the small configuration file config.json. I need to update the 'port' setting to 8080.",
+    "tool_call": {
+        "name": "apply_file_change",
+        "args": {
+            "filePath": "config.json",
+            "newContent": "{\n  \"port\": 8080,\n  \"host\": \"localhost\"\n}"
+        }
+    }
+}
+
+Example 4 (apply patch to large file):
+{
+    "thought": "I searched in the large file 'main.py' and found the function 'process_data' on line 500. I need to add a logging statement inside it. I will generate a diff patch and apply it.",
+    "tool_call": {
+        "name": "apply_file_patch",
+        "args": {
+            "filePath": "main.py",
+            "patchContent": "--- a/main.py\n+++ b/main.py\n@@ -501,6 +501,7 @@\n def process_data(data):\n   # existing code\n   result = data * 2\n+  print(f\"Processing data: {data}\") # Added logging\n   return result"
+        }
     }
 }`;
 
@@ -1288,16 +1432,16 @@ ${JSON.stringify(truncatedHistory)}
             this.currentAbortController = new AbortController();
             
             console.log(`[AgentService] Making fetch request to: ${serverUrl}`);
-            console.log(`[AgentService] Request payload length: ${JSON.stringify({ query: fullPrompt, user_ID: "0001", thread_id: threadId }).length} characters`);
+            console.log(`[AgentService] Request payload length: ${JSON.stringify({ query: fullPrompt, thread_id: threadId }).length} characters`);
             
             const response = await fetch(serverUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
                 },
                 body: JSON.stringify({ 
                     query: fullPrompt,
-                    user_ID: "0001",
                     thread_id: threadId
                 }),
                 signal: this.currentAbortController.signal
@@ -1308,6 +1452,13 @@ ${JSON.stringify(truncatedHistory)}
             if (!response.ok) {
                 const errorText = await response.text();
                 console.error(`[AgentService] Server error: ${response.status} - ${errorText}`);
+                if (response.status === 401) {
+                     return {
+                        thought: `Authentication failed. The user's token may be invalid.`,
+                        tool: 'finish',
+                        args: [`Authentication error: ${errorText}`]
+                    };
+                }
                 return {
                     thought: `The model API call failed with status ${response.status}.`,
                     tool: 'finish',
@@ -1320,6 +1471,16 @@ ${JSON.stringify(truncatedHistory)}
 
             // Check if server returned an error
             if (jsonResponse.error) {
+                // Check for the specific MAX_TOKENS error
+                 const errorMessage = jsonResponse.error || '';
+                 if (errorMessage.includes("finish_reason") && errorMessage.includes("2")) {
+                     console.warn(`[AgentService] Model response truncated due to MAX_TOKENS.`);
+                     return {
+                         thought: "The previous response was cut short because it was too long. I need to be more concise or take smaller steps.",
+                         tool: 'retry_with_valid_json', // Or potentially 'finish' if it happens too often
+                         args: [`Model output truncated (MAX_TOKENS). Error: ${errorMessage}`]
+                     };
+                 }
                 console.warn(`Server returned error: ${jsonResponse.error}`);
                 return {
                     thought: "Server returned an error.",
@@ -1428,15 +1589,15 @@ ${JSON.stringify(truncatedHistory)}
                 if (toolDef && toolDef.args) {
                     args = toolDef.args.map((argDef: any) => {
                         const value = args[argDef.name];
-                        // Handle optional parameters with defaults
-                        if (value === undefined) {
-                            if (argDef.name === 'offset') {
-                                return 0;
-                            }
-                            if (argDef.name === 'limit') {
-                                return 100;
-                            }
+                        // Handle optional offset default for list_files
+                        if (value === undefined && argDef.name === 'offset') {
+                            return 0;
                         }
+                        // Handle optional chunkNumber default for read_file_chunk
+                        if (value === undefined && argDef.name === 'chunkNumber') {
+                            return 1;
+                        }
+                        // Handle other potential defaults if needed
                         return value;
                     });
                     console.log(`Converted object args to array: ${JSON.stringify(args)}`);
@@ -1509,8 +1670,7 @@ ${JSON.stringify(truncatedHistory)}
             }
             case 'list_files': {
                 const off = argMap.offset ?? args[0];
-                const lim = argMap.limit ?? args[1];
-                return { startMsg: `Listing files (offset ${off}, limit ${lim})`, doneMsg: `Listed files` };
+                return { startMsg: `Listing files (offset ${off})`, doneMsg: `Listed files` };
             }
             case 'search_text': {
                 const k = argMap.keyword ?? args[0];
@@ -1525,8 +1685,12 @@ ${JSON.stringify(truncatedHistory)}
                 const fp = argMap.filePath ?? args[0];
                 return { startMsg: `Applying change to ${fp}`, doneMsg: `Applied change to ${fp}` };
             }
+             case 'apply_file_patch': {
+                const fp = argMap.filePath ?? args[0];
+                return { startMsg: `Applying patch to ${fp}`, doneMsg: `Applied patch to ${fp}` };
+            }
             case 'run_terminal_command': {
-                const cmd = args[0];
+                const cmd = argMap.command ?? args[0];
                 return { startMsg: `Running command: ${truncate(cmd)}`, doneMsg: `Ran command` };
             }
             case 'similar_search': {

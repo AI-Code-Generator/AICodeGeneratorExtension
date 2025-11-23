@@ -6,9 +6,14 @@ import { indexWorkspaceFiles, indexSingleFile, deleteSingleFile } from './servic
 import { ASTManager } from './service/ASTManager';
 import { DiffManager } from './service/DiffManager';
 import { DiffCodeLensProvider } from './service/DiffCodeLensProvider';
+import { AuthManager } from './service/AuthService'; // Import AuthManager
 
 export function activate(context: vscode.ExtensionContext) {
-    const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl, context);
+    // Initialize AuthManager
+    const authManager = AuthManager.getInstance(context);
+
+    // Pass AuthManager to ChatViewProvider
+    const chatViewProvider = new ChatViewProvider(context.extensionUri, config.serverUrl, context, authManager);
     
     let output = vscode.window.createOutputChannel("AI code assist");
 
@@ -140,9 +145,17 @@ export function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('ai-code-assist.openChat', () => {
 		vscode.commands.executeCommand('aiCodeAssist.chatView.focus');
     });
+
+    // Register logout command
+    let logoutDisposable = vscode.commands.registerCommand('aiCodeAssist.logout', async () => {
+        await authManager.clearToken();
+        chatViewProvider.logout(); // Notify the webview
+        vscode.window.showInformationMessage('You have been logged out.');
+    });
 	
 	context.subscriptions.push(toggleSuggestions);
     context.subscriptions.push(disposable);
+    context.subscriptions.push(logoutDisposable); // Add logout command
 }
 
 export function deactivate() {
