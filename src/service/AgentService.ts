@@ -869,12 +869,26 @@ class ToolBox {
 
             // 8. Process CWD change (best effort)
             try {
-                const currentCwd = (term.shellIntegration as any).cwd;
-                if (currentCwd) {
-                    const newDir = currentCwd.fsPath || currentCwd.toString();
-                    if (newDir && newDir !== this.workingDirectory) {
-                        console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
-                        this.workingDirectory = newDir;
+                const initialCwd = this.workingDirectory;
+                const maxRetries = 5; // Poll for ~1 second max (5 * 200ms)
+                const retryInterval = 200;
+
+                for (let i = 0; i < maxRetries; i++) {
+                    const currentCwdUri = (term.shellIntegration as any).cwd;
+                    if (currentCwdUri) {
+                        const newDir = currentCwdUri.fsPath || currentCwdUri.toString();
+                        
+                        // If the directory is different from what we had, it changed!
+                        if (newDir && newDir !== initialCwd) {
+                            console.log(`[Terminal] Directory changed from ${initialCwd} to ${newDir} (detected on attempt ${i + 1})`);
+                            this.workingDirectory = newDir;
+                            break; // Stop polling, we found the change
+                        }
+                    }
+
+                    // Wait before next check to give VS Code time to update
+                    if (i < maxRetries - 1) {
+                        await new Promise(r => setTimeout(r, retryInterval));
                     }
                 }
             } catch (error) {
