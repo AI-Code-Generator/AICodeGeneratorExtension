@@ -652,8 +652,11 @@ class ToolBox {
         return text
             // Remove ANSI escape sequences (colors, cursor movement, etc.)
             .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-            // Remove other escape sequences
-            .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
+            // Remove OSC escape sequences (e.g., window title, or VS Code shell integration ]633;...)
+            // Fixed: [0-9] -> [0-9]* to match multi-digit codes like 633
+            .replace(/\x1b\][0-9]*;[^\x07]*\x07/g, '')
+            // Remove Braille patterns commonly used for loading spinners (⠙⠹⠸...)
+            .replace(/[\u2800-\u28FF]/g, '')
             // Remove control characters except newline, carriage return, and tab
             .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
             // Clean up excessive whitespace while preserving structure
