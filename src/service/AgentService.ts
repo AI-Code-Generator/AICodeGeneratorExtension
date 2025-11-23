@@ -652,8 +652,11 @@ class ToolBox {
         return text
             // Remove ANSI escape sequences (colors, cursor movement, etc.)
             .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-            // Remove other escape sequences
-            .replace(/\x1b\][0-9];[^\x07]*\x07/g, '')
+            // Remove OSC escape sequences (e.g., window title, or VS Code shell integration ]633;...)
+            // Fixed: [0-9] -> [0-9]* to match multi-digit codes like 633
+            .replace(/\x1b\][0-9]*;[^\x07]*\x07/g, '')
+            // Remove Braille patterns commonly used for loading spinners (⠙⠹⠸...)
+            .replace(/[\u2800-\u28FF]/g, '')
             // Remove control characters except newline, carriage return, and tab
             .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
             // Clean up excessive whitespace while preserving structure
@@ -798,44 +801,65 @@ class ToolBox {
                 });
             });
 
-            // Max execution timeout
-            const MAX_EXECUTION_TIME_MS = 30000; // 30 seconds
-            const commandTimeout = new Promise<'timeout'>(resolve => {
-                setTimeout(() => {
-                    console.warn(`[Terminal] Command hit max execution timeout (${MAX_EXECUTION_TIME_MS}ms).`);
-                    resolve('timeout');
-                }, MAX_EXECUTION_TIME_MS);
-            });
-
-            // 6. Manual stream iteration to prevent 'for await' hang
+            // 6. Modified Loop: Use Inactivity Timeout instead of Total Timeout
             const stream = currentExecution.read();
             const iterator = stream[Symbol.asyncIterator]();
             console.log('[Terminal] Reading output stream manually...');
 
+            // Configuration for timeouts
+            const IDLE_TIMEOUT_MS = 15000; // 15 seconds of no output triggers timeout
+            const ABSOLUTE_TIMEOUT_MS = 600000; // 10 minutes max absolute limit (failsafe)
+            const startTime = Date.now();
+
             while (!streamClosed) {
+                // Failsafe: Check absolute time limit
+                if (Date.now() - startTime > ABSOLUTE_TIMEOUT_MS) {
+                    console.warn(`[Terminal] Command hit absolute max timeout (${ABSOLUTE_TIMEOUT_MS}ms).`);
+                    timeoutTriggered = true;
+                    streamClosed = true;
+                    break;
+                }
+
+                // Create a cancellable idle timeout for this specific iteration
+                let idleTimer: NodeJS.Timeout;
+                const idlePromise = new Promise<'timeout'>((resolve) => {
+                    idleTimer = setTimeout(() => {
+                        console.warn(`[Terminal] Inactivity timeout: No data for ${IDLE_TIMEOUT_MS}ms.`);
+                        resolve('timeout');
+                    }, IDLE_TIMEOUT_MS);
+                });
+
                 const nextChunkPromise = iterator.next(); // Promise<IteratorResult<string>>
                 
-                // Race the next chunk against the event and the timeout
-                const winner = await Promise.race([nextChunkPromise, commandFinished, commandTimeout]);
+                // Race: Data chunk vs Finished Event vs Idle Timeout
+                const winner = await Promise.race([nextChunkPromise, commandFinished, idlePromise]);
+
+                // Clear the idle timer immediately regardless of who won
+                clearTimeout(idleTimer!);
 
                 if (winner === 'event') {
                     // Event fired first. Command is done.
-                    // Give a brief moment for any final stream data.
                     console.log('[Terminal] Event fired. Waiting 200ms for final stream data.');
                     await new Promise(r => setTimeout(r, 200)); 
-                    streamClosed = true; // Force-break the loop
+                    streamClosed = true;
                 } else if (winner === 'timeout') {
-                    // Timeout fired. Command is stuck or stream is hung.
-                    console.warn('[Terminal] Timeout fired. Breaking stream loop.');
+                    // Idle timeout fired.
+                    console.warn('[Terminal] Idle Timeout fired. Breaking stream loop.');
                     timeoutTriggered = true;
-                    streamClosed = true; // Force-break the loop
+                    streamClosed = true;
                 } else if (winner.done) {
-                    // Stream *actually* closed. This is the happy path.
+                    // Stream closed naturally (iterator finished).
                     console.log('[Terminal] Stream closed naturally.');
                     streamClosed = true;
                 } else {
-                    // We got data. Append it.
+                    // We got data (winner is the chunk). 
+                    // Loop continues, which creates a FRESH idle timer for the next chunk.
                     output += winner.value;
+                    
+                    // Optional: Send live updates to UI if needed
+                    if (this.sendUpdateCallback) {
+                        // this.sendUpdateCallback(winner.value);
+                    }
                 }
             }
 
@@ -848,12 +872,26 @@ class ToolBox {
 
             // 8. Process CWD change (best effort)
             try {
-                const currentCwd = (term.shellIntegration as any).cwd;
-                if (currentCwd) {
-                    const newDir = currentCwd.fsPath || currentCwd.toString();
-                    if (newDir && newDir !== this.workingDirectory) {
-                        console.log('[Terminal] Directory changed from', this.workingDirectory, 'to', newDir);
-                        this.workingDirectory = newDir;
+                const initialCwd = this.workingDirectory;
+                const maxRetries = 5; // Poll for ~1 second max (5 * 200ms)
+                const retryInterval = 200;
+
+                for (let i = 0; i < maxRetries; i++) {
+                    const currentCwdUri = (term.shellIntegration as any).cwd;
+                    if (currentCwdUri) {
+                        const newDir = currentCwdUri.fsPath || currentCwdUri.toString();
+                        
+                        // If the directory is different from what we had, it changed!
+                        if (newDir && newDir !== initialCwd) {
+                            console.log(`[Terminal] Directory changed from ${initialCwd} to ${newDir} (detected on attempt ${i + 1})`);
+                            this.workingDirectory = newDir;
+                            break; // Stop polling, we found the change
+                        }
+                    }
+
+                    // Wait before next check to give VS Code time to update
+                    if (i < maxRetries - 1) {
+                        await new Promise(r => setTimeout(r, retryInterval));
                     }
                 }
             } catch (error) {
@@ -869,16 +907,17 @@ class ToolBox {
             let cleanStderr = '';
 
             if (!timeoutTriggered && output.length === 0 && exitCode === undefined) {
-                // Total failure: Timed out with no stream data and no event.
-                console.error('[Terminal] Timeout with 0 output. Stream/Event failed. Retrying with fallback scrape.');
+                // Total failure: Timed out/Ended with no stream data and no event.
+                console.error('[Terminal] Stream failure (0 output, no exit code). Retrying with fallback scrape.');
                 return await this.runFallbackCommand(term, command);
             }
 
             if (exitCode !== undefined && exitCode !== 0) {
                 cleanStderr = `Command exited with code ${exitCode}`;
             } else if (exitCode === undefined) {
-                // This means we timed out, but we *have* the partial output
-                cleanStderr = `Command timed out after ${MAX_EXECUTION_TIME_MS / 1000}s. Output may be incomplete.`;
+                // This means we timed out (idle or absolute), but we *have* the partial output
+                const cause = timeoutTriggered ? "inactivity" : "unknown";
+                cleanStderr = `Command stopped due to ${cause} timeout. Output may be incomplete.`;
             }
 
             if (timeoutTriggered) {
