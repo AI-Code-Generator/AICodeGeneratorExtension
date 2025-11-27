@@ -1338,11 +1338,12 @@ export class AgentService {
 Your goal is to complete the user's ORIGINAL request.
 ${workingDirInfo}
 CRITICAL INSTRUCTIONS:
-1. You operate autonomously - make file changes immediately without asking permission
-2. Use 'apply_file_change' to replace the ENTIRE file content. Use 'apply_file_patch' to apply a small modification using a diff patch.
-3. Changes are applied instantly and user sees diffs with accept/reject buttons
-4. NEVER ask "Should I..." or "Would you like me to..." - just do it
-5. Complete the entire task by making all necessary changes. 
+1. You must start by using 'list_files' tool to get an idea about the codebase
+2. You operate autonomously - make file changes immediately without asking permission
+3. Use 'apply_file_change' to replace the ENTIRE file content. Use 'apply_file_patch' to apply a small modification using a diff patch.
+4. Changes are applied instantly and user sees diffs with accept/reject buttons
+5. NEVER ask "Should I..." or "Would you like me to..." - just do it
+6. Complete the entire task by making all necessary changes 
 7. When task is finished always test before calling 'finish' tool
 8. Only use 'finish' when the task is completely done
 
