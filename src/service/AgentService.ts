@@ -1747,7 +1747,7 @@ ${JSON.stringify(truncatedHistory)}
             }
             case 'run_terminal_command': {
                 const cmd = argMap.command ?? args[0];
-                return { startMsg: `Running command: ${truncate(cmd)}`, doneMsg: `Ran command` };
+                return { startMsg: `Running command: ${truncate(cmd)}`, doneMsg: `Ran command: ${truncate(cmd)}` };
             }
             case 'similar_search': {
                 const q = argMap.query ?? args[0];

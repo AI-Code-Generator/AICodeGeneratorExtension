@@ -426,6 +426,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 
                 this.agentResponse = '';
                 let isFirstUpdate = true;
+                let lastStatusLine: string | null = null; // Track the last "waiting" status line
                 
                 // AgentService.processRequest now needs the auth token
                 this.agentService.processRequest(
@@ -433,7 +434,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     agentUrl, 
                     token, // Pass auth token
                     (update) => {
-                        this.agentResponse += update + '\n';
+                        // Check if this is a completion update (✅ or ❌) that should replace a waiting update (⏳)
+                        const isWaitingUpdate = update.startsWith('⏳');
+                        const isCompletionUpdate = update.startsWith('✅') || update.startsWith('❌');
+                        
+                        if (isWaitingUpdate) {
+                            // Store this as the last status line (will be replaced when done)
+                            lastStatusLine = update;
+                            this.agentResponse += update + '\n';
+                        } else if (isCompletionUpdate && lastStatusLine) {
+                            // Replace the last waiting line with this completion line
+                            const lines = this.agentResponse.trimEnd().split('\n');
+                            // Find and replace the last occurrence of the waiting line
+                            for (let i = lines.length - 1; i >= 0; i--) {
+                                if (lines[i] === lastStatusLine) {
+                                    lines[i] = update;
+                                    break;
+                                }
+                            }
+                            this.agentResponse = lines.join('\n') + '\n';
+                            lastStatusLine = null;
+                        } else {
+                            // Regular update, just append
+                            this.agentResponse += update + '\n';
+                            lastStatusLine = null;
+                        }
                         
                         if (isFirstUpdate) {
                             // Create the initial assistant message bubble
@@ -1070,6 +1095,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             padding: 10px;
             margin-bottom: 140px; /* Increased margin for bulk actions + input */
             box-sizing: border-box;
+        }
+        /* Animated spinner for waiting status */
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .spinner {
+            display: inline-block;
+            animation: spin 1s linear infinite;
         }
         .loading {
             display: none;
@@ -1995,6 +2029,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Process inline markdown (bold, italic, code)
         function processInlineMarkdown(text) {
             return text
+                // Replace ⏳ with animated spinning version of the same emoji
+                .replace(/⏳/g, '<span class="spinner">⏳</span>')
                 // Bold (** or __)
                 .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/__(.*?)__/g, '<strong>$1</strong>')
