@@ -1,6 +1,6 @@
 // src/service/AgentService.ts
 import * as vscode from 'vscode';
-import { promises as fs } from 'fs';
+import { promises as fs, existsSync } from 'fs';
 import * as path from 'path';
 import { DiffManager } from './DiffManager';
 import { state, initializeEmbedder, embedQuery } from './FileIndexer';
@@ -50,7 +50,23 @@ class ToolBox {
     }
 
     private ensureTerminal(): vscode.Terminal {
-        const cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        let cwd = this.workingDirectory || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        
+        // Validate that the cwd exists; if not, fall back to workspace root or undefined
+        if (cwd && !existsSync(cwd)) {
+            console.warn(`[Terminal] Working directory "${cwd}" does not exist. Falling back to workspace root.`);
+            cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            
+            // If workspace root also doesn't exist, let the terminal use its default (usually $HOME)
+            if (cwd && !existsSync(cwd)) {
+                console.warn(`[Terminal] Workspace root "${cwd}" also does not exist. Using system default.`);
+                cwd = undefined;
+            }
+            
+            // Update the internal working directory to match the fallback
+            this.workingDirectory = cwd || '';
+            console.log(`[Terminal] Updated working directory to: ${this.workingDirectory || '(empty - will use workspace root)'}`);
+        }
         
         // Check if we should refresh the terminal (too many commands executed)
         const shouldRefresh = this.terminalCommandCount >= this.MAX_COMMANDS_PER_TERMINAL;
@@ -69,7 +85,7 @@ class ToolBox {
             this.terminal = vscode.window.createTerminal({ name: 'AI Code Assist Agent', cwd });
             // Show terminal immediately to initialize shell integration faster
             this.terminal.show(false);
-            console.log('[Terminal] Created new terminal, waiting for shell integration to initialize...');
+            console.log(`[Terminal] Created new terminal with cwd: ${cwd || '(system default)'}`);
         } else {
             // Reusing existing terminal
             console.log(`[Terminal] Reusing existing terminal (${this.terminalCommandCount}/${this.MAX_COMMANDS_PER_TERMINAL} commands)`);
