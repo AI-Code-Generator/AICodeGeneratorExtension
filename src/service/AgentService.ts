@@ -1338,7 +1338,7 @@ export class AgentService {
 Your goal is to complete the user's ORIGINAL request.
 ${workingDirInfo}
 CRITICAL INSTRUCTIONS:
-1. You must start by using 'list_files' tool to get an idea about the codebase
+1. You must start by using the 'list_files' tool to get an idea about the codebase (use 'list_files' even though it was used in conversation history and not used in the current session)
 2. You operate autonomously - make file changes immediately without asking permission
 3. Use 'apply_file_change' to replace the ENTIRE file content. Use 'apply_file_patch' to apply a small modification using a diff patch.
 4. Changes are applied instantly and user sees diffs with accept/reject buttons

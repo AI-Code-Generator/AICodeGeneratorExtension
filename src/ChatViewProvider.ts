@@ -809,10 +809,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         // Active thread exists, send its content
+        // Strip thought process from messages for display (it's saved for server context but not shown in UI)
         const history = this.currentThread.messages.map(msg => ({
             id: msg.id,
             type: msg.type,
-            message: msg.content
+            message: msg.type === 'assistant' ? this.stripThoughtProcess(msg.content) : msg.content
         }));
 
         this._view?.webview.postMessage({
@@ -820,6 +821,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             history: history,
             threadTitle: this.currentThread.title || 'Conversation'
         });
+    }
+
+    /**
+     * Strips the "Agent's Thought Process" section from a message for UI display.
+     * The thought process is saved to the database for context but hidden from the user.
+     */
+    private stripThoughtProcess(content: string): string {
+        // Find and remove the thought process section (starts with "---\n### Agent's Thought Process")
+        const thoughtProcessMarker = /\n*---\n### Agent's Thought Process[\s\S]*$/;
+        return content.replace(thoughtProcessMarker, '').trim();
     }
 
     private async sendThreadListToWebview() {
