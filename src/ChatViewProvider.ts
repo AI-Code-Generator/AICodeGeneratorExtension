@@ -334,6 +334,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
             if (data.type === 'deleteMessage') {
                 if (this.currentThread) {
+                    // Refresh the thread to ensure we have the latest messages
+                    // This is important when deleting right after stopping an agent
+                    this.currentThread = await this.threadManager.getThread(this.currentThread.id);
+                    if (!this.currentThread) {
+                        return;
+                    }
+                    
                     const messageId = data.id;
                     const messages = this.currentThread.messages || [];
                     const messageIndex = messages.findIndex(m => m.id === messageId);
@@ -514,9 +521,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         finalResponse += historyMarkdown;
                     }
                 
-                    // Save final agent response (with thoughts) to thread
+                    // Save final agent response (with thoughts) to thread - always save if there's any response
+                    // This ensures the assistant message gets an ID for deletion purposes
                     if (finalResponse) {
-                        await this.addMessageToCurrentThread('assistant', finalResponse);
+                        const assistantMsgId = await this.addMessageToCurrentThread('assistant', finalResponse);
+                        // Update the assistant message in the DOM with its ID so it can be deleted later
+                        this._view?.webview.postMessage({
+                            type: 'setLastAssistantMessageId',
+                            id: assistantMsgId
+                        });
+                    } else if (!isFirstUpdate) {
+                        // If there's no finalResponse but an assistant message bubble was created (isFirstUpdate became false),
+                        // we still need to set an ID on it. Save an empty/placeholder message.
+                        const assistantMsgId = await this.addMessageToCurrentThread('assistant', '(No response)');
+                        this._view?.webview.postMessage({
+                            type: 'setLastAssistantMessageId',
+                            id: assistantMsgId
+                        });
                     }
                     
                     this.isProcessing = false;
@@ -2428,6 +2449,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'clearMessages':
                     // Clear all messages from the chat
                     chatMessages.innerHTML = '';
+                    break;
+                case 'setLastAssistantMessageId':
+                    // Set the data-id on the last assistant message so it can be deleted later
+                    const lastAssistantMsg = chatMessages.querySelector('.message.assistant:last-of-type');
+                    if (lastAssistantMsg && message.id) {
+                        lastAssistantMsg.dataset.id = message.id;
+                    }
                     break;
                 case 'messageDeleted':
                     if (message.ids && Array.isArray(message.ids)) {
