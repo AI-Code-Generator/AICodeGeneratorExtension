@@ -1062,6 +1062,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .mode-buttons {
             display: flex;
             gap: 10px;
+            position: relative;
+        }
+        .active-indicator {
+            position: absolute;
+            background: var(--vscode-button-background);
+            border-radius: var(--radius-sm);
+            z-index: 1;
+            height: 100%;
+            top: 0;
+            left: 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            pointer-events: none;
         }
         .clear-button, .logout-button {
             padding: 6px 12px;
@@ -1093,15 +1105,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             font-size: 12px;
             font-weight: 500;
-            transition: all 0.2s;
+            transition: color 0.2s;
+            position: relative;
+            z-index: 2;
         }
         .mode-button:hover {
             color: var(--vscode-foreground);
         }
         .mode-button.active {
-            background: var(--vscode-button-background);
+            background: transparent;
             color: var(--vscode-button-foreground);
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: none;
         }
         
         .message { 
@@ -1778,6 +1792,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <div class="chat-header-title" id="chatHeaderTitle">Conversation</div>
             <div class="mode-selector">
                 <div class="mode-buttons">
+                    <div class="active-indicator"></div>
                     <button id="askButton" class="mode-button active" title="Ask Mode">
                         <span class="icon icon-ask"></span>
                         <span>Ask</span>
@@ -1855,6 +1870,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const chatHeaderTitle = document.getElementById('chatHeaderTitle');
         const logoutButtonHistory = document.getElementById('logoutButtonHistory');
         const logoutButtonChat = document.getElementById('logoutButtonChat');
+        const activeIndicator = document.querySelector('.active-indicator');
         
         let currentMode = 'ask';
         let isProcessing = false;
@@ -1910,6 +1926,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             loginView.classList.remove('active');
             threadHistoryView.classList.remove('active');
             chatView.classList.add('active');
+            
+            // Initialize indicator position when chat view becomes visible
+            const activeBtn = currentMode === 'ask' ? askButton : agentButton;
+            // Use setTimeout to ensure layout is computed
+            setTimeout(() => updateActiveIndicator(activeBtn), 0);
+        }
+        
+        function updateActiveIndicator(targetButton) {
+            if (!targetButton || !activeIndicator) return;
+
+            const targetLeft = targetButton.offsetLeft;
+            const targetWidth = targetButton.offsetWidth;
+            const currentLeft = activeIndicator.offsetLeft;
+            const currentWidth = activeIndicator.offsetWidth;
+
+            // If it's the first run (no width/hidden), just set it without animation
+            if (currentWidth === 0 || activeIndicator.style.width === '') {
+                activeIndicator.style.left = \`\${targetLeft}px\`;
+                activeIndicator.style.width = \`\${targetWidth}px\`;
+                return;
+            }
+
+            // Animate
+            const keyframes = [
+                { left: \`\${currentLeft}px\`, width: \`\${currentWidth}px\`, transform: 'scale(1)' },
+                { left: \`\${(currentLeft + targetLeft) / 2}px\`, width: \`\${(currentWidth + targetWidth) / 2}px\`, transform: 'scale(0.9)' },
+                { left: \`\${targetLeft}px\`, width: \`\${targetWidth}px\`, transform: 'scale(1)' }
+            ];
+
+            const options = {
+                duration: 300,
+                easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                fill: 'forwards'
+            };
+
+            const animation = activeIndicator.animate(keyframes, options);
+            animation.onfinish = () => {
+                activeIndicator.style.left = \`\${targetLeft}px\`;
+                activeIndicator.style.width = \`\${targetWidth}px\`;
+                activeIndicator.style.transform = '';
+            };
         }
 
         // Thread List Management
@@ -2456,11 +2513,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     if (currentMode === 'ask') {
                         askButton.classList.add('active');
                         agentButton.classList.remove('active');
+                        updateActiveIndicator(askButton);
                         bulkActions.classList.remove('show');
                         bulkActions.style.display = 'none';
                     } else {
                         agentButton.classList.add('active');
                         askButton.classList.remove('active');
+                        updateActiveIndicator(agentButton);
                     }
                     break;
                 case 'showBulkActions':
