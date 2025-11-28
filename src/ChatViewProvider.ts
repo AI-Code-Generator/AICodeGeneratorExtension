@@ -334,6 +334,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
             if (data.type === 'deleteMessage') {
                 if (this.currentThread) {
+                    // Refresh the thread to ensure we have the latest messages
+                    // This is important when deleting right after stopping an agent
+                    this.currentThread = await this.threadManager.getThread(this.currentThread.id);
+                    if (!this.currentThread) {
+                        return;
+                    }
+                    
                     const messageId = data.id;
                     const messages = this.currentThread.messages || [];
                     const messageIndex = messages.findIndex(m => m.id === messageId);
@@ -426,6 +433,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 
                 this.agentResponse = '';
                 let isFirstUpdate = true;
+                let lastStatusLine: string | null = null; // Track the last "waiting" status line
                 
                 // AgentService.processRequest now needs the auth token
                 this.agentService.processRequest(
@@ -433,7 +441,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     agentUrl, 
                     token, // Pass auth token
                     (update) => {
-                        this.agentResponse += update + '\n';
+                        // Check if this is a completion update (✅ or ❌) that should replace a waiting update (⏳)
+                        const isWaitingUpdate = update.startsWith('⏳');
+                        const isCompletionUpdate = update.startsWith('✅') || update.startsWith('❌');
+                        
+                        if (isWaitingUpdate) {
+                            // Store this as the last status line (will be replaced when done)
+                            lastStatusLine = update;
+                            this.agentResponse += update + '\n';
+                        } else if (isCompletionUpdate && lastStatusLine) {
+                            // Replace the last waiting line with this completion line
+                            const lines = this.agentResponse.trimEnd().split('\n');
+                            // Find and replace the last occurrence of the waiting line
+                            for (let i = lines.length - 1; i >= 0; i--) {
+                                if (lines[i] === lastStatusLine) {
+                                    lines[i] = update;
+                                    break;
+                                }
+                            }
+                            this.agentResponse = lines.join('\n') + '\n';
+                            lastStatusLine = null;
+                        } else {
+                            // Regular update, just append
+                            this.agentResponse += update + '\n';
+                            // Don't clear lastStatusLine for "Stopped by user" - it will replace the ⏳
+                            if (!update.includes('Stopped by user')) {
+                                lastStatusLine = null;
+                            }
+                        }
                         
                         if (isFirstUpdate) {
                             // Create the initial assistant message bubble
@@ -454,9 +489,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }, 
                     this.currentThread?.id ?? null
                 ).finally(async () => {
+                    // Clean up any remaining ⏳ (waiting) lines - replace with ❌ (cancelled)
+                    // This handles the case when the process was stopped mid-execution
+                    let finalResponse = this.agentResponse.trim();
+                    finalResponse = finalResponse.split('\n').map(line => {
+                        if (line.startsWith('⏳')) {
+                            // Replace waiting status with cancelled - extract the action description
+                            const action = line.substring(2).trim(); // Remove ⏳ and space
+                            return `❌ Cancelled: ${action.replace(/^Running /, '').replace(/^Applying /, '').replace(/^Searching /, '').replace(/^Reading /, '').replace(/^Listing /, '')}`;
+                        }
+                        return line;
+                    }).join('\n');
+
                     // Get the thought history from the agent service
                     const thoughtHistory = this.agentService.getThoughtsDebug();
-                    let finalResponse = this.agentResponse.trim();
                 
                     if (thoughtHistory.summarizedArchive || thoughtHistory.recentThoughts.length > 0) {
                         let historyMarkdown = "\n\n---\n### Agent's Thought Process\n";
@@ -475,9 +521,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         finalResponse += historyMarkdown;
                     }
                 
-                    // Save final agent response (with thoughts) to thread
+                    // Save final agent response (with thoughts) to thread - always save if there's any response
+                    // This ensures the assistant message gets an ID for deletion purposes
                     if (finalResponse) {
-                        await this.addMessageToCurrentThread('assistant', finalResponse);
+                        const assistantMsgId = await this.addMessageToCurrentThread('assistant', finalResponse);
+                        // Update the assistant message in the DOM with its ID so it can be deleted later
+                        this._view?.webview.postMessage({
+                            type: 'setLastAssistantMessageId',
+                            id: assistantMsgId
+                        });
+                    } else if (!isFirstUpdate) {
+                        // If there's no finalResponse but an assistant message bubble was created (isFirstUpdate became false),
+                        // we still need to set an ID on it. Save an empty/placeholder message.
+                        const assistantMsgId = await this.addMessageToCurrentThread('assistant', '(No response)');
+                        this._view?.webview.postMessage({
+                            type: 'setLastAssistantMessageId',
+                            id: assistantMsgId
+                        });
                     }
                     
                     this.isProcessing = false;
@@ -663,9 +723,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.agentService) {
             this.agentService.stop();
         }
-        if (this.agentResponse.trim()) {
-            this.addMessageToCurrentThread('assistant', this.agentResponse.trim());
-        }
+        // Don't save here - let the .finally() block handle saving to avoid duplicates
+        // The agentWasStopped flag is set by calling agentService.stop()
         this.isProcessing = false;
         this.updateProcessingState();
     }
@@ -784,10 +843,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         // Active thread exists, send its content
+        // Strip thought process from messages for display (it's saved for server context but not shown in UI)
         const history = this.currentThread.messages.map(msg => ({
             id: msg.id,
             type: msg.type,
-            message: msg.content
+            message: msg.type === 'assistant' ? this.stripThoughtProcess(msg.content) : msg.content
         }));
 
         this._view?.webview.postMessage({
@@ -795,6 +855,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             history: history,
             threadTitle: this.currentThread.title || 'Conversation'
         });
+    }
+
+    /**
+     * Strips the "Agent's Thought Process" section from a message for UI display.
+     * The thought process is saved to the database for context but hidden from the user.
+     */
+    private stripThoughtProcess(content: string): string {
+        // Find and remove the thought process section (starts with "---\n### Agent's Thought Process")
+        const thoughtProcessMarker = /\n*---\n### Agent's Thought Process[\s\S]*$/;
+        return content.replace(thoughtProcessMarker, '').trim();
     }
 
     private async sendThreadListToWebview() {
@@ -1070,6 +1140,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             padding: 10px;
             margin-bottom: 140px; /* Increased margin for bulk actions + input */
             box-sizing: border-box;
+        }
+        /* Animated spinner for waiting status */
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .spinner {
+            display: inline-block;
+            animation: spin 1s linear infinite;
         }
         .loading {
             display: none;
@@ -1995,6 +2074,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Process inline markdown (bold, italic, code)
         function processInlineMarkdown(text) {
             return text
+                // Replace ⏳ with animated spinning version of the same emoji
+                .replace(/⏳/g, '<span class="spinner">⏳</span>')
                 // Bold (** or __)
                 .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/__(.*?)__/g, '<strong>$1</strong>')
@@ -2368,6 +2449,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'clearMessages':
                     // Clear all messages from the chat
                     chatMessages.innerHTML = '';
+                    break;
+                case 'setLastAssistantMessageId':
+                    // Set the data-id on the last assistant message so it can be deleted later
+                    const lastAssistantMsg = chatMessages.querySelector('.message.assistant:last-of-type');
+                    if (lastAssistantMsg && message.id) {
+                        lastAssistantMsg.dataset.id = message.id;
+                    }
                     break;
                 case 'messageDeleted':
                     if (message.ids && Array.isArray(message.ids)) {
