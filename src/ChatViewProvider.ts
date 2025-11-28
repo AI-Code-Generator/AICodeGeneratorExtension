@@ -893,6 +893,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
+        const backIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'backbutton.svg'));
+        const askIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'ask.svg'));
+        const agentIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'agent.svg'));
+        const deleteIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'delete.svg'));
+
         // Updated HTML with login/register UI
         return `
         <!DOCTYPE html>
@@ -1627,6 +1632,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             align-items: center;
             gap: 8px;
         }
+        
+        /* Icon styles - Use CSS mask to allow SVG to inherit text color */
+        .back-button img, .clear-button img, .mode-button img {
+            width: 16px;
+            height: 16px;
+            display: block;
+        }
+        
+        /* Icon container for CSS mask technique */
+        .icon {
+            width: 16px;
+            height: 16px;
+            display: inline-block;
+            background-color: currentColor;
+            -webkit-mask-size: contain;
+            mask-size: contain;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-position: center;
+            mask-position: center;
+        }
+        
+        .icon-back {
+            -webkit-mask-image: url('${backIconUri}');
+            mask-image: url('${backIconUri}');
+        }
+        
+        .icon-ask {
+            -webkit-mask-image: url('${askIconUri}');
+            mask-image: url('${askIconUri}');
+        }
+        
+        .icon-agent {
+            -webkit-mask-image: url('${agentIconUri}');
+            mask-image: url('${agentIconUri}');
+        }
+        
+        .icon-delete {
+            -webkit-mask-image: url('${deleteIconUri}');
+            mask-image: url('${deleteIconUri}');
+        }
+        
+        .back-button, .clear-button {
+            padding: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .mode-button {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
     </style>
 
 </head>
@@ -1694,16 +1753,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     <div id="chatView" class="chat-view">
         <div class="chat-header">
-            <button id="backButton" class="back-button">← Back</button>
+            <button id="backButton" class="back-button" title="Back">
+                <span class="icon icon-back"></span>
+                <span>Back</span>
+            </button>
             <div class="chat-header-title" id="chatHeaderTitle">Conversation</div>
             <div class="mode-selector">
                 <div class="mode-buttons">
-                    <button id="askButton" class="mode-button active">Ask</button>
-                    <button id="agentButton" class="mode-button">Agent</button>
+                    <button id="askButton" class="mode-button active" title="Ask Mode">
+                        <span class="icon icon-ask"></span>
+                        <span>Ask</span>
+                    </button>
+                    <button id="agentButton" class="mode-button" title="Agent Mode">
+                        <span class="icon icon-agent"></span>
+                        <span>Agent</span>
+                    </button>
                 </div>
             </div>
             <div class="chat-header-actions">
-                <button id="clearButton" class="clear-button" title="Clear this conversation">🗑️ Clear</button>
+                <button id="clearButton" class="clear-button" title="Clear this conversation">
+                    <span class="icon icon-delete"></span>
+                    <span>Clear</span>
+                </button>
                 <button id="logoutButtonChat" class="logout-button">Logout</button>
             </div>
         </div>
