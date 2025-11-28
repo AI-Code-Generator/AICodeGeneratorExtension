@@ -901,14 +901,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
+        :root {
+            --container-padding: 20px;
+            --input-padding-vertical: 12px;
+            --input-padding-horizontal: 16px;
+            --radius-sm: 6px;
+            --radius-md: 8px;
+            --radius-lg: 12px;
+            --radius-xl: 24px;
+        }
+
         body { 
-            font-family: var(--vscode-font-family); 
+            font-family: var(--vscode-font-family);
+            font-weight: var(--vscode-font-weight);
+            font-size: var(--vscode-font-size);
+            background-color: var(--vscode-editor-background);
+            color: var(--vscode-editor-foreground);
             padding: 0; 
             margin: 0;
             overflow: hidden;
             height: 100vh;
         }
         
+        /* --- Animations --- */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
         /* --- Global Loader --- */
         .global-loading {
             display: none; /* Hidden by default */
@@ -918,6 +943,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             height: 100vh;
             font-size: 1.2em;
             color: var(--vscode-descriptionForeground);
+            animation: fadeIn 0.3s ease;
         }
         .global-loading.active {
             display: flex;
@@ -932,6 +958,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             height: 100vh;
             padding: 20px;
             box-sizing: border-box;
+            animation: fadeIn 0.3s ease;
         }
         .login-view.active {
             display: flex;
@@ -939,57 +966,69 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .auth-container {
             width: 100%;
             max-width: 320px;
-            padding: 20px;
-            background: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 6px;
+            padding: 30px;
+            background: var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: var(--radius-md);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
         }
         .auth-container h2 {
             text-align: center;
             margin-top: 0;
-            margin-bottom: 20px;
+            margin-bottom: 24px;
             color: var(--vscode-foreground);
+            font-weight: 600;
         }
         .auth-form-group {
-            margin-bottom: 15px;
+            margin-bottom: 20px;
         }
         .auth-form-group label {
             display: block;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
             font-size: 13px;
+            font-weight: 500;
             color: var(--vscode-descriptionForeground);
         }
         .auth-input {
             width: 100%;
-            padding: 8px;
+            padding: 10px 12px;
             background: var(--vscode-input-background);
             border: 1px solid var(--vscode-input-border);
             color: var(--vscode-input-foreground);
-            border-radius: 4px;
+            border-radius: var(--radius-sm);
             box-sizing: border-box;
+            transition: border-color 0.2s;
+        }
+        .auth-input:focus {
+            border-color: var(--vscode-focusBorder);
+            outline: none;
         }
         .auth-button {
             width: 100%;
-            padding: 10px;
+            padding: 12px;
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-sm);
             cursor: pointer;
             font-size: 14px;
+            font-weight: 500;
+            transition: background-color 0.2s;
         }
         .auth-button:hover {
             background: var(--vscode-button-hoverBackground);
         }
         .auth-switch-link {
-            margin-top: 15px;
+            margin-top: 20px;
             text-align: center;
             font-size: 13px;
+            color: var(--vscode-descriptionForeground);
         }
         .auth-switch-link a {
             color: var(--vscode-textLink-foreground);
             text-decoration: none;
             cursor: pointer;
+            font-weight: 500;
         }
         .auth-switch-link a:hover {
             text-decoration: underline;
@@ -998,10 +1037,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             color: var(--vscode-errorForeground);
             background: var(--vscode-inputValidation-errorBackground);
             border: 1px solid var(--vscode-inputValidation-errorBorder);
-            padding: 10px;
-            border-radius: 4px;
+            padding: 12px;
+            border-radius: var(--radius-sm);
             font-size: 13px;
-            margin-bottom: 15px;
+            margin-bottom: 20px;
             display: none;
             text-align: center;
         }
@@ -1009,121 +1048,160 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         /* --- Main App Views --- */
         .mode-selector {
             display: flex;
-            gap: 10px;
-            padding: 10px;
-            background: var(--vscode-editor-background);
-            border-bottom: 1px solid var(--vscode-input-border);
-            align-items: center;
-            justify-content: space-between;
+            gap: 8px;
+            padding: 4px;
+            background: var(--vscode-input-background);
+            border-radius: var(--radius-md);
+            border: 1px solid var(--vscode-input-border);
         }
         .mode-buttons {
             display: flex;
             gap: 10px;
         }
         .clear-button, .logout-button {
-            padding: 6px 10px;
-            border: 1px solid var(--vscode-errorForeground);
+            padding: 6px 12px;
+            border: 1px solid transparent;
             background: transparent;
-            color: var(--vscode-errorForeground);
-            border-radius: 4px;
+            color: var(--vscode-descriptionForeground);
+            border-radius: var(--radius-sm);
             cursor: pointer;
             font-size: 12px;
             transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
-        .clear-button:hover, .logout-button:hover {
-            background: var(--vscode-errorForeground);
-            color: white;
-        }
-        .logout-button {
-             border-color: var(--vscode-descriptionForeground);
-             color: var(--vscode-descriptionForeground);
-             margin-left: 10px;
+        .clear-button:hover {
+            background: var(--vscode-inputValidation-errorBackground);
+            color: var(--vscode-errorForeground);
         }
         .logout-button:hover {
-            background: var(--vscode-descriptionForeground);
-            color: var(--vscode-editor-background);
+            background: var(--vscode-list-hoverBackground);
+            color: var(--vscode-foreground);
         }
         .mode-button {
-            padding: 8px 12px;
-            border: 1px solid var(--vscode-input-border);
-            background: var(--vscode-button-secondaryBackground);
-            color: var(--vscode-button-secondaryForeground);
-            border-radius: 4px;
+            padding: 6px 16px;
+            border: none;
+            background: transparent;
+            color: var(--vscode-descriptionForeground);
+            border-radius: var(--radius-sm);
             cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .mode-button:hover {
+            color: var(--vscode-foreground);
         }
         .mode-button.active {
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
+        
         .message { 
-            margin: 10px 0; 
-            padding: 8px; 
-            border-radius: 4px; 
+            margin: 16px 0; 
+            padding: 12px 16px; 
+            border-radius: var(--radius-lg); 
             white-space: pre-wrap;
             position: relative;
+            line-height: 1.5;
+            max-width: 90%;
+            animation: slideUp 0.3s ease-out;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
         }
         .user { 
-            background: var(--vscode-input-background);
-            margin-left: 20px;
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            margin-left: auto; /* Align right */
+            margin-right: 0;
+            border-bottom-right-radius: 2px;
+            border: 1px solid var(--vscode-button-border, transparent);
         }
         .assistant { 
-            background: var(--vscode-editor-background);
-            margin-right: 20px;
+            background: var(--vscode-editor-inactiveSelectionBackground);
+            color: var(--vscode-editor-foreground);
+            margin-right: auto; /* Align left */
+            margin-left: 0;
+            border-bottom-left-radius: 2px;
+            border: 1px solid var(--vscode-widget-border);
         }
         .delete-btn { 
             position: absolute; 
-            top: 4px; 
-            right: 6px; 
-            background: transparent; 
-            border: none; 
+            top: -8px; 
+            right: -8px; 
+            background: var(--vscode-editor-background); 
+            border: 1px solid var(--vscode-input-border); 
             cursor: pointer; 
             color: var(--vscode-descriptionForeground); 
             display: none;
-            font-size: 14px;
+            font-size: 12px;
             width: 20px;
             height: 20px;
-            border-radius: 3px;
+            border-radius: 50%;
             z-index: 10;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        .message.user:hover .delete-btn { 
-            display: inline-block; 
+        .message:hover .delete-btn { 
+            display: flex; 
         }
         .delete-btn:hover { 
             color: var(--vscode-errorForeground);
-            background: var(--vscode-input-background);
+            border-color: var(--vscode-errorForeground);
         }
+        
         .input-container {
             position: fixed;
-            bottom: 10px;
-            left: 10px;
-            right: 10px;
+            bottom: 16px;
+            left: 16px;
+            right: 16px;
             display: flex;
-            gap: 8px;
+            gap: 10px;
             background: var(--vscode-editor-background);
             padding: 10px;
-            z-index: 1000; /* Below bulk actions */
+            z-index: 1000;
+            border-radius: var(--radius-xl);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            border: 1px solid var(--vscode-widget-border);
         }
         #messageInput { 
             flex-grow: 1;
-            padding: 8px;
-            background: var(--vscode-input-background);
-            border: 1px solid var(--vscode-input-border);
+            padding: 10px 16px;
+            background: transparent;
+            border: none;
             color: var(--vscode-input-foreground);
-            resize: vertical;
-            border-radius: 4px;
-            min-height: 40px;
+            resize: none; /* Auto-resize handled by JS */
+            border-radius: var(--radius-xl);
+            min-height: 24px;
+            max-height: 150px;
+            font-family: inherit;
+            font-size: inherit;
+        }
+        #messageInput:focus {
+            outline: none;
         }
         #sendButton, #stopButton {
-            padding: 8px 16px;
+            padding: 8px 20px;
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
-            border-radius: 4px;
+            border-radius: 20px;
             cursor: pointer;
             white-space: nowrap;
+            font-weight: 500;
+            transition: transform 0.1s, background-color 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         #sendButton:hover, #stopButton:hover {
             background: var(--vscode-button-hoverBackground);
+            transform: translateY(-1px);
+        }
+        #sendButton:active, #stopButton:active {
+            transform: translateY(0);
         }
         #stopButton {
             background: var(--vscode-errorForeground);
@@ -1132,15 +1210,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         #stopButton:hover {
             background: var(--vscode-errorForeground);
-            opacity: 0.8;
+            opacity: 0.9;
         }
+        
         #chatMessages {
-            height: calc(100vh - 100px);
+            height: calc(100vh - 80px); /* Adjusted for header */
             overflow-y: auto;
-            padding: 10px;
-            margin-bottom: 140px; /* Increased margin for bulk actions + input */
+            padding: 20px;
+            padding-bottom: 100px; /* Space for input */
             box-sizing: border-box;
+            scroll-behavior: smooth;
         }
+        
         /* Animated spinner for waiting status */
         @keyframes spin {
             0% { transform: rotate(0deg); }
@@ -1156,48 +1237,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-style: italic;
             color: var(--vscode-descriptionForeground);
             position: fixed;
-            bottom: 145px;
-            left: 20px;
+            bottom: 90px;
+            left: 30px;
             background: var(--vscode-editor-background);
-            padding: 5px 10px;
-            border-radius: 4px;
-            z-index: 1000;
+            padding: 6px 12px;
+            border-radius: 20px;
+            z-index: 999;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border: 1px solid var(--vscode-widget-border);
+            animation: fadeIn 0.2s;
         }
+        
         .code-block-container {
-            margin: 12px 0;
+            margin: 16px 0;
             background: var(--vscode-textCodeBlock-background);
-            border-radius: 6px;
+            border-radius: var(--radius-md);
             overflow: hidden;
-            border: 1px solid var(--vscode-input-border);
+            border: 1px solid var(--vscode-widget-border);
         }
         .code-block-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 8px 12px;
-            background: var(--vscode-textCodeBlock-background);
-            border-bottom: 1px solid var(--vscode-input-border);
+            padding: 8px 16px;
+            background: rgba(0,0,0,0.05); /* Subtle contrast */
+            border-bottom: 1px solid var(--vscode-widget-border);
         }
         .language-label {
             color: var(--vscode-descriptionForeground);
-            font-size: 0.9em;
+            font-size: 0.85em;
             text-transform: uppercase;
+            font-weight: 600;
+            letter-spacing: 0.5px;
         }
         .copy-button {
-            background: var(--vscode-button-background);
-            color: var(--vscode-button-foreground);
-            border: none;
-            padding: 4px 8px;
-            border-radius: 3px;
+            background: transparent;
+            color: var(--vscode-descriptionForeground);
+            border: 1px solid transparent;
+            padding: 4px 10px;
+            border-radius: var(--radius-sm);
             cursor: pointer;
-            font-size: 0.9em;
-            transition: background-color 0.2s;
+            font-size: 0.85em;
+            transition: all 0.2s;
         }
         .copy-button:hover {
-            background: var(--vscode-button-hoverBackground);
+            background: var(--vscode-toolbar-hoverBackground);
+            color: var(--vscode-foreground);
         }
         .code-content {
-            padding: 12px;
+            padding: 16px;
             margin: 0;
             overflow-x: auto;
             font-family: var(--vscode-editor-font-family);
@@ -1205,40 +1293,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             line-height: 1.5;
             tab-size: 4;
         }
+        
         .text-content {
             margin: 8px 0;
             line-height: 1.6;
         }
         .text-content h1, .text-content h2, .text-content h3 {
-            margin: 16px 0 8px 0;
+            margin: 20px 0 12px 0;
             color: var(--vscode-foreground);
             line-height: 1.3;
+            font-weight: 600;
         }
         .text-content h1 {
-            font-size: 1.5em;
-            border-bottom: 1px solid var(--vscode-input-border);
-            padding-bottom: 4px;
+            font-size: 1.6em;
+            border-bottom: 1px solid var(--vscode-widget-border);
+            padding-bottom: 8px;
         }
         .text-content h2 {
-            font-size: 1.3em;
+            font-size: 1.4em;
         }
         .text-content h3 {
-            font-size: 1.1em;
+            font-size: 1.2em;
         }
         .text-content strong {
-            font-weight: bold;
+            font-weight: 600;
             color: var(--vscode-foreground);
-        }
-        .text-content em {
-            font-style: italic;
         }
         .text-content code {
             background: var(--vscode-textCodeBlock-background);
             color: var(--vscode-textPreformat-foreground);
-            padding: 2px 4px;
-            border-radius: 3px;
+            padding: 2px 6px;
+            border-radius: 4px;
             font-family: var(--vscode-editor-font-family);
             font-size: 0.9em;
+            border: 1px solid var(--vscode-widget-border);
         }
         .text-content ul, .text-content ol {
             margin: 12px 0;
@@ -1246,40 +1334,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         .text-content li {
             margin: 6px 0;
-            line-height: 1.5;
-        }
-        .text-content ul li {
-            list-style-type: disc;
-        }
-        .text-content ol li {
-            list-style-type: decimal;
-        }
-        .text-content p {
-            margin: 12px 0;
             line-height: 1.6;
         }
-        .text-content p:first-child {
-            margin-top: 0;
-        }
-        .text-content p:last-child {
-            margin-bottom: 0;
-        }
+        
         .bulk-actions {
             display: none;
             position: fixed;
-            bottom: 85px;
-            left: 10px;
-            right: 10px;
+            bottom: 90px;
+            left: 20px;
+            right: 20px;
             margin: 0;
-            padding: 15px;
+            padding: 20px;
             background: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 6px;
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: var(--radius-lg);
             text-align: center;
             z-index: 1001; /* Above loading indicator */
-            box-shadow: 0 -2px 8px rgba(0,0,0,0.2);
-            transform: translateY(100%);
-            transition: transform 0.3s ease-in-out, opacity 0.3s ease-in-out;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+            transform: translateY(20px);
+            transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
             opacity: 0;
         }
         .bulk-actions.show {
@@ -1288,22 +1361,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             opacity: 1;
         }
         .bulk-actions h4 {
-            margin: 0 0 10px 0;
+            margin: 0 0 16px 0;
             color: var(--vscode-foreground);
-            font-size: 14px;
+            font-size: 15px;
+            font-weight: 600;
         }
         .bulk-actions-buttons {
             display: flex;
-            gap: 10px;
+            gap: 12px;
             justify-content: center;
         }
         .bulk-action-button {
-            padding: 8px 16px;
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 4px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: var(--radius-md);
             cursor: pointer;
             font-size: 13px;
             font-weight: 500;
+            transition: transform 0.1s;
+        }
+        .bulk-action-button:hover {
+            transform: translateY(-1px);
         }
         .accept-all-button {
             background: var(--vscode-button-background);
@@ -1317,27 +1395,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             color: white;
         }
         .reject-all-button:hover {
-            opacity: 0.8;
+            opacity: 0.9;
         }
+        
         .terminal-command-confirmation {
             background: var(--vscode-editorWidget-background);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 8px;
-            margin: 10px 0;
-            padding: 15px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: var(--radius-lg);
+            margin: 16px 0;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            animation: slideUp 0.3s ease-out;
         }
         .terminal-command-confirmation h4 {
-            margin: 0 0 10px 0;
+            margin: 0 0 12px 0;
             color: var(--vscode-foreground);
-            font-size: 14px;
+            font-size: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
         .terminal-command {
             background: var(--vscode-editor-background);
             border: 1px solid var(--vscode-input-border);
-            border-radius: 4px;
-            padding: 10px;
-            margin: 10px 0;
+            border-radius: var(--radius-md);
+            padding: 12px;
+            margin: 12px 0;
             font-family: var(--vscode-editor-font-family);
             font-size: var(--vscode-editor-font-size);
             color: var(--vscode-editor-foreground);
@@ -1346,17 +1429,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         .terminal-command-buttons {
             display: flex;
-            gap: 10px;
+            gap: 12px;
             justify-content: flex-end;
-            margin-top: 15px;
+            margin-top: 20px;
         }
         .terminal-command-button {
             padding: 8px 16px;
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 4px;
+            border: none;
+            border-radius: var(--radius-sm);
             cursor: pointer;
             font-size: 13px;
             font-weight: 500;
+            transition: opacity 0.2s;
         }
         .allow-command-button {
             background: var(--vscode-button-background);
@@ -1370,90 +1454,109 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             color: white;
         }
         .deny-command-button:hover {
-            opacity: 0.8;
+            opacity: 0.9;
         }
+        
         /* Thread History View */
         .thread-history-view {
             display: none;
             height: 100vh;
             overflow-y: auto;
-            padding: 20px;
+            padding: 24px;
             box-sizing: border-box;
+            animation: fadeIn 0.3s ease;
         }
         .thread-history-view.active {
             display: block;
         }
         .thread-history-header {
-            margin-bottom: 20px;
+            margin-bottom: 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         .thread-history-header h2 {
-            margin: 0 0 10px 0;
+            margin: 0;
             color: var(--vscode-foreground);
+            font-size: 20px;
+            font-weight: 600;
         }
         .thread-history-actions {
             display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
+            gap: 12px;
+            margin-bottom: 24px;
         }
         .new-thread-button {
             padding: 10px 20px;
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
-            border-radius: 4px;
+            border-radius: var(--radius-xl);
             cursor: pointer;
             font-size: 14px;
+            font-weight: 500;
+            width: 100%;
+            transition: background-color 0.2s, transform 0.1s;
         }
         .new-thread-button:hover {
             background: var(--vscode-button-hoverBackground);
+            transform: translateY(-1px);
         }
         .thread-list {
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 12px;
         }
         .thread-item {
-            padding: 15px;
-            background: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 6px;
+            padding: 16px;
+            background: var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: var(--radius-md);
             cursor: pointer;
-            transition: all 0.2s;
+            transition: all 0.2s ease;
             position: relative;
+            overflow: hidden;
         }
         .thread-item:hover {
             background: var(--vscode-list-hoverBackground);
             border-color: var(--vscode-focusBorder);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
         }
         .thread-item-title {
-            font-size: 14px;
-            font-weight: 500;
-            margin-bottom: 6px;
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 8px;
             color: var(--vscode-foreground);
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+            padding-right: 24px; /* Space for delete button */
         }
         .thread-item-meta {
             font-size: 12px;
             color: var(--vscode-descriptionForeground);
             display: flex;
-            gap: 15px;
+            gap: 16px;
+            align-items: center;
         }
         .thread-item-delete {
             position: absolute;
-            top: 10px;
-            right: 10px;
+            top: 12px;
+            right: 12px;
             background: transparent;
             border: none;
             color: var(--vscode-descriptionForeground);
             cursor: pointer;
             font-size: 18px;
             opacity: 0;
-            transition: opacity 0.2s;
-            width: 24px;
-            height: 24px;
-            border-radius: 3px;
+            transition: all 0.2s;
+            width: 28px;
+            height: 28px;
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         .thread-item:hover .thread-item-delete {
             opacity: 1;
@@ -1464,45 +1567,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         .empty-threads {
             text-align: center;
-            padding: 40px 20px;
+            padding: 60px 20px;
             color: var(--vscode-descriptionForeground);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
         }
         .empty-threads-icon {
             font-size: 48px;
-            margin-bottom: 15px;
+            opacity: 0.5;
         }
+        
         /* Chat View */
         .chat-view {
             display: none;
             height: 100vh;
+            flex-direction: column;
+            animation: fadeIn 0.3s ease;
         }
         .chat-view.active {
             display: flex;
-            flex-direction: column;
         }
         .chat-header {
             display: flex;
             align-items: center;
-            gap: 10px;
-            padding: 10px;
+            gap: 16px;
+            padding: 12px 20px;
             background: var(--vscode-editor-background);
-            border-bottom: 1px solid var(--vscode-input-border);
+            border-bottom: 1px solid var(--vscode-widget-border);
+            z-index: 10;
         }
         .back-button {
-            padding: 6px 12px;
-            background: var(--vscode-button-secondaryBackground);
-            color: var(--vscode-button-secondaryForeground);
-            border: none;
-            border-radius: 4px;
+            padding: 8px 12px;
+            background: transparent;
+            color: var(--vscode-foreground);
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: var(--radius-sm);
             cursor: pointer;
-            font-size: 14px;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
         }
         .back-button:hover {
-            background: var(--vscode-button-secondaryHoverBackground);
+            background: var(--vscode-toolbar-hoverBackground);
+            border-color: var(--vscode-focusBorder);
         }
         .chat-header-title {
             flex: 1;
-            font-size: 14px;
+            font-size: 16px;
+            font-weight: 600;
             color: var(--vscode-foreground);
             overflow: hidden;
             text-overflow: ellipsis;
@@ -1511,8 +1625,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .chat-header-actions {
             display: flex;
             align-items: center;
+            gap: 8px;
         }
     </style>
+
 </head>
 <body>
 
