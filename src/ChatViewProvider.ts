@@ -1584,6 +1584,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             opacity: 0.5;
         }
         
+        /* Loading dots animation */
+        .loading-dots::after {
+            content: '';
+            display: inline-block;
+            width: 1.2em;
+            text-align: left;
+            animation: dots 2s steps(1, end) infinite;
+        }
+        @keyframes dots {
+            0%, 25% { content: ''; }
+            25%, 50% { content: '.'; }
+            50%, 75% { content: '..'; }
+            75%, 100% { content: '...'; }
+        }
+        
         /* Chat View */
         .chat-view {
             display: none;
@@ -1749,7 +1764,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <div id="threadList" class="thread-list">
             <div class="empty-threads">
                 <div class="empty-threads-icon">💬</div>
-                <p>Loading conversations...</p>
+                <p><span class="loading-dots">Loading conversations</span></p>
             </div>
         </div>
     </div>
@@ -1885,7 +1900,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             threadList.innerHTML = \`
                 <div class="empty-threads">
                     <div class="empty-threads-icon">💬</div>
-                    <p>Loading conversations...</p>
+                    <p><span class="loading-dots">Loading conversations</span></p>
                 </div>
             \`;
         }
@@ -2395,7 +2410,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                          threadList.innerHTML = \`
                             <div class="empty-threads">
                                 <div class="empty-threads-icon">💬</div>
-                                <p>Loading conversations...</p>
+                                <p><span class="loading-dots">Loading conversations</span></p>
                             </div>
                          \`;
                     }
