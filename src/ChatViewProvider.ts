@@ -1655,6 +1655,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         
         .icon-back {
+            width: 12px;
+            height: 12px;
             -webkit-mask-image: url('${backIconUri}');
             mask-image: url('${backIconUri}');
         }
@@ -1679,6 +1681,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             display: flex;
             align-items: center;
             justify-content: center;
+            gap: 6px;
         }
         
         .mode-button {
