@@ -457,7 +457,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         } else {
                             // Regular update, just append
                             this.agentResponse += update + '\n';
-                            lastStatusLine = null;
+                            // Don't clear lastStatusLine for "Stopped by user" - it will replace the ⏳
+                            if (!update.includes('Stopped by user')) {
+                                lastStatusLine = null;
+                            }
                         }
                         
                         if (isFirstUpdate) {
@@ -479,9 +482,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }, 
                     this.currentThread?.id ?? null
                 ).finally(async () => {
+                    // Clean up any remaining ⏳ (waiting) lines - replace with ❌ (cancelled)
+                    // This handles the case when the process was stopped mid-execution
+                    let finalResponse = this.agentResponse.trim();
+                    finalResponse = finalResponse.split('\n').map(line => {
+                        if (line.startsWith('⏳')) {
+                            // Replace waiting status with cancelled - extract the action description
+                            const action = line.substring(2).trim(); // Remove ⏳ and space
+                            return `❌ Cancelled: ${action.replace(/^Running /, '').replace(/^Applying /, '').replace(/^Searching /, '').replace(/^Reading /, '').replace(/^Listing /, '')}`;
+                        }
+                        return line;
+                    }).join('\n');
+
                     // Get the thought history from the agent service
                     const thoughtHistory = this.agentService.getThoughtsDebug();
-                    let finalResponse = this.agentResponse.trim();
                 
                     if (thoughtHistory.summarizedArchive || thoughtHistory.recentThoughts.length > 0) {
                         let historyMarkdown = "\n\n---\n### Agent's Thought Process\n";
@@ -688,9 +702,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.agentService) {
             this.agentService.stop();
         }
-        if (this.agentResponse.trim()) {
-            this.addMessageToCurrentThread('assistant', this.agentResponse.trim());
-        }
+        // Don't save here - let the .finally() block handle saving to avoid duplicates
+        // The agentWasStopped flag is set by calling agentService.stop()
         this.isProcessing = false;
         this.updateProcessingState();
     }
