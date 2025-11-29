@@ -1256,7 +1256,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-style: italic;
             color: var(--vscode-descriptionForeground);
             position: fixed;
-            bottom: 90px;
+            bottom: 100px;
             left: 30px;
             background: var(--vscode-editor-background);
             padding: 6px 12px;
@@ -1819,7 +1819,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <button id="rejectAllButton" class="bulk-action-button reject-all-button">✗ Reject All Changes</button>
         </div>
     </div>
-    <div id="loading" class="loading">Thinking...</div>
+    <div id="loading" class="loading"><span class="loading-dots">Thinking</span></div>
     <div class="input-container">
         <textarea 
             id="messageInput" 
