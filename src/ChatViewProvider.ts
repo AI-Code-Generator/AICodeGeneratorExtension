@@ -1184,25 +1184,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             border-radius: var(--radius-xl);
             box-shadow: 0 4px 20px rgba(0,0,0,0.15);
             border: 1px solid var(--vscode-widget-border);
+            align-items: flex-start; /* Align to top */
         }
         #messageInput { 
             flex-grow: 1;
-            padding: 10px 16px;
+            padding: 12px 16px; /* Increased vertical padding to match button height */
             background: transparent;
             border: none;
             color: var(--vscode-input-foreground);
-            resize: none; /* Auto-resize handled by JS */
+            resize: none; 
             border-radius: var(--radius-xl);
-            min-height: 24px;
+            min-height: 40px; /* Explicit min-height */
             max-height: 150px;
             font-family: inherit;
             font-size: inherit;
+            line-height: 1.4;
+            box-sizing: border-box; /* Ensure padding is included in height */
+            overflow-y: hidden; /* Hide scrollbar initially to prevent height jump */
         }
         #messageInput:focus {
             outline: none;
         }
         #sendButton, #stopButton {
-            padding: 8px 20px;
+            padding: 0 20px; /* Remove vertical padding, set height explicitly */
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
@@ -1213,7 +1217,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             transition: transform 0.1s, background-color 0.2s;
             display: flex;
             align-items: center;
-            justify-content: center;
+            height: 40px; /* Match input min-height */
+            margin-top: 0; /* Ensure alignment */
         }
         #sendButton:hover, #stopButton:hover {
             background: var(--vscode-button-hoverBackground);
@@ -1256,7 +1261,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-style: italic;
             color: var(--vscode-descriptionForeground);
             position: fixed;
-            bottom: 100px;
+            bottom: 85px;
             left: 30px;
             background: var(--vscode-editor-background);
             padding: 6px 12px;
@@ -2412,6 +2417,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     mode: currentMode
                 });
                 messageInput.value = '';
+                // Reset height
+                messageInput.style.height = 'auto';
             }
         }
 
@@ -2436,7 +2443,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Auto-expand textarea as user types
         messageInput.addEventListener('input', () => {
             messageInput.style.height = 'auto';
-            messageInput.style.height = messageInput.scrollHeight + 'px';
+            messageInput.style.overflowY = 'hidden'; // Hide scrollbar while calculating height
+            const newHeight = Math.min(messageInput.scrollHeight, 150); // Max height 150px
+            // Only expand if content exceeds min-height (40px)
+            if (newHeight > 40) {
+                messageInput.style.height = newHeight + 'px';
+            } else {
+                messageInput.style.height = '40px';
+            }
+            // Show scrollbar only when content exceeds max height
+            messageInput.style.overflowY = newHeight >= 150 ? 'auto' : 'hidden';
         });
 
         // Handle enter key (send on Enter, new line on Shift+Enter)
