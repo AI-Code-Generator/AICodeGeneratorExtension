@@ -897,6 +897,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const askIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'ask.svg'));
         const agentIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'agent.svg'));
         const deleteIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'delete.svg'));
+        const doneIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'done.svg'));
+        const loadingIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'loading.svg'));
+        const stoppedIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'stopped.svg'));
 
         // Updated HTML with login/register UI
         return `
@@ -1254,6 +1257,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .spinner {
             display: inline-block;
             animation: spin 1s linear infinite;
+        }
+        
+        /* Status icons for agent mode */
+        .status-icon {
+            width: 16px;
+            height: 16px;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+        .status-icon-done {
+            background-image: url('${doneIconUri}');
+            background-size: 14px 14px;
+            background-repeat: no-repeat;
+            background-position: center;
+        }
+        .status-icon-loading {
+            background-image: url('${loadingIconUri}');
+            background-size: 12px 12px;
+            background-repeat: no-repeat;
+            background-position: center;
+            animation: spin 1s linear infinite;
+        }
+        .status-icon-stopped {
+            background-image: url('${stoppedIconUri}');
+            background-size: 16px 16px;
+            background-repeat: no-repeat;
+            background-position: center;
         }
         .loading {
             display: none;
@@ -2341,8 +2372,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Process inline markdown (bold, italic, code)
         function processInlineMarkdown(text) {
             return text
-                // Replace ⏳ with animated spinning version of the same emoji
-                .replace(/⏳/g, '<span class="spinner">⏳</span>')
+                // Replace status emojis with SVG icons
+                .replace(/✅/g, '<span class="status-icon status-icon-done"></span>')
+                .replace(/⏳/g, '<span class="status-icon status-icon-loading"></span>')
+                .replace(/❌/g, '<span class="status-icon status-icon-stopped"></span>')
                 // Bold (** or __)
                 .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/__(.*?)__/g, '<strong>$1</strong>')
