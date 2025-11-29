@@ -723,6 +723,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.agentService) {
             this.agentService.stop();
         }
+        
+        // If there's a pending terminal command confirmation, reject it and dismiss the popup
+        if (this.pendingTerminalCommandResolve) {
+            this.pendingTerminalCommandResolve(false);
+            this.pendingTerminalCommandResolve = undefined;
+            // Dismiss the terminal command confirmation popup in webview
+            this._view?.webview.postMessage({ type: 'dismissTerminalCommandConfirmation' });
+        }
+        
         // Don't save here - let the .finally() block handle saving to avoid duplicates
         // The agentWasStopped flag is set by calling agentService.stop()
         this.isProcessing = false;
@@ -2590,6 +2599,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'showTerminalCommandConfirmation':
                     showTerminalCommandConfirmation(message.command);
+                    break;
+                case 'dismissTerminalCommandConfirmation':
+                    // Remove any existing terminal command confirmation popup
+                    const confirmationPopup = document.querySelector('.terminal-command-confirmation');
+                    if (confirmationPopup) {
+                        confirmationPopup.remove();
+                    }
                     break;
                 case 'addMessage':
                     loading.style.display = 'none';
