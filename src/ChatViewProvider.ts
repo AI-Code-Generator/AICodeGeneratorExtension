@@ -723,6 +723,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.agentService) {
             this.agentService.stop();
         }
+        
+        // If there's a pending terminal command confirmation, reject it and dismiss the popup
+        if (this.pendingTerminalCommandResolve) {
+            this.pendingTerminalCommandResolve(false);
+            this.pendingTerminalCommandResolve = undefined;
+            // Dismiss the terminal command confirmation popup in webview
+            this._view?.webview.postMessage({ type: 'dismissTerminalCommandConfirmation' });
+        }
+        
         // Don't save here - let the .finally() block handle saving to avoid duplicates
         // The agentWasStopped flag is set by calling agentService.stop()
         this.isProcessing = false;
@@ -897,6 +906,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const askIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'ask.svg'));
         const agentIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'agent.svg'));
         const deleteIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'delete.svg'));
+        const doneIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'done.svg'));
+        const loadingIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'loading.svg'));
+        const stoppedIconUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'icons', 'stopped.svg'));
 
         // Updated HTML with login/register UI
         return `
@@ -1184,25 +1196,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             border-radius: var(--radius-xl);
             box-shadow: 0 4px 20px rgba(0,0,0,0.15);
             border: 1px solid var(--vscode-widget-border);
+            align-items: flex-start; /* Align to top */
         }
         #messageInput { 
             flex-grow: 1;
-            padding: 10px 16px;
+            padding: 12px 16px; /* Increased vertical padding to match button height */
             background: transparent;
             border: none;
             color: var(--vscode-input-foreground);
-            resize: none; /* Auto-resize handled by JS */
+            resize: none; 
             border-radius: var(--radius-xl);
-            min-height: 24px;
+            min-height: 40px; /* Explicit min-height */
             max-height: 150px;
             font-family: inherit;
             font-size: inherit;
+            line-height: 1.4;
+            box-sizing: border-box; /* Ensure padding is included in height */
+            overflow-y: hidden; /* Hide scrollbar initially to prevent height jump */
         }
         #messageInput:focus {
             outline: none;
         }
         #sendButton, #stopButton {
-            padding: 8px 20px;
+            padding: 0 20px; /* Remove vertical padding, set height explicitly */
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
@@ -1213,7 +1229,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             transition: transform 0.1s, background-color 0.2s;
             display: flex;
             align-items: center;
-            justify-content: center;
+            height: 40px; /* Match input min-height */
+            margin-top: 0; /* Ensure alignment */
         }
         #sendButton:hover, #stopButton:hover {
             background: var(--vscode-button-hoverBackground);
@@ -1250,13 +1267,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             display: inline-block;
             animation: spin 1s linear infinite;
         }
+        
+        /* Status icons for agent mode */
+        .status-icon {
+            width: 16px;
+            height: 16px;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+        .status-icon-done {
+            background-image: url('${doneIconUri}');
+            background-size: 14px 14px;
+            background-repeat: no-repeat;
+            background-position: center;
+        }
+        .status-icon-loading {
+            background-image: url('${loadingIconUri}');
+            background-size: 12px 12px;
+            background-repeat: no-repeat;
+            background-position: center;
+            animation: spin 1s linear infinite;
+        }
+        .status-icon-stopped {
+            background-image: url('${stoppedIconUri}');
+            background-size: 16px 16px;
+            background-repeat: no-repeat;
+            background-position: center;
+        }
         .loading {
             display: none;
             margin: 10px 0;
             font-style: italic;
             color: var(--vscode-descriptionForeground);
             position: fixed;
-            bottom: 90px;
+            bottom: 85px;
             left: 30px;
             background: var(--vscode-editor-background);
             padding: 6px 12px;
@@ -1819,7 +1864,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <button id="rejectAllButton" class="bulk-action-button reject-all-button">✗ Reject All Changes</button>
         </div>
     </div>
-    <div id="loading" class="loading">Thinking...</div>
+    <div id="loading" class="loading"><span class="loading-dots">Thinking</span></div>
     <div class="input-container">
         <textarea 
             id="messageInput" 
@@ -2336,8 +2381,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Process inline markdown (bold, italic, code)
         function processInlineMarkdown(text) {
             return text
-                // Replace ⏳ with animated spinning version of the same emoji
-                .replace(/⏳/g, '<span class="spinner">⏳</span>')
+                // Replace status emojis with SVG icons
+                .replace(/✅/g, '<span class="status-icon status-icon-done"></span>')
+                .replace(/⏳/g, '<span class="status-icon status-icon-loading"></span>')
+                .replace(/❌/g, '<span class="status-icon status-icon-stopped"></span>')
                 // Bold (** or __)
                 .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/__(.*?)__/g, '<strong>$1</strong>')
@@ -2412,6 +2459,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     mode: currentMode
                 });
                 messageInput.value = '';
+                // Reset height
+                messageInput.style.height = 'auto';
             }
         }
 
@@ -2436,7 +2485,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Auto-expand textarea as user types
         messageInput.addEventListener('input', () => {
             messageInput.style.height = 'auto';
-            messageInput.style.height = messageInput.scrollHeight + 'px';
+            messageInput.style.overflowY = 'hidden'; // Hide scrollbar while calculating height
+            const newHeight = Math.min(messageInput.scrollHeight, 150); // Max height 150px
+            // Only expand if content exceeds min-height (40px)
+            if (newHeight > 40) {
+                messageInput.style.height = newHeight + 'px';
+            } else {
+                messageInput.style.height = '40px';
+            }
+            // Show scrollbar only when content exceeds max height
+            messageInput.style.overflowY = newHeight >= 150 ? 'auto' : 'hidden';
         });
 
         // Handle enter key (send on Enter, new line on Shift+Enter)
@@ -2541,6 +2599,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'showTerminalCommandConfirmation':
                     showTerminalCommandConfirmation(message.command);
+                    break;
+                case 'dismissTerminalCommandConfirmation':
+                    // Remove any existing terminal command confirmation popup
+                    const confirmationPopup = document.querySelector('.terminal-command-confirmation');
+                    if (confirmationPopup) {
+                        confirmationPopup.remove();
+                    }
                     break;
                 case 'addMessage':
                     loading.style.display = 'none';
