@@ -181,6 +181,51 @@ export class CodeParser {
                 return;
             }
 
+            // Group consecutive Python imports into one chunk
+            if (ext.toLowerCase() === '.py' && (node.type === 'import_statement' || node.type === 'import_from_statement')) {
+                // Identify a run of consecutive import siblings
+                let runStart = node;
+                let runEnd = node;
+
+                // Expand forward to include following consecutive import statements
+                let cursor = node.nextSibling;
+                while (cursor && (cursor.type === 'import_statement' || cursor.type === 'import_from_statement')) {
+                    runEnd = cursor;
+                    cursor = cursor.nextSibling;
+                }
+
+                // Add unprocessed code before the first import in the run
+                addUnprocessedCode(lastProcessedIndex, runStart.startIndex);
+
+                // Build the combined import block chunk
+                const blockStart = runStart.startIndex;
+                const blockEnd = runEnd.endIndex;
+                const slice = content.slice(blockStart, blockEnd);
+                const startPos = tree.rootNode.text.slice(0, blockStart).split('\n').length;
+                const endPos = startPos + slice.split('\n').length - 1;
+
+                chunks.push({
+                    content: slice.trim(),
+                    type: 'import_block',
+                    startLine: startPos,
+                    endLine: endPos
+                });
+
+                // Mark all imports in the run as processed
+                let mark: any = runStart;
+                while (true) {
+                    markNodeProcessed(mark);
+                    if (mark === runEnd) {
+                        break;
+                    }
+                    mark = mark.nextSibling;
+                }
+
+                // Update last processed index
+                lastProcessedIndex = blockEnd;
+                return;
+            }
+
             if (significantNodes.includes(node.type)) {
                 // Add any unprocessed code before this node
                 addUnprocessedCode(lastProcessedIndex, node.startIndex);
