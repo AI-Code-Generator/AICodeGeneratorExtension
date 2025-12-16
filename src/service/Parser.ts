@@ -2,7 +2,7 @@ import Parser from 'tree-sitter';
 import TreeSitterJavaScript from 'tree-sitter-javascript';
 import TreeSitterTypeScript from 'tree-sitter-typescript';
 import TreeSitterJava from 'tree-sitter-java';
-// import TreeSitterPython from 'tree-sitter-python';
+import TreeSitterPython from 'tree-sitter-python';
 import * as path from 'path';
 
 export interface CodeChunk {
@@ -40,9 +40,9 @@ export class CodeParser {
             case '.java':
                 parser.setLanguage(TreeSitterJava);
                 return parser;
-            // case '.py':
-            //     parser.setLanguage(TreeSitterPython);
-            //     return parser;
+            case '.py':
+                parser.setLanguage(TreeSitterPython);
+                return parser;
             default:
                 return null;
         }
@@ -95,7 +95,13 @@ export class CodeParser {
             'enum_declaration',
             'annotation_type_declaration',
             'import_declaration',
-            'package_declaration'
+            'package_declaration',
+            // Python nodes
+            'function_definition',
+            'class_definition',
+            'decorated_definition',
+            'import_from_statement',
+            'import_statement'
         ];
 
         const addUnprocessedCode = (startIndex: number, endIndex: number) => {
