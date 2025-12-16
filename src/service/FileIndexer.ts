@@ -149,7 +149,7 @@ async function saveFileTrackingBatch(): Promise<void> {
 // File extensions to exclude from indexing (config files, documentation, etc.)
 const EXCLUDED_EXTENSIONS = new Set([
     '.gitattributes', '.gitmodules',
-    '.pdf',
+    '.pdf', '.po',
     '.lock', '.log', '.tmp', '.temp',
     '.env', '.env.local', '.env.development', '.env.production',
     '.min.js', '.min.css', '.map',
@@ -226,6 +226,7 @@ export async function readFilesRecursive(directory: string, context: vscode.Exte
 
             if (file.isDirectory()) {
                 const subFiles = await readFilesRecursive(fullPath, context, excludeList);
+                console.log(`Indexing directory: ${fullPath} started`);
                 results = results.concat(subFiles);
             } else if (shouldIndexFile(fullPath)) {
                 results.push(fullPath);

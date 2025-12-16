@@ -2,7 +2,7 @@ import Parser from 'tree-sitter';
 import TreeSitterJavaScript from 'tree-sitter-javascript';
 import TreeSitterTypeScript from 'tree-sitter-typescript';
 import TreeSitterJava from 'tree-sitter-java';
-// import TreeSitterPython from 'tree-sitter-python';
+import TreeSitterPython from 'tree-sitter-python';
 import * as path from 'path';
 
 export interface CodeChunk {
@@ -40,9 +40,9 @@ export class CodeParser {
             case '.java':
                 parser.setLanguage(TreeSitterJava);
                 return parser;
-            // case '.py':
-            //     parser.setLanguage(TreeSitterPython);
-            //     return parser;
+            case '.py':
+                parser.setLanguage(TreeSitterPython);
+                return parser;
             default:
                 return null;
         }
@@ -95,7 +95,13 @@ export class CodeParser {
             'enum_declaration',
             'annotation_type_declaration',
             'import_declaration',
-            'package_declaration'
+            'package_declaration',
+            // Python nodes
+            'function_definition',
+            'class_definition',
+            'decorated_definition',
+            'import_from_statement',
+            'import_statement'
         ];
 
         const addUnprocessedCode = (startIndex: number, endIndex: number) => {
@@ -162,6 +168,51 @@ export class CodeParser {
 
                 // Mark all imports in the run as processed
                 let mark = runStart;
+                while (true) {
+                    markNodeProcessed(mark);
+                    if (mark === runEnd) {
+                        break;
+                    }
+                    mark = mark.nextSibling;
+                }
+
+                // Update last processed index
+                lastProcessedIndex = blockEnd;
+                return;
+            }
+
+            // Group consecutive Python imports into one chunk
+            if (ext.toLowerCase() === '.py' && (node.type === 'import_statement' || node.type === 'import_from_statement')) {
+                // Identify a run of consecutive import siblings
+                let runStart = node;
+                let runEnd = node;
+
+                // Expand forward to include following consecutive import statements
+                let cursor = node.nextSibling;
+                while (cursor && (cursor.type === 'import_statement' || cursor.type === 'import_from_statement')) {
+                    runEnd = cursor;
+                    cursor = cursor.nextSibling;
+                }
+
+                // Add unprocessed code before the first import in the run
+                addUnprocessedCode(lastProcessedIndex, runStart.startIndex);
+
+                // Build the combined import block chunk
+                const blockStart = runStart.startIndex;
+                const blockEnd = runEnd.endIndex;
+                const slice = content.slice(blockStart, blockEnd);
+                const startPos = tree.rootNode.text.slice(0, blockStart).split('\n').length;
+                const endPos = startPos + slice.split('\n').length - 1;
+
+                chunks.push({
+                    content: slice.trim(),
+                    type: 'import_block',
+                    startLine: startPos,
+                    endLine: endPos
+                });
+
+                // Mark all imports in the run as processed
+                let mark: any = runStart;
                 while (true) {
                     markNodeProcessed(mark);
                     if (mark === runEnd) {
