@@ -226,6 +226,7 @@ export async function readFilesRecursive(directory: string, context: vscode.Exte
 
             if (file.isDirectory()) {
                 const subFiles = await readFilesRecursive(fullPath, context, excludeList);
+                console.log(`Indexing directory: ${fullPath} started`);
                 results = results.concat(subFiles);
             } else if (shouldIndexFile(fullPath)) {
                 results.push(fullPath);
