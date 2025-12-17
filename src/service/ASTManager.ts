@@ -4,6 +4,7 @@ import Parser from 'tree-sitter';
 import TreeSitterJavaScript from 'tree-sitter-javascript';
 import TreeSitterTypeScript from 'tree-sitter-typescript';
 import TreeSitterJava from 'tree-sitter-java';
+import TreeSitterPython from 'tree-sitter-python';
 import { EXCLUDED_DIRS } from './constants';
 
 export interface SpringAnnotation {
@@ -100,6 +101,9 @@ export class ASTManager {
             case '.java':
                 parser.setLanguage(TreeSitterJava);
                 return parser;
+            case '.py':
+                parser.setLanguage(TreeSitterPython);
+                return parser;
             default:
                 return null;
         }
@@ -112,8 +116,8 @@ export class ASTManager {
 
     public async initializeWorkspace(context: vscode.ExtensionContext): Promise<void> {
         // Set up file watcher
-        this.fileWatcher = vscode.workspace.createFileSystemWatcher("**/*.{ts,tsx,js,jsx,java}", false, false, false);
-        
+        this.fileWatcher = vscode.workspace.createFileSystemWatcher("**/*.{ts,tsx,js,jsx,java,py}", false, false, false);
+
         this.fileWatcher.onDidChange(async (uri) => {
             await this.updateFileAST(uri);
         });
@@ -138,8 +142,8 @@ export class ASTManager {
             return;
         }
 
-        const pattern = "**/*.{ts,tsx,js,jsx,java}";
-        
+        const pattern = "**/*.{ts,tsx,js,jsx,java,py}";
+
         // Create glob pattern from EXCLUDED_DIRS
         const excludePattern = `{${EXCLUDED_DIRS.map(dir => `**/${dir}/**`).join(',')}}`;
         const files = await vscode.workspace.findFiles(pattern, excludePattern);
@@ -154,7 +158,7 @@ export class ASTManager {
         const ext = path.extname(filePath);
         
         // Skip unsupported file types
-        if (!['.ts', '.tsx', '.js', '.jsx', '.java'].includes(ext.toLowerCase())) {
+        if (!['.ts', '.tsx', '.js', '.jsx', '.java', '.py'].includes(ext.toLowerCase())) {
             return;
         }
 
@@ -332,7 +336,23 @@ export class ASTManager {
                     return localNameChild ? content.slice(localNameChild.startIndex, localNameChild.endIndex) : undefined;
                 }
                 break;
-            
+
+            // Python constructs
+            case 'function_definition':
+            case 'class_definition': {
+                const pyNameChild = node.childForFieldName('name');
+                return pyNameChild ? content.slice(pyNameChild.startIndex, pyNameChild.endIndex) : undefined;
+            }
+
+            case 'decorated_definition': {
+                // For decorated definitions, get the name from the inner function/class
+                const definition = node.childForFieldName('definition');
+                if (definition) {
+                    const innerName = definition.childForFieldName('name');
+                    return innerName ? content.slice(innerName.startIndex, innerName.endIndex) : undefined;
+                }
+                break;
+            }
             default:
                 return undefined;
         }
@@ -340,7 +360,7 @@ export class ASTManager {
 
     private extractSemanticInfo(astNode: ASTNode, node: Parser.SyntaxNode, content: string): void {
         // Extract imports
-        if (node.type === 'import_statement' || node.type === 'import_declaration') {
+        if (node.type === 'import_statement' || node.type === 'import_declaration' || node.type === 'import_from_statement') {
             const importClause = node.childForFieldName('import') || node;
             if (importClause) {
                 astNode.imports = this.extractImportNames(importClause, content);
