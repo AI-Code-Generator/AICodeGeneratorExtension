@@ -1,6 +1,6 @@
 // src/ChatViewProvider.ts
 import * as vscode from 'vscode';
-import { similaritySearch } from './service/FileIndexer';
+import { enhancedSimilaritySearch, EnhancedSearchResult } from './service/FileIndexer';
 import { ContextGatherer } from './service/ContextGatherer';
 import { AgentService } from './service/AgentService';
 import { DiffManager } from './service/DiffManager';
@@ -585,12 +585,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const workspaceContext = this.contextGatherer.gatherWorkspaceContext();
                         const currentFileContext = this.contextGatherer.gatherCurrentFileContext(editor);
                         const relevantSymbols = this.contextGatherer.findRelevantSymbols(data.message);
+
+                        // Extract recent conversation history from thread for context
+                        // This helps the query enhancement understand follow-up questions
+                        const conversationHistory: { role: string; content: string }[] = [];
+                        if (this.currentThread && this.currentThread.messages.length > 0) {
+                            // Get the last 5 message pairs (10 messages max) for context
+                            const recentMessages = this.currentThread.messages.slice(-10);
+                            for (const msg of recentMessages) {
+                                conversationHistory.push({
+                                    role: msg.type === 'user' ? 'user' : 'assistant',
+                                    // Truncate long messages to avoid overwhelming the context
+                                    content: msg.content.length > 500
+                                        ? msg.content.slice(0, 500) + '...'
+                                        : msg.content
+                                });
+                            }
+                        }
+
                         const enhancedContext = {
                             ...workspaceContext,
                             currentFileContext,
                             relevantSymbols,
                             language: fileLanguage,
-                            selectedCode: selectedCode.trim() ? selectedCode : undefined
+                            selectedCode: selectedCode.trim() ? selectedCode : undefined,
+                            conversationHistory: conversationHistory.length > 0 ? conversationHistory : undefined
                         };
 
                         const enhancedQuery = await this.enhanceQuery(
@@ -602,16 +621,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const totalFiles = workspaceContext.filenames?.length || 0;
                         const adaptiveLimit = this.computeSimilarityLimit(totalFiles);
 
-                        const similarityResults = await similaritySearch(enhancedQuery, this._context, adaptiveLimit);
+                        const similarityResults = await enhancedSimilaritySearch(enhancedQuery, this._context, adaptiveLimit);
 
-                        // Transform similarity results
-                        const similarity = (similarityResults || []).map(r => ({
+                        // Transform enhanced similarity results
+                        const similarity = (similarityResults || []).map((r: EnhancedSearchResult) => ({
                             filePath: r.filePath,
                             startLine: r.startLine,
                             endLine: r.endLine,
                             type: r.chunkType,
                             score: r.score,
-                            content: r.content
+                            content: r.content,
+                            retrievalMode: r.retrievalMode
                         }));
 
                         // Add user message to current thread
@@ -627,8 +647,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                         // Server expects context: Optional[List[str]];
                         const contextStrings = similarity.map(s => {
-                            const header = `<Chunk Info> ${s.filePath}: Line${s.startLine}-${s.endLine} [${s.type}] similarity score=${s.score.toFixed(3)}`;
-                            const trimmed = s.content.length > 800 ? s.content.slice(0, 800) + '...<trimmed>' : s.content;
+                            const modeLabel = s.retrievalMode === 'full_file' ? '[FULL FILE]' : '[CHUNK+NEIGHBORS]';
+                            const header = `<Context Info> ${s.filePath}: Lines ${s.startLine}-${s.endLine} ${modeLabel} [${s.type}] score=${s.score.toFixed(3)}`;
+                            // Allow more content for full files since they provide complete context
+                            const contentLimit = s.retrievalMode === 'full_file' ? 2000 : 1200;
+                            const trimmed = s.content.length > contentLimit
+                                ? s.content.slice(0, contentLimit) + '...<trimmed>'
+                                : s.content;
                             return header + "\n" + trimmed;
                         });
 
@@ -2890,7 +2915,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async handleTerminalCommandConfirmation(command: string): Promise<boolean> {
         return new Promise((resolve) => {
             this.pendingTerminalCommandResolve = resolve;
-            
+
             // Send terminal command confirmation request to webview
             this._view?.webview.postMessage({
                 type: 'showTerminalCommandConfirmation',

@@ -35,6 +35,11 @@ let STORAGEPATH: any = null;
 let CURRENT_PROJECT_KEY: string | null = null;
 // Conservative char cap for embedder input (~8k tokens headroom)
 const MAX_EMBED_INPUT_CHARS = 4000;
+// Threshold for determining if a file is "small" enough to return entirely
+// Files under this line count will have their full content returned instead of just chunks
+const SMALL_FILE_THRESHOLD_LINES = 150;
+// Default number of neighbor chunks to include before/after matched chunk in large files
+const DEFAULT_NEIGHBOR_COUNT = 2;
 
 export const state = {
     db: null as lancedb.Connection | null,
@@ -590,6 +595,109 @@ export interface SimilaritySearchResultMetadata {
     score: number;
 }
 
+export interface EnhancedSearchResult {
+    filePath: string;
+    content: string;
+    startLine: number;
+    endLine: number;
+    chunkType: string;
+    score: number;
+    retrievalMode: 'full_file' | 'chunk_with_neighbors';
+    neighborChunks?: {
+        before: SimilaritySearchResultMetadata[];
+        after: SimilaritySearchResultMetadata[];
+    };
+}
+
+export interface EnhancedSearchOptions {
+    smallFileThreshold?: number;
+    neighborCount?: number;
+}
+
+/**
+ * Get the line count of a file
+ */
+async function getFileLineCount(filePath: string): Promise<number> {
+    try {
+        const content = await fs.readFile(filePath, 'utf8');
+        return content.split('\n').length;
+    } catch (error) {
+        console.error(`Error reading file for line count: ${filePath}`, error);
+        return Infinity; // Treat as large file if we can't read it
+    }
+}
+
+/**
+ * Read the full content of a file
+ */
+async function getFullFileContent(filePath: string): Promise<string> {
+    try {
+        return await fs.readFile(filePath, 'utf8');
+    } catch (error) {
+        console.error(`Error reading full file: ${filePath}`, error);
+        return '';
+    }
+}
+
+/**
+ * Get neighboring chunks from the same file based on line ranges
+ */
+async function getNeighborChunks(
+    filePath: string,
+    startLine: number,
+    endLine: number,
+    neighborCount: number = DEFAULT_NEIGHBOR_COUNT
+): Promise<{ before: SimilaritySearchResultMetadata[]; after: SimilaritySearchResultMetadata[] }> {
+    if (!state.table) {
+        return { before: [], after: [] };
+    }
+
+    try {
+        const escapedPath = filePath.replace(/'/g, "''");
+
+        // Get chunks that end before the current chunk starts (preceding neighbors)
+        const beforeResults = await state.table
+            .query()
+            .where(`\`filePath\` = '${escapedPath}' AND \`endLine\` < ${startLine}`)
+            .toArray();
+
+        // Sort by endLine descending to get the closest chunks first
+        const sortedBefore = beforeResults
+            .sort((a, b) => b.endLine - a.endLine)
+            .slice(0, neighborCount)
+            .reverse(); // Reverse to maintain line order
+
+        // Get chunks that start after the current chunk ends (following neighbors)
+        const afterResults = await state.table
+            .query()
+            .where(`\`filePath\` = '${escapedPath}' AND \`startLine\` > ${endLine}`)
+            .toArray();
+
+        // Sort by startLine ascending to get the closest chunks first
+        const sortedAfter = afterResults
+            .sort((a, b) => a.startLine - b.startLine)
+            .slice(0, neighborCount);
+
+        const mapToMetadata = (result: any): SimilaritySearchResultMetadata => ({
+            id: result.id,
+            filePath: result.filePath,
+            startLine: result.startLine,
+            endLine: result.endLine,
+            chunkType: result.chunkType,
+            content: result.content,
+            score: 0 // Neighbors don't have a relevance score
+        });
+
+        return {
+            before: sortedBefore.map(mapToMetadata),
+            after: sortedAfter.map(mapToMetadata)
+        };
+    } catch (error) {
+        console.error(`Error getting neighbor chunks for ${filePath}:`, error);
+        return { before: [], after: [] };
+    }
+}
+
 export async function similaritySearch(text: string, context: vscode.ExtensionContext, limit: number = 8): Promise<SimilaritySearchResultMetadata[] | null> {
     if (!text || !state.table) {
         return null;
@@ -615,6 +723,138 @@ export async function similaritySearch(text: string, context: vscode.ExtensionCo
         }));
     } catch (error) {
         console.error('Error in similarity search:', error);
+        return null;
+    }
+}
+
+/**
+ * Enhanced similarity search with parent retrieval
+ * - For small files (< threshold lines): returns the entire file content
+ * - For large files: returns the matched chunk with surrounding neighbor chunks
+ */
+export async function enhancedSimilaritySearch(
+    text: string,
+    context: vscode.ExtensionContext,
+    limit: number = 8,
+    options?: EnhancedSearchOptions
+): Promise<EnhancedSearchResult[] | null> {
+    if (!text || !state.table) {
+        return null;
+    }
+
+    const threshold = options?.smallFileThreshold ?? SMALL_FILE_THRESHOLD_LINES;
+    const neighborCount = options?.neighborCount ?? DEFAULT_NEIGHBOR_COUNT;
+
+    try {
+        await initializeEmbedder(context);
+        const embeddedText = await embedQuery(text);
+
+        const results = await state.table
+            .vectorSearch(embeddedText)
+            .limit(limit)
+            .toArray();
+
+        // Group results by file path to avoid duplicate file reads
+        const fileGroups = new Map<string, typeof results>();
+        for (const result of results) {
+            const existing = fileGroups.get(result.filePath) || [];
+            existing.push(result);
+            fileGroups.set(result.filePath, existing);
+        }
+
+        // Cache file line counts to avoid repeated reads
+        const fileLineCountCache = new Map<string, number>();
+        // Cache full file contents for small files
+        const fullFileContentCache = new Map<string, string>();
+
+        const enhancedResults: EnhancedSearchResult[] = [];
+        const processedFullFiles = new Set<string>(); // Track files already returned in full
+
+        for (const result of results) {
+            const filePath = result.filePath;
+
+            // Get or compute line count
+            if (!fileLineCountCache.has(filePath)) {
+                fileLineCountCache.set(filePath, await getFileLineCount(filePath));
+            }
+            const lineCount = fileLineCountCache.get(filePath)!;
+
+            if (lineCount <= threshold) {
+                // Small file: return full content (but only once per file)
+                if (processedFullFiles.has(filePath)) {
+                    continue; // Skip duplicate entries for the same small file
+                }
+                processedFullFiles.add(filePath);
+
+                // Get or read full file content
+                if (!fullFileContentCache.has(filePath)) {
+                    fullFileContentCache.set(filePath, await getFullFileContent(filePath));
+                }
+                const fullContent = fullFileContentCache.get(filePath)!;
+
+                enhancedResults.push({
+                    filePath,
+                    content: fullContent,
+                    startLine: 1,
+                    endLine: lineCount,
+                    chunkType: 'full_file',
+                    score: result._distance,
+                    retrievalMode: 'full_file'
+                });
+            } else {
+                // Large file: return chunk with neighbors
+                const neighbors = await getNeighborChunks(
+                    filePath,
+                    result.startLine,
+                    result.endLine,
+                    neighborCount
+                );
+
+                // Combine neighbor content with the main chunk for a richer context
+                let combinedContent = '';
+
+                // Add before neighbors
+                for (const neighbor of neighbors.before) {
+                    combinedContent += `// --- Context (lines ${neighbor.startLine}-${neighbor.endLine}) ---\n`;
+                    combinedContent += neighbor.content + '\n\n';
+                }
+
+                // Add main chunk
+                combinedContent += `// --- Matched chunk (lines ${result.startLine}-${result.endLine}) ---\n`;
+                combinedContent += result.content;
+
+                // Add after neighbors
+                for (const neighbor of neighbors.after) {
+                    combinedContent += '\n\n';
+                    combinedContent += `// --- Context (lines ${neighbor.startLine}-${neighbor.endLine}) ---\n`;
+                    combinedContent += neighbor.content;
+                }
+
+                // Calculate the effective line range
+                const effectiveStartLine = neighbors.before.length > 0
+                    ? neighbors.before[0].startLine
+                    : result.startLine;
+                const effectiveEndLine = neighbors.after.length > 0
+                    ? neighbors.after[neighbors.after.length - 1].endLine
+                    : result.endLine;
+
+                enhancedResults.push({
+                    filePath,
+                    content: combinedContent.trim(),
+                    startLine: effectiveStartLine,
+                    endLine: effectiveEndLine,
+                    chunkType: result.chunkType,
+                    score: result._distance,
+                    retrievalMode: 'chunk_with_neighbors',
+                    neighborChunks: neighbors
+                });
+            }
+        }
+
+        // Sort by score (lower distance = better match)
+        return enhancedResults.sort((a, b) => a.score - b.score);
+    } catch (error) {
+        console.error('Error in enhanced similarity search:', error);
         return null;
     }
 }
