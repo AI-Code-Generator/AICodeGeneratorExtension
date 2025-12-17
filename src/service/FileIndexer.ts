@@ -154,7 +154,7 @@ async function saveFileTrackingBatch(): Promise<void> {
 // File extensions to exclude from indexing (config files, documentation, etc.)
 const EXCLUDED_EXTENSIONS = new Set([
     '.gitattributes', '.gitmodules',
-    '.pdf', '.po',
+    '.pdf', '.po', '.mo',
     '.lock', '.log', '.tmp', '.temp',
     '.env', '.env.local', '.env.development', '.env.production',
     '.min.js', '.min.css', '.map',
