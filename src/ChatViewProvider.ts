@@ -585,12 +585,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         const workspaceContext = this.contextGatherer.gatherWorkspaceContext();
                         const currentFileContext = this.contextGatherer.gatherCurrentFileContext(editor);
                         const relevantSymbols = this.contextGatherer.findRelevantSymbols(data.message);
+
+                        // Extract recent conversation history from thread for context
+                        // This helps the query enhancement understand follow-up questions
+                        const conversationHistory: { role: string; content: string }[] = [];
+                        if (this.currentThread && this.currentThread.messages.length > 0) {
+                            // Get the last 5 message pairs (10 messages max) for context
+                            const recentMessages = this.currentThread.messages.slice(-10);
+                            for (const msg of recentMessages) {
+                                conversationHistory.push({
+                                    role: msg.type === 'user' ? 'user' : 'assistant',
+                                    // Truncate long messages to avoid overwhelming the context
+                                    content: msg.content.length > 500
+                                        ? msg.content.slice(0, 500) + '...'
+                                        : msg.content
+                                });
+                            }
+                        }
+
                         const enhancedContext = {
                             ...workspaceContext,
                             currentFileContext,
                             relevantSymbols,
                             language: fileLanguage,
-                            selectedCode: selectedCode.trim() ? selectedCode : undefined
+                            selectedCode: selectedCode.trim() ? selectedCode : undefined,
+                            conversationHistory: conversationHistory.length > 0 ? conversationHistory : undefined
                         };
 
                         const enhancedQuery = await this.enhanceQuery(
