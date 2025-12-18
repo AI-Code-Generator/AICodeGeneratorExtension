@@ -215,6 +215,21 @@ function shouldIndexFile(filePath: string): boolean {
     return true;
 }
 
+/**
+ * Detects if file content is binary by checking for null bytes.
+ * Binary files typically contain null bytes while text files don't.
+ * Only checks the first chunk of the file for performance.
+ */
+function isBinaryContent(content: string, bytesToCheck: number = 8000): boolean {
+    const checkLength = Math.min(content.length, bytesToCheck);
+    for (let i = 0; i < checkLength; i++) {
+        if (content.charCodeAt(i) === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export async function readFilesRecursive(directory: string, context: vscode.ExtensionContext, excludeList: string[] = []): Promise<string[]> {
     let results: string[] = [];
 
@@ -236,6 +251,12 @@ export async function readFilesRecursive(directory: string, context: vscode.Exte
             } else if (shouldIndexFile(fullPath)) {
                 results.push(fullPath);
                 const content: string = await fs.readFile(fullPath, 'utf8');
+
+                // Skip binary files
+                if (isBinaryContent(content)) {
+                    console.log(`Skipping binary file: ${fullPath}`);
+                    continue;
+                }
 
                 const shouldProcess = await shouldProcessFile(fullPath, content);
 
@@ -386,7 +407,13 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
         
         // Read file content
         const content = await fs.readFile(filePath, 'utf8');
-        
+
+        // Skip binary files
+        if (isBinaryContent(content)) {
+            console.log(`Skipping binary file: ${filePath}`);
+            return false;
+        }
+
         // Check if we need to process this file
         const shouldProcess = await shouldProcessFile(filePath, content);
         
