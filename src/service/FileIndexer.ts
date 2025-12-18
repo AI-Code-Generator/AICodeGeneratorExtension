@@ -216,18 +216,32 @@ function shouldIndexFile(filePath: string): boolean {
 }
 
 /**
- * Detects if file content is binary by checking for null bytes.
- * Binary files typically contain null bytes while text files don't.
- * Only checks the first chunk of the file for performance.
+ * Detects if a file is binary by reading raw bytes and checking for null bytes.
+ * Reads only a small buffer (8KB) from disk to avoid memory issues with large files.
+ * Uses Buffer (raw bytes) instead of UTF-8 string to avoid data corruption.
  */
-function isBinaryContent(content: string, bytesToCheck: number = 8000): boolean {
-    const checkLength = Math.min(content.length, bytesToCheck);
-    for (let i = 0; i < checkLength; i++) {
-        if (content.charCodeAt(i) === 0) {
-            return true;
+async function isBinaryFile(filePath: string, bytesToCheck: number = 8192): Promise<boolean> {
+    let fileHandle: fs.FileHandle | null = null;
+    try {
+        fileHandle = await fs.open(filePath, 'r');
+        const buffer = Buffer.alloc(bytesToCheck);
+        const { bytesRead } = await fileHandle.read(buffer, 0, bytesToCheck, 0);
+
+        // Check for null bytes in the raw buffer
+        for (let i = 0; i < bytesRead; i++) {
+            if (buffer[i] === 0) {
+                return true;
+            }
+        }
+        return false;
+    } catch (error) {
+        console.error(`Error checking if file is binary: ${filePath}`, error);
+        return false; // If we can't read it, let the normal flow handle the error
+    } finally {
+        if (fileHandle) {
+            await fileHandle.close();
         }
     }
-    return false;
 }
 
 export async function readFilesRecursive(directory: string, context: vscode.ExtensionContext, excludeList: string[] = []): Promise<string[]> {
@@ -249,14 +263,14 @@ export async function readFilesRecursive(directory: string, context: vscode.Exte
                 console.log(`Indexing directory: ${fullPath} started`);
                 results = results.concat(subFiles);
             } else if (shouldIndexFile(fullPath)) {
-                results.push(fullPath);
-                const content: string = await fs.readFile(fullPath, 'utf8');
-
-                // Skip binary files
-                if (isBinaryContent(content)) {
+                // Skip binary files BEFORE reading as UTF-8 to avoid memory/corruption issues
+                if (await isBinaryFile(fullPath)) {
                     console.log(`Skipping binary file: ${fullPath}`);
                     continue;
                 }
+
+                results.push(fullPath);
+                const content: string = await fs.readFile(fullPath, 'utf8');
 
                 const shouldProcess = await shouldProcessFile(fullPath, content);
 
@@ -404,15 +418,15 @@ export async function indexSingleFile(fileUri: vscode.Uri, storageUri: vscode.Ur
             STORAGEPATH = storageUri;
             await initializeLanceDB(storageUri);
         }
-        
-        // Read file content
-        const content = await fs.readFile(filePath, 'utf8');
 
-        // Skip binary files
-        if (isBinaryContent(content)) {
+        // Skip binary files BEFORE reading as UTF-8 to avoid memory/corruption issues
+        if (await isBinaryFile(filePath)) {
             console.log(`Skipping binary file: ${filePath}`);
             return false;
         }
+
+        // Read file content
+        const content = await fs.readFile(filePath, 'utf8');
 
         // Check if we need to process this file
         const shouldProcess = await shouldProcessFile(filePath, content);
