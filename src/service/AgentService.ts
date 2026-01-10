@@ -8,6 +8,32 @@ import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
 import { extractCommandOutput } from './terminalUtils';
 import * as Diff from 'diff';
 
+// --- NEW HELPER: Check binary without reading whole file ---
+async function isBinaryFile(filePath: string): Promise<boolean> {
+    let fileHandle: fs.FileHandle | null = null;
+    try {
+        fileHandle = await fs.open(filePath, 'r');
+        const bytesToCheck = 4096;
+        const buffer = Buffer.alloc(bytesToCheck); 
+        const { bytesRead } = await fileHandle.read(buffer, 0, bytesToCheck, 0);
+
+        // Check for null bytes in the sample
+        for (let i = 0; i < bytesRead; i++) {
+            if (buffer[i] === 0) {
+                return true;
+            }
+        }
+        return false;
+    } catch (error) {
+        return false; // Assume text if we can't check
+    } finally {
+        if (fileHandle) {
+            await fileHandle.close();
+        }
+    }
+}
+// -----------------------------------------------------------
+
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
     private diffManager: DiffManager;
@@ -332,14 +358,36 @@ class ToolBox {
         return results.slice(0, maxFiles);
     }
 
+    // --- OPTIMIZED READ_FILE ---
     public async read_file(filePath: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
-        try {
-            const content = await fs.readFile(absolutePath, 'utf-8');
-            // Use a fixed chunk size for calculation, matching read_file_chunk
-            const CHUNK_SIZE = 100000;
-            const FILE_SIZE_LIMIT = CHUNK_SIZE; // Align limit with chunk size
+        const CHUNK_SIZE = 50000;
+        const FILE_SIZE_LIMIT = CHUNK_SIZE;
 
+        try {
+            // 1. Check statistics FIRST (before reading content)
+            const stats = await fs.stat(absolutePath);
+
+            // 2. Fail fast on Binary Files
+            if (await isBinaryFile(absolutePath)) {
+                return `Error: File '${filePath}' appears to be a binary file. Reading it as text is not supported.`;
+            }
+
+            // 3. Fail fast on size (check bytes, not characters, to avoid memory spikes)
+            // Use a safety multiplier (e.g. 1.2x limit) because 1 char != 1 byte in UTF8
+            // If the file is > 100KB bytes, it's definitely going to be > 100k chars or close enough to warn
+            if (stats.size > FILE_SIZE_LIMIT * 1.5) {
+                const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
+                return `Error: File '${filePath}' is too long (approx ${stats.size} bytes). ` +
+                        `It has been divided into approx ${totalChunks} chunks. ` +
+                        `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
+                        `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk.`;
+            }
+
+            // 4. Safe to read into RAM now
+            const content = await fs.readFile(absolutePath, 'utf-8');
+            
+            // 5. Final accurate character check
             if (content.length > FILE_SIZE_LIMIT) {
                 // Calculate total chunks based on the fixed chunk size
                 const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
@@ -363,6 +411,12 @@ class ToolBox {
     public async search_in_file(filePath: string, keyword: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
+            // NOTE: search_in_file still reads the whole file to find matches.
+            // If you have massive files, you might want to stream this too, 
+            if (await isBinaryFile(absolutePath)) {
+                return `Error: Cannot search in binary file '${filePath}'.`;
+            }
+
             const content = await fs.readFile(absolutePath, 'utf-8');
             const lines = content.split('\n');
             const matchingLines: string[] = [];
@@ -398,9 +452,13 @@ class ToolBox {
     // Updated read_file_chunk: removed chunkSize, uses fixed size
     public async read_file_chunk(filePath: string, chunkNumber: number = 1): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
-        const CHUNK_SIZE = 100000; // Use the fixed chunk size
+        const CHUNK_SIZE = 50000; // Use the fixed chunk size
 
         try {
+            if (await isBinaryFile(absolutePath)) {
+                return `Error: Cannot read chunk of binary file '${filePath}'.`;
+            }
+
             const content = await fs.readFile(absolutePath, 'utf-8');
             const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
 
@@ -1482,7 +1540,7 @@ Tool Call History (most recent last):
 ${JSON.stringify(truncatedHistory)}
 </toolCallHistory>`;
 
-    console.log(`[AgentService] Full prompt length: ${fullPrompt.length}, history: ${history.length} -> ${truncatedHistory.length}`);
+        console.log(`[AgentService] Full prompt length: ${fullPrompt.length}, history: ${history.length} -> ${truncatedHistory.length}`);
 
         try {
             this.currentAbortController = new AbortController();
