@@ -386,18 +386,18 @@ class ToolBox {
 
             // 4. Safe to read into RAM now
             const content = await fs.readFile(absolutePath, 'utf-8');
-            
-            // 5. Final accurate character check
-            if (content.length > FILE_SIZE_LIMIT) {
-                // Calculate total chunks based on the fixed chunk size
-                const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+
+            // 5. Final check using BYTES (not characters) to match read_file_chunk behavior
+            // Note: We use stats.size (bytes) not content.length (characters) for consistency
+            if (stats.size > FILE_SIZE_LIMIT) {
+                // Calculate total chunks based on BYTES to match read_file_chunk
+                const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
 
                 // If file is too long, return error with total chunks
-                return `Error: File '${filePath}' is too long (${content.length} characters). ` +
-                       `It has been divided into ${totalChunks} chunks. ` + // Inform about total chunks
-                       `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
-                       `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk (e.g., chunkNumber 1).`;
-                       // Removed the truncated content start
+                return `Error: File '${filePath}' is too long (${stats.size} bytes). ` +
+                    `It has been divided into ${totalChunks} chunks. ` +
+                    `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
+                    `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk (e.g., chunkNumber 1).`;
             }
             return content; // Return full content if within limit
         } catch (error) {
@@ -479,7 +479,7 @@ class ToolBox {
             const { bytesRead } = await fileHandle.read(buffer, 0, bytesToRead, startByte);
 
             // 4. Convert the buffer to UTF-8 string
-            const chunkContent = buffer.slice(0, bytesRead).toString('utf-8');
+            const chunkContent = buffer.subarray(0, bytesRead).toString('utf-8');
 
             return `--- Showing chunk ${chunkNumber} of ${totalChunks} from file '${filePath}' ---\n\n` + chunkContent;
 
