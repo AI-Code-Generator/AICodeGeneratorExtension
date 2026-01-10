@@ -449,29 +449,38 @@ class ToolBox {
         }
     }
 
-    // Updated read_file_chunk: removed chunkSize, uses fixed size
+    // Updated read_file_chunk: BUFFERED implementation - only reads the specific bytes needed
     public async read_file_chunk(filePath: string, chunkNumber: number = 1): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
-        const CHUNK_SIZE = 50000; // Use the fixed chunk size
+        const CHUNK_SIZE_BYTES = 50000; // Fixed chunk size in bytes
 
+        let fileHandle: fs.FileHandle | null = null;
         try {
             if (await isBinaryFile(absolutePath)) {
                 return `Error: Cannot read chunk of binary file '${filePath}'.`;
             }
 
-            const content = await fs.readFile(absolutePath, 'utf-8');
-            const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+            // 1. Get file stats to calculate total chunks WITHOUT reading the file
+            const stats = await fs.stat(absolutePath);
+            const fileSize = stats.size;
+            const totalChunks = Math.ceil(fileSize / CHUNK_SIZE_BYTES);
 
             if (chunkNumber < 1 || chunkNumber > totalChunks) {
                 return `Error: Chunk number ${chunkNumber} is out of bounds. The file '${filePath}' only has ${totalChunks} chunks (1 to ${totalChunks}).`;
             }
 
-            const start = (chunkNumber - 1) * CHUNK_SIZE;
-            // End index is calculated correctly, Math.min handles the last chunk
-            const end = Math.min(start + CHUNK_SIZE, content.length);
-            const chunkContent = content.substring(start, end);
+            // 2. Calculate byte positions for this chunk
+            const startByte = (chunkNumber - 1) * CHUNK_SIZE_BYTES;
+            const bytesToRead = Math.min(CHUNK_SIZE_BYTES, fileSize - startByte);
 
-            // Never return truncated message from here
+            // 3. Open file and read ONLY the bytes we need (buffered read)
+            fileHandle = await fs.open(absolutePath, 'r');
+            const buffer = Buffer.alloc(bytesToRead);
+            const { bytesRead } = await fileHandle.read(buffer, 0, bytesToRead, startByte);
+
+            // 4. Convert the buffer to UTF-8 string
+            const chunkContent = buffer.slice(0, bytesRead).toString('utf-8');
+
             return `--- Showing chunk ${chunkNumber} of ${totalChunks} from file '${filePath}' ---\n\n` + chunkContent;
 
         } catch (error) {
@@ -479,6 +488,11 @@ class ToolBox {
                 return `Error: File not found at path: ${absolutePath}.`;
             }
             return `Error reading file chunk: ${error}`;
+        } finally {
+            // Always close the file handle to prevent resource leaks
+            if (fileHandle) {
+                await fileHandle.close();
+            }
         }
     }
 
