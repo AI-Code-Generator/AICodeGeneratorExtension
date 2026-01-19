@@ -1,6 +1,7 @@
 {
-  "name": "ai-code-assist",
-  "displayName": "ai-code-assist",
+  "name": "VeloxAI",
+  "displayName": "VeloxAI",
+  "publisher": "VeloxAI",
   "description": "",
   "version": "0.0.1",
   "engines": {
