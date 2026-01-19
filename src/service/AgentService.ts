@@ -8,6 +8,32 @@ import { EXCLUDED_DIRS, EXCLUDED_GLOB_PATTERN } from './constants';
 import { extractCommandOutput } from './terminalUtils';
 import * as Diff from 'diff';
 
+// --- NEW HELPER: Check binary without reading whole file ---
+async function isBinaryFile(filePath: string): Promise<boolean> {
+    let fileHandle: fs.FileHandle | null = null;
+    try {
+        fileHandle = await fs.open(filePath, 'r');
+        const bytesToCheck = 4096;
+        const buffer = Buffer.alloc(bytesToCheck); 
+        const { bytesRead } = await fileHandle.read(buffer, 0, bytesToCheck, 0);
+
+        // Check for null bytes in the sample
+        for (let i = 0; i < bytesRead; i++) {
+            if (buffer[i] === 0) {
+                return true;
+            }
+        }
+        return false;
+    } catch (error) {
+        return false; // Assume text if we can't check
+    } finally {
+        if (fileHandle) {
+            await fileHandle.close();
+        }
+    }
+}
+// -----------------------------------------------------------
+
 // The ToolBox holds the set of functions the agent can execute.
 class ToolBox {
     private diffManager: DiffManager;
@@ -332,24 +358,46 @@ class ToolBox {
         return results.slice(0, maxFiles);
     }
 
+    // --- OPTIMIZED READ_FILE ---
     public async read_file(filePath: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
-        try {
-            const content = await fs.readFile(absolutePath, 'utf-8');
-            // Use a fixed chunk size for calculation, matching read_file_chunk
-            const CHUNK_SIZE = 100000;
-            const FILE_SIZE_LIMIT = CHUNK_SIZE; // Align limit with chunk size
+        const CHUNK_SIZE = 50000;
+        const FILE_SIZE_LIMIT = CHUNK_SIZE;
 
-            if (content.length > FILE_SIZE_LIMIT) {
-                // Calculate total chunks based on the fixed chunk size
-                const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+        try {
+            // 1. Check statistics FIRST (before reading content)
+            const stats = await fs.stat(absolutePath);
+
+            // 2. Fail fast on Binary Files
+            if (await isBinaryFile(absolutePath)) {
+                return `Error: File '${filePath}' appears to be a binary file. Reading it as text is not supported.`;
+            }
+
+            // 3. Fail fast on size (check bytes, not characters, to avoid memory spikes)
+            // Use a safety multiplier (e.g. 1.2x limit) because 1 char != 1 byte in UTF8
+            // If the file is > 100KB bytes, it's definitely going to be > 100k chars or close enough to warn
+            if (stats.size > FILE_SIZE_LIMIT * 1.5) {
+                const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
+                return `Error: File '${filePath}' is too long (approx ${stats.size} bytes). ` +
+                        `It has been divided into approx ${totalChunks} chunks. ` +
+                        `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
+                        `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk.`;
+            }
+
+            // 4. Safe to read into RAM now
+            const content = await fs.readFile(absolutePath, 'utf-8');
+
+            // 5. Final check using BYTES (not characters) to match read_file_chunk behavior
+            // Note: We use stats.size (bytes) not content.length (characters) for consistency
+            if (stats.size > FILE_SIZE_LIMIT) {
+                // Calculate total chunks based on BYTES to match read_file_chunk
+                const totalChunks = Math.ceil(stats.size / CHUNK_SIZE);
 
                 // If file is too long, return error with total chunks
-                return `Error: File '${filePath}' is too long (${content.length} characters). ` +
-                       `It has been divided into ${totalChunks} chunks. ` + // Inform about total chunks
-                       `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
-                       `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk (e.g., chunkNumber 1).`;
-                       // Removed the truncated content start
+                return `Error: File '${filePath}' is too long (${stats.size} bytes). ` +
+                    `It has been divided into ${totalChunks} chunks. ` +
+                    `Use 'search_in_file(filePath, keyword)' to find specific content, ` +
+                    `or 'read_file_chunk(filePath, chunkNumber)' to read a specific chunk (e.g., chunkNumber 1).`;
             }
             return content; // Return full content if within limit
         } catch (error) {
@@ -363,6 +411,12 @@ class ToolBox {
     public async search_in_file(filePath: string, keyword: string): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
         try {
+            // NOTE: search_in_file still reads the whole file to find matches.
+            // If you have massive files, you might want to stream this too, 
+            if (await isBinaryFile(absolutePath)) {
+                return `Error: Cannot search in binary file '${filePath}'.`;
+            }
+
             const content = await fs.readFile(absolutePath, 'utf-8');
             const lines = content.split('\n');
             const matchingLines: string[] = [];
@@ -395,25 +449,38 @@ class ToolBox {
         }
     }
 
-    // Updated read_file_chunk: removed chunkSize, uses fixed size
+    // Updated read_file_chunk: BUFFERED implementation - only reads the specific bytes needed
     public async read_file_chunk(filePath: string, chunkNumber: number = 1): Promise<string> {
         const absolutePath = this.getAbsolutePath(filePath);
-        const CHUNK_SIZE = 100000; // Use the fixed chunk size
+        const CHUNK_SIZE_BYTES = 50000; // Fixed chunk size in bytes
 
+        let fileHandle: fs.FileHandle | null = null;
         try {
-            const content = await fs.readFile(absolutePath, 'utf-8');
-            const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+            if (await isBinaryFile(absolutePath)) {
+                return `Error: Cannot read chunk of binary file '${filePath}'.`;
+            }
+
+            // 1. Get file stats to calculate total chunks WITHOUT reading the file
+            const stats = await fs.stat(absolutePath);
+            const fileSize = stats.size;
+            const totalChunks = Math.ceil(fileSize / CHUNK_SIZE_BYTES);
 
             if (chunkNumber < 1 || chunkNumber > totalChunks) {
                 return `Error: Chunk number ${chunkNumber} is out of bounds. The file '${filePath}' only has ${totalChunks} chunks (1 to ${totalChunks}).`;
             }
 
-            const start = (chunkNumber - 1) * CHUNK_SIZE;
-            // End index is calculated correctly, Math.min handles the last chunk
-            const end = Math.min(start + CHUNK_SIZE, content.length);
-            const chunkContent = content.substring(start, end);
+            // 2. Calculate byte positions for this chunk
+            const startByte = (chunkNumber - 1) * CHUNK_SIZE_BYTES;
+            const bytesToRead = Math.min(CHUNK_SIZE_BYTES, fileSize - startByte);
 
-            // Never return truncated message from here
+            // 3. Open file and read ONLY the bytes we need (buffered read)
+            fileHandle = await fs.open(absolutePath, 'r');
+            const buffer = Buffer.alloc(bytesToRead);
+            const { bytesRead } = await fileHandle.read(buffer, 0, bytesToRead, startByte);
+
+            // 4. Convert the buffer to UTF-8 string
+            const chunkContent = buffer.subarray(0, bytesRead).toString('utf-8');
+
             return `--- Showing chunk ${chunkNumber} of ${totalChunks} from file '${filePath}' ---\n\n` + chunkContent;
 
         } catch (error) {
@@ -421,6 +488,11 @@ class ToolBox {
                 return `Error: File not found at path: ${absolutePath}.`;
             }
             return `Error reading file chunk: ${error}`;
+        } finally {
+            // Always close the file handle to prevent resource leaks
+            if (fileHandle) {
+                await fileHandle.close();
+            }
         }
     }
 
@@ -1482,7 +1554,7 @@ Tool Call History (most recent last):
 ${JSON.stringify(truncatedHistory)}
 </toolCallHistory>`;
 
-    console.log(`[AgentService] Full prompt length: ${fullPrompt.length}, history: ${history.length} -> ${truncatedHistory.length}`);
+        console.log(`[AgentService] Full prompt length: ${fullPrompt.length}, history: ${history.length} -> ${truncatedHistory.length}`);
 
         try {
             this.currentAbortController = new AbortController();
