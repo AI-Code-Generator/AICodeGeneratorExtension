@@ -1,4 +1,4 @@
-# AI Code Assist
+# AI Code Assist [![Demo Video](https://img.shields.io/badge/▶️_Watch_Demo-YouTube-red?style=for-the-badge&logo=youtube)](https://youtu.be/Tl_Zqd9HC6g)
 
 AI Code Assist is a powerful Visual Studio Code extension that brings the capabilities of a large language model directly into your editor. It provides an interactive chat interface, an autonomous agent for complex tasks, and advanced code intelligence features to streamline your development workflow.
 
